@@ -17,7 +17,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Check dependency freshness
-        uses: owner/cargo-oxidate@v1
+        uses: timweri/cargo-oxidate@v1
         with:
           cargo-lock-path: 'Cargo.lock'
           min-age-days: '14'

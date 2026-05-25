@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Check Cargo dependency freshness - flags packages that are too new or too old"
 license = "MIT"
+authors = ["Thanh Nguyen (timweri)", "Mitchell Grenier (obelisk)"]
 
 [[bin]]
 name = "cargo-oxidate"
