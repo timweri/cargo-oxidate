@@ -1,0 +1,26 @@
+[package]
+name = "cargo-oxidate"
+version = "0.1.0"
+edition = "2024"
+description = "Check Cargo dependency freshness - flags packages that are too new or too old"
+license = "MIT"
+
+[[bin]]
+name = "cargo-oxidate"
+path = "src/main.rs"
+
+[dependencies]
+cargo-lock = "10"
+clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+
+# Optimize for small binary size - reduces CI cache/download time
+[profile.release]
+opt-level = "z"     # Optimize for size
+lto = true          # Link-time optimization
+strip = true        # Remove debug symbols

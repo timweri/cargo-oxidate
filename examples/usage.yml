@@ -1,0 +1,29 @@
+# Example: .github/workflows/dependency-freshness.yml
+name: Dependency Freshness Check
+
+on:
+  pull_request:
+    paths:
+      - 'Cargo.lock'
+  schedule:
+    - cron: '0 9 * * 1'  # Weekly Monday 9am UTC
+
+jobs:
+  check-dependencies:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Check dependency freshness
+        uses: owner/cargo-oxidate@v1
+        with:
+          cargo-lock-path: 'Cargo.lock'
+          min-age-days: '14'
+          max-age-days: '730'
+          exempt-packages: |
+            my-internal-crate
+            another-private-crate
+          include-missing: 'true'
+          timeout: '15'

@@ -1,0 +1,91 @@
+name: 'Cargo Oxidate'
+description: 'Check Cargo dependency freshness - flags packages that are too new (supply chain risk) or too old (staleness)'
+author: 'owner'
+
+branding:
+  icon: 'shield'
+  color: 'orange'
+
+inputs:
+  cargo-lock-path:
+    description: 'Path to the Cargo.lock file'
+    required: false
+    default: 'Cargo.lock'
+  min-age-days:
+    description: 'Minimum age in days. Packages newer than this are flagged (supply chain security).'
+    required: false
+  max-age-days:
+    description: 'Maximum age in days. Packages older than this are flagged (staleness).'
+    required: false
+  exempt-packages:
+    description: 'Newline-separated list of package names to exempt from checks'
+    required: false
+    default: ''
+  include-missing:
+    description: 'Whether to flag packages whose publish date cannot be determined'
+    required: false
+    default: 'true'
+  timeout:
+    description: 'HTTP request timeout in seconds'
+    required: false
+    default: '10'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+    - name: Cache cargo-oxidate binary
+      id: cache-binary
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ~/.cargo-oxidate-bin
+        key: cargo-oxidate-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'src/**') }}
+
+    - name: Build cargo-oxidate
+      if: steps.cache-binary.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        cd ${{ github.action_path }}
+        cargo build --release
+        mkdir -p ~/.cargo-oxidate-bin
+        cp target/release/cargo-oxidate ~/.cargo-oxidate-bin/
+
+    - name: Run cargo-oxidate
+      shell: bash
+      env:
+        INPUT_CARGO_LOCK_PATH: ${{ inputs.cargo-lock-path }}
+        INPUT_MIN_AGE_DAYS: ${{ inputs.min-age-days }}
+        INPUT_MAX_AGE_DAYS: ${{ inputs.max-age-days }}
+        INPUT_EXEMPT_PACKAGES: ${{ inputs.exempt-packages }}
+        INPUT_INCLUDE_MISSING: ${{ inputs.include-missing }}
+        INPUT_TIMEOUT: ${{ inputs.timeout }}
+      run: |
+        ARGS=("$INPUT_CARGO_LOCK_PATH")
+
+        if [ -n "$INPUT_MIN_AGE_DAYS" ]; then
+          ARGS+=("--min-age-days" "$INPUT_MIN_AGE_DAYS")
+        fi
+
+        if [ -n "$INPUT_MAX_AGE_DAYS" ]; then
+          ARGS+=("--max-age-days" "$INPUT_MAX_AGE_DAYS")
+        fi
+
+        if [ "$INPUT_INCLUDE_MISSING" = "true" ]; then
+          ARGS+=("--include-missing")
+        fi
+
+        if [ -n "$INPUT_TIMEOUT" ]; then
+          ARGS+=("--timeout" "$INPUT_TIMEOUT")
+        fi
+
+        # Convert multiline exempt-packages input to comma-separated
+        if [ -n "$INPUT_EXEMPT_PACKAGES" ]; then
+          EXEMPT=$(echo "$INPUT_EXEMPT_PACKAGES" | tr '\n' ',' | sed 's/,*$//')
+          if [ -n "$EXEMPT" ]; then
+            ARGS+=("--exempt" "$EXEMPT")
+          fi
+        fi
+
+        ~/.cargo-oxidate-bin/cargo-oxidate "${ARGS[@]}"
