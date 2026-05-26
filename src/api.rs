@@ -1,6 +1,5 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
-use reqwest::Client;
 use serde::Deserialize;
 use std::time::Duration;
 
@@ -35,49 +34,45 @@ impl std::fmt::Display for FetchError {
 impl std::error::Error for FetchError {}
 
 pub struct CratesIoClient {
-    client: Client,
+    agent: ureq::Agent,
 }
 
 impl CratesIoClient {
     pub fn new(timeout_secs: u64) -> Result<Self> {
-        let client = Client::builder()
+        let agent = ureq::Agent::config_builder()
             .user_agent("cargo-oxidate/0.1 (https://github.com/timweri/cargo-oxidate)")
-            .timeout(Duration::from_secs(timeout_secs))
+            .timeout_global(Some(Duration::from_secs(timeout_secs)))
+            .http_status_as_error(false)
             .build()
-            .context("Failed to build HTTP client")?;
+            .new_agent();
 
-        Ok(Self { client })
+        Ok(Self { agent })
     }
 
-    pub async fn fetch_publish_date(
+    pub fn fetch_publish_date(
         &self,
         name: &str,
         version: &str,
     ) -> Result<Option<DateTime<Utc>>, FetchError> {
         let url = format!("https://crates.io/api/v1/crates/{name}/{version}");
 
-        let response = match self.client.get(&url).send().await {
+        let mut response = match self.agent.get(&url).call() {
             Ok(resp) => resp,
             Err(e) => {
-                // Classify reqwest errors
-                if e.is_timeout() || e.is_connect() {
-                    return Err(FetchError::Retryable(format!(
-                        "Network error for {name}@{version}: {e}"
-                    )));
-                }
-                return Err(FetchError::Permanent(format!(
-                    "Request failed for {name}@{version}: {e}"
+                // Classify ureq errors (network/timeout)
+                return Err(FetchError::Retryable(format!(
+                    "Network error for {name}@{version}: {e}"
                 )));
             }
         };
 
         let status = response.status();
 
-        if status == reqwest::StatusCode::NOT_FOUND {
+        if status == 404 {
             return Ok(None);
         }
 
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        if status == 429 {
             return Err(FetchError::Retryable(format!(
                 "Rate limited for {name}@{version}"
             )));
@@ -95,7 +90,7 @@ impl CratesIoClient {
             )));
         }
 
-        let data: CrateVersionResponse = response.json().await.map_err(|e| {
+        let data: CrateVersionResponse = response.body_mut().read_json().map_err(|e| {
             FetchError::Permanent(format!(
                 "Failed to parse response for {name}@{version}: {e}"
             ))
@@ -104,7 +99,7 @@ impl CratesIoClient {
         Ok(Some(data.version.created_at))
     }
 
-    pub async fn fetch_publish_date_with_retry(
+    pub fn fetch_publish_date_with_retry(
         &self,
         name: &str,
         version: &str,
@@ -112,12 +107,12 @@ impl CratesIoClient {
         let mut last_error = None;
 
         for attempt in 0..3 {
-            match self.fetch_publish_date(name, version).await {
+            match self.fetch_publish_date(name, version) {
                 Ok(result) => return Ok(result),
                 Err(FetchError::Permanent(msg)) => return Err(FetchError::Permanent(msg)),
                 Err(e) => {
                     if attempt < 2 {
-                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        std::thread::sleep(Duration::from_millis(500));
                     }
                     last_error = Some(e);
                 }

@@ -40,8 +40,7 @@ struct Cli {
     timeout: u64,
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     // Filter out the "oxidate" subcommand name that cargo passes when invoked as `cargo oxidate`
     let args: Vec<String> = std::env::args()
         .enumerate()
@@ -50,7 +49,7 @@ async fn main() -> ExitCode {
         .collect();
     let cli = Cli::parse_from(args);
 
-    match run(cli).await {
+    match run(cli) {
         Ok(has_violations) => {
             if has_violations {
                 ExitCode::from(1)
@@ -65,7 +64,7 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(cli: Cli) -> Result<bool> {
+fn run(cli: Cli) -> Result<bool> {
     // Validate that at least one threshold is set
     if cli.min_age_days.is_none() && cli.max_age_days.is_none() {
         anyhow::bail!("At least one of --min-age-days or --max-age-days must be specified");
@@ -138,8 +137,7 @@ async fn run(cli: Cli) -> Result<bool> {
         );
 
         let result = client
-            .fetch_publish_date_with_retry(&pkg.name, &pkg.version)
-            .await;
+            .fetch_publish_date_with_retry(&pkg.name, &pkg.version);
 
         match result {
             Ok(Some(published)) => {
@@ -193,7 +191,7 @@ async fn run(cli: Cli) -> Result<bool> {
         }
 
         // Rate limit: 100ms between requests
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
     eprintln!(); // Clear progress line
 
