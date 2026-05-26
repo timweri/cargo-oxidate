@@ -138,8 +138,8 @@ fn run(cli: Cli) -> Result<bool> {
             continue;
         }
 
-        eprint!(
-            "\r  Checking [{}/{}] {}@{}",
+        eprintln!(
+            "  Checking [{}/{}] {}@{}",
             i + 1,
             total,
             pkg.name,
@@ -202,7 +202,6 @@ fn run(cli: Cli) -> Result<bool> {
         // Rate limit: 100ms between requests
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    eprintln!(); // Clear progress line
 
     // Print report
     report::print_report(&violations);
@@ -220,8 +219,8 @@ fn run(cli: Cli) -> Result<bool> {
         if !too_new_violations.is_empty() {
             eprintln!("\nFetching version suggestions...");
             for (i, violation) in too_new_violations.iter().enumerate() {
-                eprint!(
-                    "\r  [{}/{}] {}",
+                eprintln!(
+                    "  [{}/{}] {}",
                     i + 1,
                     too_new_violations.len(),
                     violation.package
@@ -249,7 +248,6 @@ fn run(cli: Cli) -> Result<bool> {
 
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            eprintln!(); // Clear progress line
 
             report::print_suggestions(&suggestions);
         }
