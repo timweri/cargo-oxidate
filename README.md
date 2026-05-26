@@ -1,6 +1,6 @@
 # cargo-oxidate
 
-Check Cargo dependency freshness — flags packages in `Cargo.lock` that are too new (supply chain risk) or too old (staleness).
+Check `Cargo.lock` for packages that are too new (supply chain risk) or too old (staleness/CVE risk).
 
 ## Installation
 
