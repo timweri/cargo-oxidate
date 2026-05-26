@@ -42,7 +42,7 @@ At least one of `--min-age-days` or `--max-age-days` must be specified.
 This tool is also available as a GitHub Action. See [examples/usage.yml](examples/usage.yml) or use it in your workflow:
 
 ```yaml
-- uses: timweri/cargo-oxidate@v1
+- uses: timweri/cargo-oxidate@v0.1.4
   with:
     min-age-days: 14
     max-age-days: 730
