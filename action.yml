@@ -1,4 +1,4 @@
-name: 'Cargo Oxidate'
+name: 'cargo-oxidate'
 description: 'Check Cargo dependency freshness - flags packages that are too new (supply chain risk) or too old (staleness)'
 author: 'Thanh Nguyen (timweri), Mitchell Grenier (obelisk)'
 
