@@ -8,7 +8,12 @@ mod lockfile;
 mod report;
 
 #[derive(Parser, Debug)]
-#[command(name = "cargo-oxidate", version, about = "Check Cargo dependency freshness")]
+#[command(
+    name = "cargo-oxidate",
+    version,
+    about = "Check Cargo dependency freshness",
+    after_help = "By default, packages whose publish date cannot be determined are treated as violations. Use --exclude-missing to suppress them."
+)]
 struct Cli {
     /// Path to the Cargo.lock file
     #[arg(default_value = "Cargo.lock")]
@@ -26,7 +31,7 @@ struct Cli {
     #[arg(long, value_delimiter = ',')]
     exempt: Vec<String>,
 
-    /// Exclude packages whose publish date cannot be determined
+    /// Exclude packages whose publish date cannot be determined from violations (by default they are included)
     #[arg(long)]
     exclude_missing: bool,
 

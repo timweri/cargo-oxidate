@@ -21,10 +21,10 @@ inputs:
     description: 'Newline-separated list of package names to exempt from checks'
     required: false
     default: ''
-  include-missing:
-    description: 'Whether to flag packages whose publish date cannot be determined'
+  exclude-missing:
+    description: 'Exclude packages whose publish date cannot be determined from violations (by default they are included)'
     required: false
-    default: 'true'
+    default: 'false'
   timeout:
     description: 'HTTP request timeout in seconds'
     required: false
@@ -59,7 +59,7 @@ runs:
         INPUT_MIN_AGE_DAYS: ${{ inputs.min-age-days }}
         INPUT_MAX_AGE_DAYS: ${{ inputs.max-age-days }}
         INPUT_EXEMPT_PACKAGES: ${{ inputs.exempt-packages }}
-        INPUT_INCLUDE_MISSING: ${{ inputs.include-missing }}
+        INPUT_EXCLUDE_MISSING: ${{ inputs.exclude-missing }}
         INPUT_TIMEOUT: ${{ inputs.timeout }}
       run: |
         ARGS=("$INPUT_CARGO_LOCK_PATH")
@@ -72,8 +72,8 @@ runs:
           ARGS+=("--max-age-days" "$INPUT_MAX_AGE_DAYS")
         fi
 
-        if [ "$INPUT_INCLUDE_MISSING" = "true" ]; then
-          ARGS+=("--include-missing")
+        if [ "$INPUT_EXCLUDE_MISSING" = "true" ]; then
+          ARGS+=("--exclude-missing")
         fi
 
         if [ -n "$INPUT_TIMEOUT" ]; then
