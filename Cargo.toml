@@ -2,7 +2,7 @@
 name = "cargo-oxidate"
 version = "0.1.1"
 edition = "2024"
-description = "Check Cargo dependency freshness - flags packages that are too new or too old"
+description = "Check Cargo dependency for packages that are too new or too old"
 license = "MIT"
 authors = ["Thanh Nguyen (timweri)", "Mitchell Grenier (obelisk)"]
 repository = "https://github.com/timweri/cargo-oxidate"
