@@ -26,9 +26,9 @@ struct Cli {
     #[arg(long, value_delimiter = ',')]
     exempt: Vec<String>,
 
-    /// Flag packages whose publish date cannot be determined
-    #[arg(long, default_value_t = true)]
-    include_missing: bool,
+    /// Exclude packages whose publish date cannot be determined
+    #[arg(long)]
+    exclude_missing: bool,
 
     /// HTTP request timeout in seconds
     #[arg(long, default_value_t = 10)]
@@ -60,8 +60,52 @@ async fn run() -> Result<bool> {
         anyhow::bail!("At least one of --min-age-days or --max-age-days must be specified");
     }
 
+    // Validate cargo-lock path
+    let cargo_lock_path = {
+        let path = &cli.cargo_lock;
+
+        // Resolve the path to catch traversal
+        let resolved = if path.is_absolute() {
+            path.clone()
+        } else {
+            std::env::current_dir()
+                .context("Failed to get current directory")?
+                .join(path)
+        };
+
+        // Canonicalize to resolve symlinks and ".." components
+        // (file must exist for canonicalize to succeed)
+        let canonical = resolved.canonicalize().context(format!(
+            "Cargo.lock path does not exist or is not accessible: {}",
+            path.display()
+        ))?;
+
+        // Ensure it's a regular file
+        if !canonical.is_file() {
+            anyhow::bail!(
+                "Cargo.lock path is not a regular file: {}",
+                path.display()
+            );
+        }
+
+        // Ensure the resolved path is within the current working directory
+        let cwd = std::env::current_dir()
+            .context("Failed to get current directory")?
+            .canonicalize()
+            .context("Failed to canonicalize current directory")?;
+
+        if !canonical.starts_with(&cwd) {
+            anyhow::bail!(
+                "Cargo.lock path escapes the working directory: {}",
+                path.display()
+            );
+        }
+
+        canonical
+    };
+
     // Parse lockfile
-    let packages = lockfile::parse_lockfile(&cli.cargo_lock)
+    let packages = lockfile::parse_lockfile(&cargo_lock_path)
         .context("Failed to parse Cargo.lock")?;
 
     // Build API client
@@ -80,7 +124,9 @@ async fn run() -> Result<bool> {
 
         eprint!("\r  Checking [{}/{}] {}@{}", i + 1, total, pkg.name, pkg.version);
 
-        match client.fetch_publish_date(&pkg.name, &pkg.version).await {
+        let result = client.fetch_publish_date_with_retry(&pkg.name, &pkg.version).await;
+
+        match result {
             Ok(Some(published)) => {
                 let age_days = (chrono::Utc::now() - published).num_days();
 
@@ -90,7 +136,6 @@ async fn run() -> Result<bool> {
                         version: pkg.version.clone(),
                         kind: report::ViolationKind::TooNew,
                         age_days,
-                        threshold: min,
                         published: Some(published),
                     });
                 }
@@ -101,32 +146,27 @@ async fn run() -> Result<bool> {
                         version: pkg.version.clone(),
                         kind: report::ViolationKind::TooOld,
                         age_days,
-                        threshold: max,
                         published: Some(published),
                     });
                 }
             }
-            Ok(None) => {
-                if cli.include_missing {
-                    violations.push(report::Violation {
-                        package: pkg.name.clone(),
-                        version: pkg.version.clone(),
-                        kind: report::ViolationKind::Unknown,
-                        age_days: 0,
-                        threshold: 0,
-                        published: None,
-                    });
+            Ok(None) | Err(_) => {
+                if let Err(ref e) = result {
+                    let severity = match e {
+                        api::FetchError::Retryable(_) => "transient",
+                        api::FetchError::Permanent(_) => "permanent",
+                    };
+                    eprintln!(
+                        "\n  Warning: {severity} error checking {}@{}: {e}",
+                        pkg.name, pkg.version
+                    );
                 }
-            }
-            Err(e) => {
-                eprintln!("\n  Warning: failed to check {}@{}: {}", pkg.name, pkg.version, e);
-                if cli.include_missing {
+                if !cli.exclude_missing {
                     violations.push(report::Violation {
                         package: pkg.name.clone(),
                         version: pkg.version.clone(),
                         kind: report::ViolationKind::Unknown,
                         age_days: 0,
-                        threshold: 0,
                         published: None,
                     });
                 }
