@@ -29,6 +29,10 @@ inputs:
     description: 'HTTP request timeout in seconds'
     required: false
     default: '10'
+  suggest-fix:
+    description: 'For "too new" violations, suggest cargo update commands to downgrade to compliant versions'
+    required: false
+    default: 'false'
 
 runs:
   using: 'composite'
@@ -61,6 +65,7 @@ runs:
         INPUT_EXEMPT_PACKAGES: ${{ inputs.exempt-packages }}
         INPUT_EXCLUDE_MISSING: ${{ inputs.exclude-missing }}
         INPUT_TIMEOUT: ${{ inputs.timeout }}
+        INPUT_SUGGEST_FIX: ${{ inputs.suggest-fix }}
       run: |
         ARGS=("$INPUT_CARGO_LOCK_PATH")
 
@@ -78,6 +83,10 @@ runs:
 
         if [ -n "$INPUT_TIMEOUT" ]; then
           ARGS+=("--timeout" "$INPUT_TIMEOUT")
+        fi
+
+        if [ "$INPUT_SUGGEST_FIX" = "true" ]; then
+          ARGS+=("--suggest-fix")
         fi
 
         # Convert multiline exempt-packages input to comma-separated

@@ -1,3 +1,4 @@
+use crate::suggest;
 use chrono::{DateTime, Utc};
 
 pub enum ViolationKind {
@@ -82,4 +83,29 @@ pub fn print_report(violations: &[Violation]) {
         }
         println!();
     }
+}
+
+pub fn print_suggestions(suggestions: &[suggest::Suggestion]) {
+    if suggestions.is_empty() {
+        println!("\n⚠️  No compliant versions found for any \"too new\" violations.");
+        println!("    Consider adding these packages to --exempt if they are trusted.\n");
+        return;
+    }
+
+    println!("\n💡 Suggested fixes for \"too new\" violations:\n");
+
+    for s in suggestions {
+        println!(
+            "    cargo update -p {} --precise {}    # {} days old",
+            s.package, s.suggested_version, s.suggested_age_days
+        );
+    }
+
+    println!(
+        r#"
+  Note: These suggestions pick the newest version that satisfies --min-age-days.
+  They may not be compatible with your Cargo.toml version requirements.
+  For transitive dependencies, run `cargo tree -i <pkg>` to find the parent.
+"#
+    );
 }

@@ -27,6 +27,7 @@ cargo-oxidate Cargo.lock --min-age-days 14 --max-age-days 730
 | `--exempt pkg1,pkg2` | Comma-separated packages to skip |
 | `--exclude-missing` | Don't flag packages with unknown publish dates |
 | `--timeout N` | HTTP timeout in seconds (default: 10) |
+| `--suggest-fix` | For "too new" violations, suggest `cargo update` commands to downgrade |
 
 At least one of `--min-age-days` or `--max-age-days` must be specified.
 

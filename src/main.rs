@@ -6,6 +6,7 @@ use std::process::ExitCode;
 mod api;
 mod lockfile;
 mod report;
+mod suggest;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -38,6 +39,10 @@ struct Cli {
     /// HTTP request timeout in seconds
     #[arg(long, default_value_t = 10)]
     timeout: u64,
+
+    /// For "too new" violations, suggest cargo update commands to downgrade to compliant versions
+    #[arg(long)]
+    suggest_fix: bool,
 }
 
 fn main() -> ExitCode {
@@ -68,6 +73,11 @@ fn run(cli: Cli) -> Result<bool> {
     // Validate that at least one threshold is set
     if cli.min_age_days.is_none() && cli.max_age_days.is_none() {
         anyhow::bail!("At least one of --min-age-days or --max-age-days must be specified");
+    }
+
+    // Validate that --suggest-fix requires --min-age-days
+    if cli.suggest_fix && cli.min_age_days.is_none() {
+        anyhow::bail!("--suggest-fix requires --min-age-days to be specified");
     }
 
     // Validate cargo-lock path
@@ -196,6 +206,55 @@ fn run(cli: Cli) -> Result<bool> {
 
     // Print report
     report::print_report(&violations);
+
+    // Generate suggestions if requested
+    if cli.suggest_fix {
+        // Safe to unwrap: validated at start of run()
+        let min_age = cli.min_age_days.unwrap();
+        let mut suggestions = Vec::new();
+        let too_new_violations: Vec<_> = violations
+            .iter()
+            .filter(|v| matches!(v.kind, report::ViolationKind::TooNew))
+            .collect();
+
+        if !too_new_violations.is_empty() {
+            eprintln!("\nFetching version suggestions...");
+            for (i, violation) in too_new_violations.iter().enumerate() {
+                eprint!(
+                    "\r  [{}/{}] {}",
+                    i + 1,
+                    too_new_violations.len(),
+                    violation.package
+                );
+
+                match client.fetch_all_versions_with_retry(&violation.package) {
+                    Ok(versions) => {
+                        if let Some((suggested_version, age_days)) =
+                            suggest::find_compliant_version(&versions, min_age)
+                        {
+                            suggestions.push(suggest::Suggestion {
+                                package: violation.package.clone(),
+                                current_version: violation.version.clone(),
+                                suggested_version,
+                                suggested_age_days: age_days,
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "\n  Warning: failed to fetch versions for {}: {e}",
+                            violation.package
+                        );
+                    }
+                }
+
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            eprintln!(); // Clear progress line
+
+            report::print_suggestions(&suggestions);
+        }
+    }
 
     Ok(!violations.is_empty())
 }
