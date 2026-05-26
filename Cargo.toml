@@ -5,6 +5,16 @@ edition = "2024"
 description = "Check Cargo dependency freshness - flags packages that are too new or too old"
 license = "MIT"
 authors = ["Thanh Nguyen (timweri)", "Mitchell Grenier (obelisk)"]
+repository = "https://github.com/timweri/cargo-oxidate"
+homepage = "https://github.com/timweri/cargo-oxidate"
+readme = "README.md"
+keywords = ["cargo", "dependencies", "security", "supply-chain", "freshness"]
+categories = ["command-line-utilities", "development-tools::cargo-plugins"]
+exclude = [
+    "action.yml",
+    "examples/",
+    ".github/",
+]
 
 [[bin]]
 name = "cargo-oxidate"

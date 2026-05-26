@@ -42,7 +42,15 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    match run().await {
+    // Filter out the "oxidate" subcommand name that cargo passes when invoked as `cargo oxidate`
+    let args: Vec<String> = std::env::args()
+        .enumerate()
+        .filter(|(i, arg)| !(*i == 1 && arg == "oxidate"))
+        .map(|(_, arg)| arg)
+        .collect();
+    let cli = Cli::parse_from(args);
+
+    match run(cli).await {
         Ok(has_violations) => {
             if has_violations {
                 ExitCode::from(1)
@@ -57,9 +65,7 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run() -> Result<bool> {
-    let cli = Cli::parse();
-
+async fn run(cli: Cli) -> Result<bool> {
     // Validate that at least one threshold is set
     if cli.min_age_days.is_none() && cli.max_age_days.is_none() {
         anyhow::bail!("At least one of --min-age-days or --max-age-days must be specified");
