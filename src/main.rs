@@ -87,10 +87,7 @@ async fn run() -> Result<bool> {
 
         // Ensure it's a regular file
         if !canonical.is_file() {
-            anyhow::bail!(
-                "Cargo.lock path is not a regular file: {}",
-                path.display()
-            );
+            anyhow::bail!("Cargo.lock path is not a regular file: {}", path.display());
         }
 
         // Ensure the resolved path is within the current working directory
@@ -110,16 +107,15 @@ async fn run() -> Result<bool> {
     };
 
     // Parse lockfile
-    let packages = lockfile::parse_lockfile(&cargo_lock_path)
-        .context("Failed to parse Cargo.lock")?;
+    let packages =
+        lockfile::parse_lockfile(&cargo_lock_path).context("Failed to parse Cargo.lock")?;
 
     // Build API client
     let client = api::CratesIoClient::new(cli.timeout)?;
 
     // Check each package
     let mut violations = Vec::new();
-    let exempt_set: std::collections::HashSet<&str> =
-        cli.exempt.iter().map(|s| s.trim()).collect();
+    let exempt_set: std::collections::HashSet<&str> = cli.exempt.iter().map(|s| s.trim()).collect();
 
     let total = packages.len();
     for (i, pkg) in packages.iter().enumerate() {
@@ -127,15 +123,25 @@ async fn run() -> Result<bool> {
             continue;
         }
 
-        eprint!("\r  Checking [{}/{}] {}@{}", i + 1, total, pkg.name, pkg.version);
+        eprint!(
+            "\r  Checking [{}/{}] {}@{}",
+            i + 1,
+            total,
+            pkg.name,
+            pkg.version
+        );
 
-        let result = client.fetch_publish_date_with_retry(&pkg.name, &pkg.version).await;
+        let result = client
+            .fetch_publish_date_with_retry(&pkg.name, &pkg.version)
+            .await;
 
         match result {
             Ok(Some(published)) => {
                 let age_days = (chrono::Utc::now() - published).num_days();
 
-                if let Some(min) = cli.min_age_days && age_days < min as i64 {
+                if let Some(min) = cli.min_age_days
+                    && age_days < min as i64
+                {
                     violations.push(report::Violation {
                         package: pkg.name.clone(),
                         version: pkg.version.clone(),
@@ -145,7 +151,9 @@ async fn run() -> Result<bool> {
                     });
                 }
 
-                if let Some(max) = cli.max_age_days && age_days > max as i64 {
+                if let Some(max) = cli.max_age_days
+                    && age_days > max as i64
+                {
                     violations.push(report::Violation {
                         package: pkg.name.clone(),
                         version: pkg.version.clone(),

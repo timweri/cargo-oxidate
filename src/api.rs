@@ -96,7 +96,9 @@ impl CratesIoClient {
         }
 
         let data: CrateVersionResponse = response.json().await.map_err(|e| {
-            FetchError::Permanent(format!("Failed to parse response for {name}@{version}: {e}"))
+            FetchError::Permanent(format!(
+                "Failed to parse response for {name}@{version}: {e}"
+            ))
         })?;
 
         Ok(Some(data.version.created_at))
