@@ -234,7 +234,6 @@ fn run(cli: Cli) -> Result<bool> {
                         {
                             suggestions.push(suggest::Suggestion {
                                 package: violation.package.clone(),
-                                current_version: violation.version.clone(),
                                 suggested_version,
                                 suggested_age_days: age_days,
                             });

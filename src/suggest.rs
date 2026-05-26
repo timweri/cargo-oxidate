@@ -3,7 +3,6 @@ use chrono::Utc;
 
 pub struct Suggestion {
     pub package: String,
-    pub current_version: String,
     pub suggested_version: String,
     pub suggested_age_days: i64,
 }
