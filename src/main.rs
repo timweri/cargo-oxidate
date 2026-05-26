@@ -136,8 +136,7 @@ fn run(cli: Cli) -> Result<bool> {
             pkg.version
         );
 
-        let result = client
-            .fetch_publish_date_with_retry(&pkg.name, &pkg.version);
+        let result = client.fetch_publish_date_with_retry(&pkg.name, &pkg.version);
 
         match result {
             Ok(Some(published)) => {
