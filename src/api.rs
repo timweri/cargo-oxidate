@@ -56,7 +56,11 @@ pub struct CratesIoClient {
 }
 
 impl CratesIoClient {
-    pub fn new(timeout_secs: u64, cache_path: Option<&Path>, cache_max_age_hours: u64) -> Result<Self> {
+    pub fn new(
+        timeout_secs: u64,
+        cache_path: Option<&Path>,
+        cache_max_age_hours: u64,
+    ) -> Result<Self> {
         let agent = ureq::Agent::config_builder()
             .user_agent("cargo-oxidate/0.1 (https://github.com/timweri/cargo-oxidate)")
             .timeout_global(Some(Duration::from_secs(timeout_secs)))

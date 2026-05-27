@@ -104,19 +104,25 @@ impl ResponseCache {
         };
 
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create cache directory: {}", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create cache directory: {}", parent.display())
+            })?;
         }
 
         let tmp_path = path.with_extension("tmp");
-        let contents = serde_json::to_string(&self.data)
-            .context("Failed to serialize cache data")?;
+        let contents =
+            serde_json::to_string(&self.data).context("Failed to serialize cache data")?;
 
         std::fs::write(&tmp_path, contents)
             .with_context(|| format!("Failed to write cache to {}", tmp_path.display()))?;
 
-        std::fs::rename(&tmp_path, path)
-            .with_context(|| format!("Failed to rename cache from {} to {}", tmp_path.display(), path.display()))?;
+        std::fs::rename(&tmp_path, path).with_context(|| {
+            format!(
+                "Failed to rename cache from {} to {}",
+                tmp_path.display(),
+                path.display()
+            )
+        })?;
 
         Ok(())
     }
@@ -151,7 +157,10 @@ mod tests {
         cache.save().unwrap();
 
         let loaded = ResponseCache::load(Some(&path));
-        assert_eq!(loaded.get_publish_date("serde", "1.0.0"), Some(sample_date()));
+        assert_eq!(
+            loaded.get_publish_date("serde", "1.0.0"),
+            Some(sample_date())
+        );
         assert_eq!(loaded.get_publish_date("serde", "9.9.9"), None);
     }
 
@@ -164,10 +173,18 @@ mod tests {
         cache.set_all_versions("serde", vec![sample_version()]);
 
         // Fresh entry within TTL is returned.
-        assert!(cache.get_all_versions("serde", Duration::hours(1)).is_some());
+        assert!(
+            cache
+                .get_all_versions("serde", Duration::hours(1))
+                .is_some()
+        );
 
         // With TTL of 0 (or negative), the entry is considered stale.
-        assert!(cache.get_all_versions("serde", Duration::seconds(-1)).is_none());
+        assert!(
+            cache
+                .get_all_versions("serde", Duration::seconds(-1))
+                .is_none()
+        );
     }
 
     #[test]
@@ -178,7 +195,11 @@ mod tests {
 
         let cache = ResponseCache::load(Some(&path));
         assert_eq!(cache.get_publish_date("anything", "0.0.1"), None);
-        assert!(cache.get_all_versions("anything", Duration::hours(1)).is_none());
+        assert!(
+            cache
+                .get_all_versions("anything", Duration::hours(1))
+                .is_none()
+        );
     }
 
     #[test]
