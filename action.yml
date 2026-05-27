@@ -33,6 +33,10 @@ inputs:
     description: 'For "too new" violations, suggest cargo update commands to downgrade to compliant versions'
     required: false
     default: 'false'
+  cache-responses:
+    description: 'Cache crates.io API responses between runs'
+    required: false
+    default: 'true'
 
 runs:
   using: 'composite'
@@ -56,6 +60,21 @@ runs:
         mkdir -p ~/.cargo-oxidate-bin
         cp target/release/cargo-oxidate ~/.cargo-oxidate-bin/
 
+    - name: Resolve cache path
+      if: inputs.cache-responses == 'true'
+      id: cache-path
+      shell: bash
+      run: echo "path=$HOME/.cargo-oxidate-cache/responses.json" >> "$GITHUB_OUTPUT"
+
+    - name: Cache crates.io API responses
+      if: inputs.cache-responses == 'true'
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ${{ steps.cache-path.outputs.path }}
+        key: cargo-oxidate-responses-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          cargo-oxidate-responses-
+
     - name: Run cargo-oxidate
       shell: bash
       env:
@@ -66,7 +85,13 @@ runs:
         INPUT_EXCLUDE_MISSING: ${{ inputs.exclude-missing }}
         INPUT_TIMEOUT: ${{ inputs.timeout }}
         INPUT_SUGGEST_FIX: ${{ inputs.suggest-fix }}
+        CARGO_OXIDATE_CACHE_PATH: ${{ steps.cache-path.outputs.path }}
       run: |
+        # Ensure cache directory exists
+        if [ -n "$CARGO_OXIDATE_CACHE_PATH" ]; then
+          mkdir -p "$(dirname "$CARGO_OXIDATE_CACHE_PATH")"
+        fi
+
         ARGS=("$INPUT_CARGO_LOCK_PATH")
 
         if [ -n "$INPUT_MIN_AGE_DAYS" ]; then

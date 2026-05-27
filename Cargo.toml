@@ -22,11 +22,15 @@ path = "src/main.rs"
 
 [dependencies]
 cargo-lock = "10"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 ureq = { version = "3", features = ["rustls", "json"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
 
 # Optimize for small binary size - reduces CI cache/download time
 [profile.release]
