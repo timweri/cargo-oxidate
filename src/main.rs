@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 mod api;
+mod cache;
 mod lockfile;
 mod report;
 mod suggest;
@@ -43,6 +44,14 @@ struct Cli {
     /// For "too new" violations, suggest cargo update commands to downgrade to compliant versions
     #[arg(long)]
     suggest_fix: bool,
+
+    /// Path to the response cache file (enables caching)
+    #[arg(long, env = "CARGO_OXIDATE_CACHE_PATH")]
+    cache_path: Option<PathBuf>,
+
+    /// Maximum age in hours for cached all-versions responses
+    #[arg(long, default_value_t = 24)]
+    cache_max_age_hours: u64,
 }
 
 fn main() -> ExitCode {
@@ -126,7 +135,11 @@ fn run(cli: Cli) -> Result<bool> {
         lockfile::parse_lockfile(&cargo_lock_path).context("Failed to parse Cargo.lock")?;
 
     // Build API client
-    let client = api::CratesIoClient::new(cli.timeout)?;
+    let mut client = api::CratesIoClient::new(
+        cli.timeout,
+        cli.cache_path.as_deref(),
+        cli.cache_max_age_hours,
+    )?;
 
     // Check each package
     let mut violations = Vec::new();
@@ -199,8 +212,7 @@ fn run(cli: Cli) -> Result<bool> {
             }
         }
 
-        // Rate limit: 100ms between requests
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        client.rate_limit();
     }
 
     // Print report
@@ -226,7 +238,9 @@ fn run(cli: Cli) -> Result<bool> {
                     violation.package
                 );
 
-                match client.fetch_all_versions_with_retry(&violation.package) {
+                let result = client.fetch_all_versions_with_retry(&violation.package);
+
+                match result {
                     Ok(versions) => {
                         if let Some((suggested_version, age_days)) =
                             suggest::find_compliant_version(&versions, min_age)
@@ -246,12 +260,14 @@ fn run(cli: Cli) -> Result<bool> {
                     }
                 }
 
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                client.rate_limit();
             }
 
             report::print_suggestions(&suggestions);
         }
     }
+
+    client.save_cache();
 
     Ok(!violations.is_empty())
 }

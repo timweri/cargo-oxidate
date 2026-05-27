@@ -1,7 +1,10 @@
 use anyhow::Result;
-use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use serde::{Deserialize, Serialize};
+use std::path::Path;
 use std::time::Duration;
+
+use crate::cache::ResponseCache;
 
 #[derive(Deserialize)]
 struct CrateVersionResponse {
@@ -18,7 +21,7 @@ struct CrateResponse {
     versions: Vec<CrateVersionInfo>,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 pub struct CrateVersionInfo {
     pub num: String,
     pub created_at: DateTime<Utc>,
@@ -47,10 +50,17 @@ impl std::error::Error for FetchError {}
 
 pub struct CratesIoClient {
     agent: ureq::Agent,
+    cache: ResponseCache,
+    cache_max_age_hours: u64,
+    last_was_cache_hit: bool,
 }
 
 impl CratesIoClient {
-    pub fn new(timeout_secs: u64) -> Result<Self> {
+    pub fn new(
+        timeout_secs: u64,
+        cache_path: Option<&Path>,
+        cache_max_age_hours: u64,
+    ) -> Result<Self> {
         let agent = ureq::Agent::config_builder()
             .user_agent("cargo-oxidate/0.1 (https://github.com/timweri/cargo-oxidate)")
             .timeout_global(Some(Duration::from_secs(timeout_secs)))
@@ -58,10 +68,31 @@ impl CratesIoClient {
             .build()
             .new_agent();
 
-        Ok(Self { agent })
+        let cache = ResponseCache::load(cache_path);
+
+        Ok(Self {
+            agent,
+            cache,
+            cache_max_age_hours,
+            last_was_cache_hit: false,
+        })
     }
 
-    pub fn fetch_publish_date(
+    pub fn save_cache(&self) {
+        if let Err(e) = self.cache.save() {
+            eprintln!("Warning: failed to save cache: {e}");
+        }
+    }
+
+    /// Sleeps for the inter-request rate limit window if the most recent fetch
+    /// hit the network. No-op if it was served from cache.
+    pub fn rate_limit(&self) {
+        if !self.last_was_cache_hit {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn fetch_publish_date_uncached(
         &self,
         name: &str,
         version: &str,
@@ -112,15 +143,26 @@ impl CratesIoClient {
     }
 
     pub fn fetch_publish_date_with_retry(
-        &self,
+        &mut self,
         name: &str,
         version: &str,
     ) -> Result<Option<DateTime<Utc>>, FetchError> {
+        if let Some(date) = self.cache.get_publish_date(name, version) {
+            self.last_was_cache_hit = true;
+            return Ok(Some(date));
+        }
+
+        self.last_was_cache_hit = false;
         let mut last_error = None;
 
         for attempt in 0..3 {
-            match self.fetch_publish_date(name, version) {
-                Ok(result) => return Ok(result),
+            match self.fetch_publish_date_uncached(name, version) {
+                Ok(result) => {
+                    if let Some(date) = result {
+                        self.cache.set_publish_date(name, version, date);
+                    }
+                    return Ok(result);
+                }
                 Err(FetchError::Permanent(msg)) => return Err(FetchError::Permanent(msg)),
                 Err(e) => {
                     if attempt < 2 {
@@ -134,7 +176,7 @@ impl CratesIoClient {
         Err(last_error.unwrap())
     }
 
-    pub fn fetch_all_versions(&self, name: &str) -> Result<Vec<CrateVersionInfo>, FetchError> {
+    fn fetch_all_versions_uncached(&self, name: &str) -> Result<Vec<CrateVersionInfo>, FetchError> {
         let url = format!("https://crates.io/api/v1/crates/{name}");
 
         let mut response = match self.agent.get(&url).call() {
@@ -178,14 +220,27 @@ impl CratesIoClient {
     }
 
     pub fn fetch_all_versions_with_retry(
-        &self,
+        &mut self,
         name: &str,
     ) -> Result<Vec<CrateVersionInfo>, FetchError> {
+        let max_age = ChronoDuration::hours(self.cache_max_age_hours as i64);
+
+        if let Some(versions) = self.cache.get_all_versions(name, max_age) {
+            self.last_was_cache_hit = true;
+            return Ok(versions);
+        }
+
+        self.last_was_cache_hit = false;
         let mut last_error = None;
 
         for attempt in 0..3 {
-            match self.fetch_all_versions(name) {
-                Ok(result) => return Ok(result),
+            match self.fetch_all_versions_uncached(name) {
+                Ok(result) => {
+                    if !result.is_empty() {
+                        self.cache.set_all_versions(name, result.clone());
+                    }
+                    return Ok(result);
+                }
                 Err(FetchError::Permanent(msg)) => return Err(FetchError::Permanent(msg)),
                 Err(e) => {
                     if attempt < 2 {

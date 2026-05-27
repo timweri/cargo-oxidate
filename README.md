@@ -28,6 +28,8 @@ cargo-oxidate Cargo.lock --min-age-days 14 --max-age-days 730
 | `--exclude-missing` | Don't flag packages with unknown publish dates |
 | `--timeout N` | HTTP timeout in seconds (default: 10) |
 | `--suggest-fix` | For "too new" violations, suggest `cargo update` commands to downgrade |
+| `--cache-path PATH` | Enable response caching at PATH (or set `CARGO_OXIDATE_CACHE_PATH`) |
+| `--cache-max-age-hours N` | Max age for cached version listings (default: 24) |
 
 At least one of `--min-age-days` or `--max-age-days` must be specified.
 
@@ -37,16 +39,29 @@ At least one of `--min-age-days` or `--max-age-days` must be specified.
 - `1` — Violations detected
 - `2` — Runtime error
 
+## Caching
+
+Repeat runs can reuse crates.io API responses by passing `--cache-path`:
+
+```sh
+cargo oxidate --cache-path .cache/oxidate.json --min-age-days 14
+```
+
+Per-version publish dates are cached indefinitely (they're immutable on crates.io). Per-crate version listings expire after `--cache-max-age-hours` (default 24h) so newly published versions are picked up.
+
 ## GitHub Action
 
 This tool is also available as a GitHub Action. See [examples/usage.yml](examples/usage.yml) or use it in your workflow:
 
 ```yaml
-- uses: timweri/cargo-oxidate@v0.1.4
+- uses: timweri/cargo-oxidate@v0.1.5
   with:
     min-age-days: 14
     max-age-days: 730
+    cache-responses: true  # default; set to 'false' to disable
 ```
+
+When `cache-responses` is enabled (the default), the action wires up `actions/cache` keyed on the `Cargo.lock` hash so subsequent runs skip already-fetched crates.io responses.
 
 ## License
 
