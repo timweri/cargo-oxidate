@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use crate::api::CrateVersionInfo;
 
+const CACHE_VERSION: u32 = 1;
+
 #[derive(Serialize, Deserialize, Default)]
 struct CacheData {
     version: u32,
@@ -32,26 +34,37 @@ impl ResponseCache {
         let data = if let Some(ref p) = path {
             match std::fs::read_to_string(p) {
                 Ok(contents) => match serde_json::from_str::<CacheData>(&contents) {
-                    Ok(data) => data,
+                    Ok(data) if data.version == CACHE_VERSION => data,
+                    Ok(data) => {
+                        eprintln!(
+                            "Warning: unsupported cache version {} at {}, starting fresh",
+                            data.version,
+                            p.display()
+                        );
+                        CacheData {
+                            version: CACHE_VERSION,
+                            ..Default::default()
+                        }
+                    }
                     Err(e) => {
                         eprintln!(
                             "Warning: corrupted cache file at {}, starting fresh: {e}",
                             p.display()
                         );
                         CacheData {
-                            version: 1,
+                            version: CACHE_VERSION,
                             ..Default::default()
                         }
                     }
                 },
                 Err(_) => CacheData {
-                    version: 1,
+                    version: CACHE_VERSION,
                     ..Default::default()
                 },
             }
         } else {
             CacheData {
-                version: 1,
+                version: CACHE_VERSION,
                 ..Default::default()
             }
         };
@@ -242,5 +255,24 @@ mod tests {
         cache.set_publish_date("serde", "1.0.0", sample_date());
         // Should not panic or error even though there's no path.
         cache.save().unwrap();
+    }
+
+    #[test]
+    fn load_wrong_version_starts_fresh() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cache.json");
+
+        // Write cache with wrong version
+        std::fs::write(
+            &path,
+            r#"{"version":99,"publish_dates":{"serde/1.0.0":"2020-01-01T00:00:00Z"},"all_versions":{}}"#,
+        )
+        .unwrap();
+
+        let cache = ResponseCache::load(Some(&path));
+
+        // Should have cleared the data and started fresh
+        assert_eq!(cache.get_publish_date("serde", "1.0.0"), None);
+        assert_eq!(cache.data.version, CACHE_VERSION);
     }
 }
