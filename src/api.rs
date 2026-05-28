@@ -1,5 +1,6 @@
 use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::Duration;
@@ -92,19 +93,24 @@ impl CratesIoClient {
         }
     }
 
-    fn fetch_publish_date_uncached(
+    /// Issues a GET, classifies HTTP errors, and parses JSON.
+    ///
+    /// Returns `Ok(None)` on HTTP 404 — this is hardcoded; callers that need a
+    /// different 404 policy must wrap or replace this helper.
+    ///
+    /// `subject` is the trailing fragment used in every error message
+    /// (`"Network error {subject}: …"`, `"Rate limited {subject}"`, …,
+    /// `"Failed to parse response {subject}: …"`).
+    fn fetch_json<T: DeserializeOwned>(
         &self,
-        name: &str,
-        version: &str,
-    ) -> Result<Option<DateTime<Utc>>, FetchError> {
-        let url = format!("https://crates.io/api/v1/crates/{name}/{version}");
-
-        let mut response = match self.agent.get(&url).call() {
+        url: &str,
+        subject: &str,
+    ) -> Result<Option<T>, FetchError> {
+        let mut response = match self.agent.get(url).call() {
             Ok(resp) => resp,
             Err(e) => {
-                // Classify ureq errors (network/timeout)
                 return Err(FetchError::Retryable(format!(
-                    "Network error for {name}@{version}: {e}"
+                    "Network error {subject}: {e}"
                 )));
             }
         };
@@ -116,53 +122,39 @@ impl CratesIoClient {
         }
 
         if status == 429 {
-            return Err(FetchError::Retryable(format!(
-                "Rate limited for {name}@{version}"
-            )));
+            return Err(FetchError::Retryable(format!("Rate limited {subject}")));
         }
 
         if status.is_server_error() {
             return Err(FetchError::Retryable(format!(
-                "Server error {status} for {name}@{version}"
+                "Server error {status} {subject}"
             )));
         }
 
         if status.is_client_error() {
             return Err(FetchError::Permanent(format!(
-                "Client error {status} for {name}@{version}"
+                "Client error {status} {subject}"
             )));
         }
 
-        let data: CrateVersionResponse = response.body_mut().read_json().map_err(|e| {
-            FetchError::Permanent(format!(
-                "Failed to parse response for {name}@{version}: {e}"
-            ))
+        let data: T = response.body_mut().read_json().map_err(|e| {
+            FetchError::Permanent(format!("Failed to parse response {subject}: {e}"))
         })?;
 
-        Ok(Some(data.version.created_at))
+        Ok(Some(data))
     }
 
-    pub fn fetch_publish_date_with_retry(
+    /// Runs `op` up to 3 times, sleeping 500ms between transient failures.
+    /// `Permanent` errors short-circuit immediately.
+    fn with_retry<T>(
         &mut self,
-        name: &str,
-        version: &str,
-    ) -> Result<Option<DateTime<Utc>>, FetchError> {
-        if let Some(date) = self.cache.get_publish_date(name, version) {
-            self.last_was_cache_hit = true;
-            return Ok(Some(date));
-        }
-
-        self.last_was_cache_hit = false;
+        mut op: impl FnMut(&mut Self) -> Result<T, FetchError>,
+    ) -> Result<T, FetchError> {
         let mut last_error = None;
 
         for attempt in 0..3 {
-            match self.fetch_publish_date_uncached(name, version) {
-                Ok(result) => {
-                    if let Some(date) = result {
-                        self.cache.set_publish_date(name, version, date);
-                    }
-                    return Ok(result);
-                }
+            match op(self) {
+                Ok(result) => return Ok(result),
                 Err(FetchError::Permanent(msg)) => return Err(FetchError::Permanent(msg)),
                 Err(e) => {
                     if attempt < 2 {
@@ -176,47 +168,42 @@ impl CratesIoClient {
         Err(last_error.unwrap())
     }
 
+    fn fetch_publish_date_uncached(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<DateTime<Utc>>, FetchError> {
+        let url = format!("https://crates.io/api/v1/crates/{name}/{version}");
+        let subject = format!("for {name}@{version}");
+        let data: Option<CrateVersionResponse> = self.fetch_json(&url, &subject)?;
+        Ok(data.map(|d| d.version.created_at))
+    }
+
+    pub fn fetch_publish_date_with_retry(
+        &mut self,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<DateTime<Utc>>, FetchError> {
+        if let Some(date) = self.cache.get_publish_date(name, version) {
+            self.last_was_cache_hit = true;
+            return Ok(Some(date));
+        }
+
+        self.last_was_cache_hit = false;
+        self.with_retry(|client| {
+            let result = client.fetch_publish_date_uncached(name, version)?;
+            if let Some(date) = result {
+                client.cache.set_publish_date(name, version, date);
+            }
+            Ok(result)
+        })
+    }
+
     fn fetch_all_versions_uncached(&self, name: &str) -> Result<Vec<CrateVersionInfo>, FetchError> {
         let url = format!("https://crates.io/api/v1/crates/{name}");
-
-        let mut response = match self.agent.get(&url).call() {
-            Ok(resp) => resp,
-            Err(e) => {
-                return Err(FetchError::Retryable(format!(
-                    "Network error fetching versions for {name}: {e}"
-                )));
-            }
-        };
-
-        let status = response.status();
-
-        if status == 404 {
-            return Ok(Vec::new());
-        }
-
-        if status == 429 {
-            return Err(FetchError::Retryable(format!(
-                "Rate limited fetching versions for {name}"
-            )));
-        }
-
-        if status.is_server_error() {
-            return Err(FetchError::Retryable(format!(
-                "Server error {status} fetching versions for {name}"
-            )));
-        }
-
-        if status.is_client_error() {
-            return Err(FetchError::Permanent(format!(
-                "Client error {status} fetching versions for {name}"
-            )));
-        }
-
-        let data: CrateResponse = response.body_mut().read_json().map_err(|e| {
-            FetchError::Permanent(format!("Failed to parse versions response for {name}: {e}"))
-        })?;
-
-        Ok(data.versions)
+        let subject = format!("fetching versions for {name}");
+        let data: Option<CrateResponse> = self.fetch_json(&url, &subject)?;
+        Ok(data.map(|d| d.versions).unwrap_or_default())
     }
 
     pub fn fetch_all_versions_with_retry(
@@ -231,26 +218,12 @@ impl CratesIoClient {
         }
 
         self.last_was_cache_hit = false;
-        let mut last_error = None;
-
-        for attempt in 0..3 {
-            match self.fetch_all_versions_uncached(name) {
-                Ok(result) => {
-                    if !result.is_empty() {
-                        self.cache.set_all_versions(name, result.clone());
-                    }
-                    return Ok(result);
-                }
-                Err(FetchError::Permanent(msg)) => return Err(FetchError::Permanent(msg)),
-                Err(e) => {
-                    if attempt < 2 {
-                        std::thread::sleep(Duration::from_millis(500));
-                    }
-                    last_error = Some(e);
-                }
+        self.with_retry(|client| {
+            let result = client.fetch_all_versions_uncached(name)?;
+            if !result.is_empty() {
+                client.cache.set_all_versions(name, result.clone());
             }
-        }
-
-        Err(last_error.unwrap())
+            Ok(result)
+        })
     }
 }

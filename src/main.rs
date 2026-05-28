@@ -1,11 +1,10 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 mod api;
 mod cache;
-mod lockfile;
 mod report;
 mod suggest;
 
@@ -54,6 +53,31 @@ struct Cli {
     cache_max_age_hours: u64,
 }
 
+struct Package {
+    name: String,
+    version: String,
+}
+
+fn parse_lockfile(path: &Path) -> Result<Vec<Package>> {
+    let lockfile = cargo_lock::Lockfile::load(path)
+        .context(format!("Could not load lockfile at {}", path.display()))?;
+
+    let packages = lockfile
+        .packages
+        .into_iter()
+        .filter(|p| {
+            // Only check packages from crates.io registry
+            p.source.as_ref().is_some_and(|s| s.is_default_registry())
+        })
+        .map(|p| Package {
+            name: p.name.as_str().to_string(),
+            version: p.version.to_string(),
+        })
+        .collect();
+
+    Ok(packages)
+}
+
 fn main() -> ExitCode {
     // Filter out the "oxidate" subcommand name that cargo passes when invoked as `cargo oxidate`
     let args: Vec<String> = std::env::args()
@@ -76,6 +100,72 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Checks one package's publish date and produces any violations it triggers.
+/// Logs a warning to stderr when the fetch errors out.
+fn check_package(
+    client: &mut api::CratesIoClient,
+    pkg: &Package,
+    min_age_days: Option<u64>,
+    max_age_days: Option<u64>,
+    exclude_missing: bool,
+) -> Vec<report::Violation> {
+    let mut violations = Vec::new();
+    let result = client.fetch_publish_date_with_retry(&pkg.name, &pkg.version);
+
+    match result {
+        Ok(Some(published)) => {
+            let age_days = (chrono::Utc::now() - published).num_days();
+
+            if let Some(min) = min_age_days
+                && age_days < min as i64
+            {
+                violations.push(report::Violation {
+                    package: pkg.name.clone(),
+                    version: pkg.version.clone(),
+                    kind: report::ViolationKind::TooNew,
+                    age_days,
+                    published: Some(published),
+                });
+            }
+
+            if let Some(max) = max_age_days
+                && age_days > max as i64
+            {
+                violations.push(report::Violation {
+                    package: pkg.name.clone(),
+                    version: pkg.version.clone(),
+                    kind: report::ViolationKind::TooOld,
+                    age_days,
+                    published: Some(published),
+                });
+            }
+        }
+        Ok(None) | Err(_) => {
+            if let Err(ref e) = result {
+                let severity = match e {
+                    api::FetchError::Retryable(_) => "transient",
+                    api::FetchError::Permanent(_) => "permanent",
+                };
+                eprintln!(
+                    "\n  Warning: {severity} error checking {}@{}: {e}",
+                    pkg.name, pkg.version
+                );
+            }
+            if !exclude_missing {
+                violations.push(report::Violation {
+                    package: pkg.name.clone(),
+                    version: pkg.version.clone(),
+                    kind: report::ViolationKind::Unknown,
+                    age_days: 0,
+                    published: None,
+                });
+            }
+        }
+    }
+
+    violations
 }
 
 fn run(cli: Cli) -> Result<bool> {
@@ -131,8 +221,7 @@ fn run(cli: Cli) -> Result<bool> {
     };
 
     // Parse lockfile
-    let packages =
-        lockfile::parse_lockfile(&cargo_lock_path).context("Failed to parse Cargo.lock")?;
+    let packages = parse_lockfile(&cargo_lock_path).context("Failed to parse Cargo.lock")?;
 
     // Build API client
     let mut client = api::CratesIoClient::new(
@@ -159,58 +248,13 @@ fn run(cli: Cli) -> Result<bool> {
             pkg.version
         );
 
-        let result = client.fetch_publish_date_with_retry(&pkg.name, &pkg.version);
-
-        match result {
-            Ok(Some(published)) => {
-                let age_days = (chrono::Utc::now() - published).num_days();
-
-                if let Some(min) = cli.min_age_days
-                    && age_days < min as i64
-                {
-                    violations.push(report::Violation {
-                        package: pkg.name.clone(),
-                        version: pkg.version.clone(),
-                        kind: report::ViolationKind::TooNew,
-                        age_days,
-                        published: Some(published),
-                    });
-                }
-
-                if let Some(max) = cli.max_age_days
-                    && age_days > max as i64
-                {
-                    violations.push(report::Violation {
-                        package: pkg.name.clone(),
-                        version: pkg.version.clone(),
-                        kind: report::ViolationKind::TooOld,
-                        age_days,
-                        published: Some(published),
-                    });
-                }
-            }
-            Ok(None) | Err(_) => {
-                if let Err(ref e) = result {
-                    let severity = match e {
-                        api::FetchError::Retryable(_) => "transient",
-                        api::FetchError::Permanent(_) => "permanent",
-                    };
-                    eprintln!(
-                        "\n  Warning: {severity} error checking {}@{}: {e}",
-                        pkg.name, pkg.version
-                    );
-                }
-                if !cli.exclude_missing {
-                    violations.push(report::Violation {
-                        package: pkg.name.clone(),
-                        version: pkg.version.clone(),
-                        kind: report::ViolationKind::Unknown,
-                        age_days: 0,
-                        published: None,
-                    });
-                }
-            }
-        }
+        violations.extend(check_package(
+            &mut client,
+            pkg,
+            cli.min_age_days,
+            cli.max_age_days,
+            cli.exclude_missing,
+        ));
 
         client.rate_limit();
     }
