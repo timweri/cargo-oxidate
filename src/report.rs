@@ -109,3 +109,66 @@ pub fn print_suggestions(suggestions: &[suggest::Suggestion]) {
 "#
     );
 }
+
+pub fn print_upgrade_suggestions(suggestions: &[suggest::UpgradeSuggestion]) {
+    if suggestions.is_empty() {
+        println!("\n✅ All dependencies are already at their newest compliant versions.");
+        return;
+    }
+
+    let direct: Vec<_> = suggestions.iter().filter(|s| s.is_direct).collect();
+    let transitive: Vec<_> = suggestions.iter().filter(|s| !s.is_direct).collect();
+
+    println!(
+        "\n⬆️  {} upgrade(s) available (constrained by --min-age-days):\n",
+        suggestions.len()
+    );
+
+    if !direct.is_empty() {
+        println!("  Direct dependencies:");
+        for s in direct {
+            println!(
+                "    cargo update -p {} --precise {}    # {} -> {}, {} days old",
+                s.package,
+                s.suggested_version,
+                s.current_version,
+                s.suggested_version,
+                s.suggested_age_days
+            );
+        }
+        println!();
+    }
+
+    if !transitive.is_empty() {
+        println!("  Transitive dependencies (compatibility not guaranteed):");
+        for s in transitive {
+            println!(
+                "    cargo update -p {} --precise {}    # {} -> {}, {} days old",
+                s.package,
+                s.suggested_version,
+                s.current_version,
+                s.suggested_version,
+                s.suggested_age_days
+            );
+        }
+        println!();
+    }
+
+    println!(
+        r#"  Note: Direct dependencies are validated against your Cargo.toml version requirements.
+  Transitive dependencies are age-compliant but may not satisfy parent requirements.
+  For transitive dependencies, run `cargo tree -i <pkg>` to find the parent.
+
+  Known limitations:
+  - Pre-release versions (-alpha, -beta, -rc, etc.) are never suggested.
+  - Only [dependencies] in Cargo.toml is parsed. Deps under [dev-dependencies],
+    [build-dependencies], [target.'cfg(...)'.dependencies], or inherited via
+    {{ workspace = true }} may appear in the Transitive section above even
+    though they are direct deps. Renamed deps (package = "...") are also
+    misclassified.
+  - When the lockfile contains multiple versions of the same crate, the
+    `cargo update -p NAME --precise X` lines above are ambiguous. Use
+    `cargo update -p NAME@VERSION --precise X` instead.
+"#
+    );
+}

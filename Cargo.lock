@@ -123,9 +123,11 @@ dependencies = [
  "cargo-lock",
  "chrono",
  "clap",
+ "semver",
  "serde",
  "serde_json",
  "tempfile",
+ "toml",
  "ureq",
 ]
 

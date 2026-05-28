@@ -6,6 +6,7 @@ use std::process::ExitCode;
 mod api;
 mod cache;
 mod lockfile;
+mod manifest;
 mod report;
 mod suggest;
 
@@ -44,6 +45,10 @@ struct Cli {
     /// For "too new" violations, suggest cargo update commands to downgrade to compliant versions
     #[arg(long)]
     suggest_fix: bool,
+
+    /// For all lockfile packages, suggest cargo update commands to upgrade to the newest compliant version
+    #[arg(long)]
+    suggest_upgrade: bool,
 
     /// Path to the response cache file (enables caching)
     #[arg(long, env = "CARGO_OXIDATE_CACHE_PATH")]
@@ -87,6 +92,11 @@ fn run(cli: Cli) -> Result<bool> {
     // Validate that --suggest-fix requires --min-age-days
     if cli.suggest_fix && cli.min_age_days.is_none() {
         anyhow::bail!("--suggest-fix requires --min-age-days to be specified");
+    }
+
+    // Validate that --suggest-upgrade requires --min-age-days
+    if cli.suggest_upgrade && cli.min_age_days.is_none() {
+        anyhow::bail!("--suggest-upgrade requires --min-age-days to be specified");
     }
 
     // Validate cargo-lock path
@@ -265,6 +275,56 @@ fn run(cli: Cli) -> Result<bool> {
 
             report::print_suggestions(&suggestions);
         }
+    }
+
+    // Generate upgrade suggestions if requested
+    if cli.suggest_upgrade {
+        let min_age = cli.min_age_days.unwrap();
+        let mut upgrade_suggestions = Vec::new();
+
+        // Parse Cargo.toml to get version requirements for direct deps
+        // Safe: cargo_lock_path was canonicalized to a regular file above, so it
+        // always has a parent directory.
+        let cargo_toml_path = cargo_lock_path.parent().unwrap().join("Cargo.toml");
+        let version_reqs = manifest::parse_version_requirements(&cargo_toml_path);
+
+        eprintln!("\nFetching upgrade suggestions for all packages...");
+        for (i, pkg) in packages.iter().enumerate() {
+            if exempt_set.contains(pkg.name.as_str()) {
+                continue;
+            }
+
+            eprintln!("  [{}/{}] {}@{}", i + 1, total, pkg.name, pkg.version);
+
+            let result = client.fetch_all_versions_with_retry(&pkg.name);
+
+            match result {
+                Ok(versions) => {
+                    let version_req = version_reqs.get(&pkg.name);
+                    if let Some((suggested_version, age_days)) =
+                        suggest::find_upgrade_version(&versions, min_age, &pkg.version, version_req)
+                    {
+                        upgrade_suggestions.push(suggest::UpgradeSuggestion {
+                            package: pkg.name.clone(),
+                            current_version: pkg.version.clone(),
+                            suggested_version,
+                            suggested_age_days: age_days,
+                            is_direct: version_req.is_some(),
+                        });
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "\n  Warning: failed to fetch versions for {}: {e}",
+                        pkg.name
+                    );
+                }
+            }
+
+            client.rate_limit();
+        }
+
+        report::print_upgrade_suggestions(&upgrade_suggestions);
     }
 
     client.save_cache();
