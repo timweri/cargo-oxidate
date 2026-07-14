@@ -469,12 +469,19 @@ fn build_fix_plan(
         exclude_missing,
         exempt,
     };
-    build_fix_plan_with(&mut backend, &temporary_lockfile, min_age_days, max_age_days)
+    build_fix_plan_with(
+        &mut backend,
+        &temporary_lockfile,
+        manifest_path,
+        min_age_days,
+        max_age_days,
+    )
 }
 
 fn build_fix_plan_with(
     backend: &mut impl FixPlanBackend,
     temporary_lockfile: &Path,
+    manifest_path: &Path,
     min_age_days: u64,
     max_age_days: Option<u64>,
 ) -> Result<FixPlan> {
@@ -522,8 +529,11 @@ fn build_fix_plan_with(
                 )? {
                     None => {
                         commands.push(format!(
-                            "cargo update -p {}@{} --precise {}",
-                            violation.package, violation.version, candidate
+                            "cargo update --manifest-path '{}' -p {}@{} --precise {}",
+                            manifest_path.display(),
+                            violation.package,
+                            violation.version,
+                            candidate
                         ));
                         updated = true;
                         break;
@@ -886,13 +896,20 @@ cc = { workspace = true }
         fake.versions.insert("beta".to_string(), vec![version("2.5.0", 30)]);
         fake.updates.extend([None, None]);
 
-        let plan = build_fix_plan_with(&mut fake, Path::new("Cargo.lock"), 7, None).unwrap();
+        let plan = build_fix_plan_with(
+            &mut fake,
+            Path::new("Cargo.lock"),
+            Path::new("subproject/Cargo.toml"),
+            7,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(
             plan.commands,
             [
-                "cargo update -p alpha@2.0.0 --precise 1.5.0",
-                "cargo update -p beta@3.0.0 --precise 2.5.0",
+                "cargo update --manifest-path 'subproject/Cargo.toml' -p alpha@2.0.0 --precise 1.5.0",
+                "cargo update --manifest-path 'subproject/Cargo.toml' -p beta@3.0.0 --precise 2.5.0",
             ]
         );
         assert_eq!(plan.blocker, None);
@@ -914,9 +931,19 @@ cc = { workspace = true }
         );
         fake.updates.extend([Some("version conflict".to_string()), None]);
 
-        let plan = build_fix_plan_with(&mut fake, Path::new("Cargo.lock"), 7, None).unwrap();
+        let plan = build_fix_plan_with(
+            &mut fake,
+            Path::new("Cargo.lock"),
+            Path::new("Cargo.toml"),
+            7,
+            None,
+        )
+        .unwrap();
 
-        assert_eq!(plan.commands, ["cargo update -p alpha@2.0.0 --precise 1.4.0"]);
+        assert_eq!(
+            plan.commands,
+            ["cargo update --manifest-path 'Cargo.toml' -p alpha@2.0.0 --precise 1.4.0"]
+        );
         assert_eq!(
             fake.update_calls,
             [
@@ -934,7 +961,14 @@ cc = { workspace = true }
         fake.dependencies
             .insert("alpha".to_string(), direct_dependency("alpha", false));
 
-        let plan = build_fix_plan_with(&mut fake, Path::new("Cargo.lock"), 7, None).unwrap();
+        let plan = build_fix_plan_with(
+            &mut fake,
+            Path::new("Cargo.lock"),
+            Path::new("Cargo.toml"),
+            7,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(
             plan.commands,
@@ -954,7 +988,14 @@ cc = { workspace = true }
         fake.dependencies
             .insert("alpha".to_string(), direct_dependency("alpha", true));
 
-        let plan = build_fix_plan_with(&mut fake, Path::new("Cargo.lock"), 7, None).unwrap();
+        let plan = build_fix_plan_with(
+            &mut fake,
+            Path::new("Cargo.lock"),
+            Path::new("Cargo.toml"),
+            7,
+            None,
+        )
+        .unwrap();
 
         assert!(plan.commands.is_empty());
         assert!(plan
@@ -970,7 +1011,14 @@ cc = { workspace = true }
         fake.fetch_failures.insert("alpha".to_string());
         fake.versions.insert("beta".to_string(), vec![version("2.0.0", 30)]);
 
-        let plan = build_fix_plan_with(&mut fake, Path::new("Cargo.lock"), 7, None).unwrap();
+        let plan = build_fix_plan_with(
+            &mut fake,
+            Path::new("Cargo.lock"),
+            Path::new("Cargo.toml"),
+            7,
+            None,
+        )
+        .unwrap();
 
         assert!(plan.commands.is_empty());
         let blocker = plan.blocker.unwrap();
@@ -986,7 +1034,14 @@ cc = { workspace = true }
             .insert("alpha".to_string(), vec![version("1.5.0", 30)]);
         fake.updates.push_back(Some("version conflict".to_string()));
 
-        let plan = build_fix_plan_with(&mut fake, Path::new("Cargo.lock"), 7, None).unwrap();
+        let plan = build_fix_plan_with(
+            &mut fake,
+            Path::new("Cargo.lock"),
+            Path::new("Cargo.toml"),
+            7,
+            None,
+        )
+        .unwrap();
 
         assert!(plan.commands.is_empty());
         assert_eq!(
