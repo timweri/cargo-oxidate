@@ -46,16 +46,21 @@ runs:
 
     - name: Cache cargo-oxidate binary
       id: cache-binary
+      if: env.ACTION_REF != ''
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      env:
+        ACTION_REF: ${{ github.action_ref }}
       with:
         path: ~/.cargo-oxidate-bin
-        key: cargo-oxidate-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'src/**') }}
+        key: cargo-oxidate-bin-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.ACTION_REF }}
 
     - name: Build cargo-oxidate
       if: steps.cache-binary.outputs.cache-hit != 'true'
       shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
       run: |
-        cd ${{ github.action_path }}
+        cd "$ACTION_PATH"
         cargo build --release
         mkdir -p ~/.cargo-oxidate-bin
         cp target/release/cargo-oxidate ~/.cargo-oxidate-bin/
@@ -71,9 +76,9 @@ runs:
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: ${{ steps.cache-path.outputs.path }}
-        key: cargo-oxidate-responses-${{ hashFiles('**/Cargo.lock') }}
+        key: cargo-oxidate-responses-v1-${{ runner.os }}-${{ hashFiles(inputs.cargo-lock-path) }}
         restore-keys: |
-          cargo-oxidate-responses-
+          cargo-oxidate-responses-v1-${{ runner.os }}-
 
     - name: Run cargo-oxidate
       shell: bash
