@@ -1,27 +1,56 @@
 use crate::api::CrateVersionInfo;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use semver::Version;
 
-pub struct Suggestion {
-    pub package: String,
-    pub suggested_version: String,
-    pub suggested_age_days: i64,
+pub fn find_compliant_versions(
+    versions: &[CrateVersionInfo],
+    current_version: &str,
+    min_age_days: u64,
+    max_age_days: Option<u64>,
+) -> Vec<(String, i64)> {
+    find_compliant_versions_at(
+        versions,
+        current_version,
+        min_age_days,
+        max_age_days,
+        Utc::now(),
+    )
 }
 
-pub fn find_compliant_version(
+fn find_compliant_versions_at(
     versions: &[CrateVersionInfo],
+    current_version: &str,
     min_age_days: u64,
-) -> Option<(String, i64)> {
-    let now = Utc::now();
+    max_age_days: Option<u64>,
+    now: DateTime<Utc>,
+) -> Vec<(String, i64)> {
+    let Ok(current_version) = Version::parse(current_version) else {
+        return Vec::new();
+    };
     let min_age_threshold = now - chrono::Duration::days(min_age_days as i64);
+    let max_age_threshold = max_age_days.map(|days| now - chrono::Duration::days(days as i64));
 
-    versions
+    let mut candidates: Vec<_> = versions
         .iter()
-        .filter(|v| !v.yanked && v.created_at <= min_age_threshold)
-        .max_by_key(|v| v.created_at)
-        .map(|v| {
+        .filter_map(|v| {
+            let version = Version::parse(&v.num).ok()?;
+            if v.yanked
+                || version >= current_version
+                || v.created_at > min_age_threshold
+                || max_age_threshold.is_some_and(|threshold| v.created_at < threshold)
+            {
+                return None;
+            }
             let age_days = (now - v.created_at).num_days();
-            (v.num.clone(), age_days)
+            Some((version, v.num.clone(), age_days))
         })
+        .collect();
+
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates
+        .into_iter()
+        .map(|(_, version, age_days)| (version, age_days))
+        .collect()
 }
 
 #[cfg(test)]
@@ -30,7 +59,8 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     fn make_version(version: &str, days_ago: i64, yanked: bool) -> CrateVersionInfo {
-        let created_at = Utc::now() - chrono::Duration::days(days_ago);
+        let created_at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
+            - chrono::Duration::days(days_ago);
         CrateVersionInfo {
             num: version.to_string(),
             created_at,
@@ -39,91 +69,124 @@ mod tests {
     }
 
     #[test]
-    fn test_find_compliant_version_basic() {
+    fn test_find_compliant_versions_choose_closest_downgrade() {
         let versions = vec![
             make_version("1.0.0", 100, false),
             make_version("1.1.0", 50, false),
-            make_version("1.2.0", 20, false),
+            make_version("1.2.0", 40, false),
             make_version("1.3.0", 5, false),
         ];
 
-        let result = find_compliant_version(&versions, 30);
-        assert!(result.is_some());
-        let (version, age_days) = result.unwrap();
-        assert_eq!(version, "1.1.0"); // Newest version older than 30 days
-        assert!(age_days >= 50 && age_days <= 51); // Allow for timing variance
+        let result = find_compliant_versions_at(
+            &versions,
+            "1.3.0",
+            30,
+            None,
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+        );
+        assert_eq!(result[0].0, "1.2.0");
     }
 
     #[test]
-    fn test_find_compliant_version_filters_yanked() {
+    fn test_find_compliant_versions_filter_yanked() {
         let versions = vec![
             make_version("1.0.0", 100, false),
             make_version("1.1.0", 50, true), // yanked
             make_version("1.2.0", 20, false),
         ];
 
-        let result = find_compliant_version(&versions, 30);
-        assert!(result.is_some());
-        let (version, _) = result.unwrap();
-        assert_eq!(version, "1.0.0"); // Skips yanked 1.1.0
+        let result = find_compliant_versions_at(
+            &versions,
+            "1.2.0",
+            30,
+            None,
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+        );
+        assert_eq!(result[0].0, "1.0.0");
     }
 
     #[test]
-    fn test_find_compliant_version_no_compliant() {
+    fn test_find_compliant_versions_no_compliant() {
         let versions = vec![
             make_version("1.0.0", 10, false),
             make_version("1.1.0", 5, false),
             make_version("1.2.0", 2, false),
         ];
 
-        let result = find_compliant_version(&versions, 30);
-        assert!(result.is_none());
+        let result = find_compliant_versions_at(
+            &versions,
+            "1.3.0",
+            30,
+            None,
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+        );
+        assert!(result.is_empty());
     }
 
     #[test]
-    fn test_find_compliant_version_all_yanked() {
+    fn test_find_compliant_versions_all_yanked() {
         let versions = vec![
             make_version("1.0.0", 100, true),
             make_version("1.1.0", 50, true),
         ];
 
-        let result = find_compliant_version(&versions, 30);
-        assert!(result.is_none());
+        let result = find_compliant_versions_at(
+            &versions,
+            "1.2.0",
+            30,
+            None,
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+        );
+        assert!(result.is_empty());
     }
 
     #[test]
-    fn test_find_compliant_version_empty() {
+    fn test_find_compliant_versions_empty() {
         let versions: Vec<CrateVersionInfo> = vec![];
-        let result = find_compliant_version(&versions, 30);
-        assert!(result.is_none());
+        let result = find_compliant_versions_at(
+            &versions,
+            "1.0.0",
+            30,
+            None,
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+        );
+        assert!(result.is_empty());
     }
 
     #[test]
-    fn test_find_compliant_version_exact_threshold() {
+    fn test_find_compliant_versions_exact_threshold() {
         let versions = vec![
             make_version("1.0.0", 30, false),
             make_version("1.1.0", 29, false),
         ];
 
-        let result = find_compliant_version(&versions, 30);
-        assert!(result.is_some());
-        let (version, _) = result.unwrap();
-        assert_eq!(version, "1.0.0"); // Exactly 30 days should be compliant
+        let result = find_compliant_versions_at(
+            &versions,
+            "1.2.0",
+            30,
+            None,
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+        );
+        assert_eq!(result[0].0, "1.0.0");
     }
 
     #[test]
-    fn test_find_compliant_version_picks_newest_compliant() {
+    fn test_find_compliant_versions_respect_maximum_age() {
         let versions = vec![
             make_version("1.0.0", 100, false),
             make_version("1.1.0", 90, false),
             make_version("1.2.0", 80, false),
-            make_version("1.3.0", 70, false),
+            make_version("1.3.0", 90, false),
             make_version("1.4.0", 10, false), // Too new
         ];
 
-        let result = find_compliant_version(&versions, 50);
-        assert!(result.is_some());
-        let (version, _) = result.unwrap();
-        assert_eq!(version, "1.3.0"); // Newest among compliant versions
+        let result = find_compliant_versions_at(
+            &versions,
+            "1.4.0",
+            50,
+            Some(85),
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+        );
+        assert_eq!(result[0].0, "1.2.0");
     }
 }
