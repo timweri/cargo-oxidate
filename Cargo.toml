@@ -1,6 +1,6 @@
 [package]
 name = "cargo-oxidate"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 description = "Check Cargo dependency for packages that are too new or too old"
 license = "MIT"
