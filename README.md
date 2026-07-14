@@ -5,7 +5,7 @@ Check `Cargo.lock` for packages that are too new (supply chain risk) or too old 
 ## Installation
 
 ```sh
-cargo install cargo-oxidate
+cargo install cargo-oxidate --locked
 ```
 
 ## Usage
@@ -61,7 +61,7 @@ This tool is also available as a GitHub Action. See [examples/usage.yml](example
     cache-responses: true  # default; set to 'false' to disable
 ```
 
-When `cache-responses` is enabled (the default), the action wires up `actions/cache` keyed on the `Cargo.lock` hash so subsequent runs skip already-fetched crates.io responses.
+When `cache-responses` is enabled (the default), the action caches crates.io responses using the selected `Cargo.lock` hash. Its compiled binary is cached separately by the referenced cargo-oxidate action version, so dependency changes in the consuming repository do not trigger a rebuild of this tool.
 
 ## License
 
