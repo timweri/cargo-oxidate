@@ -27,7 +27,7 @@ cargo-oxidate Cargo.lock --min-age-days 14 --max-age-days 730
 | `--exempt pkg1,pkg2` | Comma-separated packages to skip |
 | `--exclude-missing` | Don't flag packages with unknown publish dates |
 | `--timeout N` | HTTP timeout in seconds (default: 10) |
-| `--suggest-fix` | For "too new" violations, suggest `cargo update` commands to downgrade |
+| `--suggest-fix` | Build an ordered Cargo-validated downgrade plan for "too new" violations (requires Cargo 1.97+) |
 | `--cache-path PATH` | Enable response caching at PATH (or set `CARGO_OXIDATE_CACHE_PATH`) |
 | `--cache-max-age-hours N` | Max age for cached version listings (default: 24) |
 

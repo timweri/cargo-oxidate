@@ -30,7 +30,7 @@ inputs:
     required: false
     default: '10'
   suggest-fix:
-    description: 'For "too new" violations, suggest cargo update commands to downgrade to compliant versions'
+    description: 'Build an ordered Cargo-validated downgrade plan for "too new" violations (requires Cargo 1.97+)'
     required: false
     default: 'false'
   cache-responses:
