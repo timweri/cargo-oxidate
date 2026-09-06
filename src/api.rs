@@ -117,9 +117,11 @@ pub struct CratesIoClient<T: Transport = UreqTransport> {
     transport: T,
     cache: ResponseCache,
     cache_max_age_hours: u64,
-    retry_count: u32,
-    retry_delay: Duration,
-    pacing_delay: Duration,
+    // Settable directly by tests (in this module and others, e.g. the
+    // suggest flow tests) so the test suite doesn't sleep.
+    pub(crate) retry_count: u32,
+    pub(crate) retry_delay: Duration,
+    pub(crate) pacing_delay: Duration,
 }
 
 impl CratesIoClient<UreqTransport> {

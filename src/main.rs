@@ -135,10 +135,7 @@ fn run(cli: Cli) -> Result<bool> {
         cli.exempt,
     )?;
 
-    // Validate that --suggest-fix requires --min-age-days
-    if cli.suggest_fix && cli.min_age_days.is_none() {
-        anyhow::bail!("--suggest-fix requires --min-age-days to be specified");
-    }
+    let suggest_min_age = suggest::require_min_age(cli.suggest_fix, cli.min_age_days)?;
 
     // Validate cargo-lock path
     let cargo_lock_path = {
@@ -216,50 +213,11 @@ fn run(cli: Cli) -> Result<bool> {
     report::print_report(&violations);
 
     // Generate suggestions if requested
-    if cli.suggest_fix {
-        // Safe to unwrap: validated at start of run()
-        let min_age = freshness_policy.min_age_days().unwrap();
-        let mut suggestions = Vec::new();
-        let too_new_violations: Vec<_> = violations
-            .iter()
-            .filter(|v| matches!(v.kind, report::ViolationKind::TooNew { .. }))
-            .collect();
-
-        if !too_new_violations.is_empty() {
-            eprintln!("\nFetching version suggestions...");
-            for (i, violation) in too_new_violations.iter().enumerate() {
-                eprintln!(
-                    "  [{}/{}] {}",
-                    i + 1,
-                    too_new_violations.len(),
-                    violation.package
-                );
-
-                let result = client.fetch_all_versions(&violation.package);
-
-                match result {
-                    Ok(versions) => {
-                        if let Some((suggested_version, age_days)) =
-                            suggest::find_compliant_version(&versions, min_age)
-                        {
-                            suggestions.push(suggest::Suggestion {
-                                package: violation.package.clone(),
-                                suggested_version,
-                                suggested_age_days: age_days,
-                            });
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "\n  Warning: failed to fetch versions for {}: {e}",
-                            violation.package
-                        );
-                    }
-                }
-            }
-
-            report::print_suggestions(&suggestions);
-        }
+    if let Some(min_age) = suggest_min_age
+        && let Some(suggestions) =
+            suggest::generate_suggestions(&mut client, &violations, min_age, now)
+    {
+        report::print_suggestions(&suggestions);
     }
 
     client.finish();

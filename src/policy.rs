@@ -43,10 +43,6 @@ impl FreshnessPolicy {
         self.exempt.contains(name)
     }
 
-    pub fn min_age_days(&self) -> Option<u64> {
-        self.min_age_days
-    }
-
     /// Evaluates a package against the policy given the outcome of a
     /// publish-date lookup and the current time, returning the Violations
     /// triggered. A lookup that failed and a lookup that succeeded with no
