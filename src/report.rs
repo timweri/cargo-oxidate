@@ -2,8 +2,14 @@ use crate::suggest;
 use chrono::{DateTime, Utc};
 
 pub enum ViolationKind {
-    TooNew,
-    TooOld,
+    TooNew {
+        published: DateTime<Utc>,
+        age_days: i64,
+    },
+    TooOld {
+        published: DateTime<Utc>,
+        age_days: i64,
+    },
     Unknown,
 }
 
@@ -11,29 +17,24 @@ pub struct Violation {
     pub package: String,
     pub version: String,
     pub kind: ViolationKind,
-    pub age_days: i64,
-    pub published: Option<DateTime<Utc>>,
 }
 
-fn print_section(header: &str, violations: &[&Violation]) {
+fn print_section(header: &str, violations: &[(&Violation, DateTime<Utc>, i64)]) {
     if violations.is_empty() {
         return;
     }
     println!("  {header}");
     let days_width = violations
         .iter()
-        .map(|v| v.age_days.to_string().len())
+        .map(|(_, _, age_days)| age_days.to_string().len())
         .max()
         .unwrap_or(1);
-    for v in violations {
-        let date_str = v
-            .published
-            .map(|d| d.format("%Y-%m-%d").to_string())
-            .unwrap_or_else(|| "unknown   ".to_string());
+    for (v, published, age_days) in violations {
+        let date_str = published.format("%Y-%m-%d").to_string();
         println!(
             "    {} | {:>width$} days old | {} {}",
             date_str,
-            v.age_days,
+            age_days,
             v.package,
             v.version,
             width = days_width
@@ -53,11 +54,23 @@ pub fn print_report(violations: &[Violation]) {
     // Group by kind
     let too_new: Vec<_> = violations
         .iter()
-        .filter(|v| matches!(v.kind, ViolationKind::TooNew))
+        .filter_map(|v| match v.kind {
+            ViolationKind::TooNew {
+                published,
+                age_days,
+            } => Some((v, published, age_days)),
+            _ => None,
+        })
         .collect();
     let too_old: Vec<_> = violations
         .iter()
-        .filter(|v| matches!(v.kind, ViolationKind::TooOld))
+        .filter_map(|v| match v.kind {
+            ViolationKind::TooOld {
+                published,
+                age_days,
+            } => Some((v, published, age_days)),
+            _ => None,
+        })
         .collect();
     let unknown: Vec<_> = violations
         .iter()

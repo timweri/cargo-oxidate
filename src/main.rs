@@ -5,6 +5,7 @@ use std::process::ExitCode;
 
 mod api;
 mod cache;
+mod policy;
 mod report;
 mod suggest;
 
@@ -106,73 +107,33 @@ fn main() -> ExitCode {
 /// Logs a warning to stderr when the fetch errors out.
 fn check_package(
     client: &mut api::CratesIoClient,
+    freshness_policy: &policy::FreshnessPolicy,
     pkg: &Package,
-    min_age_days: Option<u64>,
-    max_age_days: Option<u64>,
-    exclude_missing: bool,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Vec<report::Violation> {
-    let mut violations = Vec::new();
     let result = client.fetch_publish_date_with_retry(&pkg.name, &pkg.version);
 
-    match result {
-        Ok(Some(published)) => {
-            let age_days = (chrono::Utc::now() - published).num_days();
-
-            if let Some(min) = min_age_days
-                && age_days < min as i64
-            {
-                violations.push(report::Violation {
-                    package: pkg.name.clone(),
-                    version: pkg.version.clone(),
-                    kind: report::ViolationKind::TooNew,
-                    age_days,
-                    published: Some(published),
-                });
-            }
-
-            if let Some(max) = max_age_days
-                && age_days > max as i64
-            {
-                violations.push(report::Violation {
-                    package: pkg.name.clone(),
-                    version: pkg.version.clone(),
-                    kind: report::ViolationKind::TooOld,
-                    age_days,
-                    published: Some(published),
-                });
-            }
-        }
-        Ok(None) | Err(_) => {
-            if let Err(ref e) = result {
-                let severity = match e {
-                    api::FetchError::Retryable(_) => "transient",
-                    api::FetchError::Permanent(_) => "permanent",
-                };
-                eprintln!(
-                    "\n  Warning: {severity} error checking {}@{}: {e}",
-                    pkg.name, pkg.version
-                );
-            }
-            if !exclude_missing {
-                violations.push(report::Violation {
-                    package: pkg.name.clone(),
-                    version: pkg.version.clone(),
-                    kind: report::ViolationKind::Unknown,
-                    age_days: 0,
-                    published: None,
-                });
-            }
-        }
+    if let Err(ref e) = result {
+        let severity = match e {
+            api::FetchError::Retryable(_) => "transient",
+            api::FetchError::Permanent(_) => "permanent",
+        };
+        eprintln!(
+            "\n  Warning: {severity} error checking {}@{}: {e}",
+            pkg.name, pkg.version
+        );
     }
 
-    violations
+    freshness_policy.evaluate(pkg, &result, now)
 }
 
 fn run(cli: Cli) -> Result<bool> {
-    // Validate that at least one threshold is set
-    if cli.min_age_days.is_none() && cli.max_age_days.is_none() {
-        anyhow::bail!("At least one of --min-age-days or --max-age-days must be specified");
-    }
+    let freshness_policy = policy::FreshnessPolicy::new(
+        cli.min_age_days,
+        cli.max_age_days,
+        cli.exclude_missing,
+        cli.exempt,
+    )?;
 
     // Validate that --suggest-fix requires --min-age-days
     if cli.suggest_fix && cli.min_age_days.is_none() {
@@ -232,11 +193,11 @@ fn run(cli: Cli) -> Result<bool> {
 
     // Check each package
     let mut violations = Vec::new();
-    let exempt_set: std::collections::HashSet<&str> = cli.exempt.iter().map(|s| s.trim()).collect();
+    let now = chrono::Utc::now();
 
     let total = packages.len();
     for (i, pkg) in packages.iter().enumerate() {
-        if exempt_set.contains(pkg.name.as_str()) {
+        if freshness_policy.is_exempt(&pkg.name) {
             continue;
         }
 
@@ -248,13 +209,7 @@ fn run(cli: Cli) -> Result<bool> {
             pkg.version
         );
 
-        violations.extend(check_package(
-            &mut client,
-            pkg,
-            cli.min_age_days,
-            cli.max_age_days,
-            cli.exclude_missing,
-        ));
+        violations.extend(check_package(&mut client, &freshness_policy, pkg, now));
 
         client.rate_limit();
     }
@@ -265,11 +220,11 @@ fn run(cli: Cli) -> Result<bool> {
     // Generate suggestions if requested
     if cli.suggest_fix {
         // Safe to unwrap: validated at start of run()
-        let min_age = cli.min_age_days.unwrap();
+        let min_age = freshness_policy.min_age_days().unwrap();
         let mut suggestions = Vec::new();
         let too_new_violations: Vec<_> = violations
             .iter()
-            .filter(|v| matches!(v.kind, report::ViolationKind::TooNew))
+            .filter(|v| matches!(v.kind, report::ViolationKind::TooNew { .. }))
             .collect();
 
         if !too_new_violations.is_empty() {
