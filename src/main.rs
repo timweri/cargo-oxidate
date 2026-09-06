@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 mod api;
 mod cache;
+mod lockfile;
 mod policy;
 mod report;
 mod suggest;
@@ -54,31 +55,6 @@ struct Cli {
     cache_max_age_hours: u64,
 }
 
-struct Package {
-    name: String,
-    version: String,
-}
-
-fn parse_lockfile(path: &Path) -> Result<Vec<Package>> {
-    let lockfile = cargo_lock::Lockfile::load(path)
-        .context(format!("Could not load lockfile at {}", path.display()))?;
-
-    let packages = lockfile
-        .packages
-        .into_iter()
-        .filter(|p| {
-            // Only check packages from crates.io registry
-            p.source.as_ref().is_some_and(|s| s.is_default_registry())
-        })
-        .map(|p| Package {
-            name: p.name.as_str().to_string(),
-            version: p.version.to_string(),
-        })
-        .collect();
-
-    Ok(packages)
-}
-
 fn main() -> ExitCode {
     // Filter out the "oxidate" subcommand name that cargo passes when invoked as `cargo oxidate`
     let args: Vec<String> = std::env::args()
@@ -108,7 +84,7 @@ fn main() -> ExitCode {
 fn check_package(
     client: &mut api::CratesIoClient,
     freshness_policy: &policy::FreshnessPolicy,
-    pkg: &Package,
+    pkg: &lockfile::Package,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Vec<report::Violation> {
     let result = client.fetch_publish_date(&pkg.name, &pkg.version);
@@ -137,49 +113,10 @@ fn run(cli: Cli) -> Result<bool> {
 
     let suggest_min_age = suggest::require_min_age(cli.suggest_fix, cli.min_age_days)?;
 
-    // Validate cargo-lock path
-    let cargo_lock_path = {
-        let path = &cli.cargo_lock;
-
-        // Resolve the path to catch traversal
-        let resolved = if path.is_absolute() {
-            path.clone()
-        } else {
-            std::env::current_dir()
-                .context("Failed to get current directory")?
-                .join(path)
-        };
-
-        // Canonicalize to resolve symlinks and ".." components
-        // (file must exist for canonicalize to succeed)
-        let canonical = resolved.canonicalize().context(format!(
-            "Cargo.lock path does not exist or is not accessible: {}",
-            path.display()
-        ))?;
-
-        // Ensure it's a regular file
-        if !canonical.is_file() {
-            anyhow::bail!("Cargo.lock path is not a regular file: {}", path.display());
-        }
-
-        // Ensure the resolved path is within the current working directory
-        let cwd = std::env::current_dir()
-            .context("Failed to get current directory")?
-            .canonicalize()
-            .context("Failed to canonicalize current directory")?;
-
-        if !canonical.starts_with(&cwd) {
-            anyhow::bail!(
-                "Cargo.lock path escapes the working directory: {}",
-                path.display()
-            );
-        }
-
-        canonical
-    };
+    let working_dir = std::env::current_dir().context("Failed to get current directory")?;
 
     // Parse lockfile
-    let packages = parse_lockfile(&cargo_lock_path).context("Failed to parse Cargo.lock")?;
+    let packages = lockfile::load(&cli.cargo_lock, &working_dir)?;
 
     // Build API client
     let mut client = api::CratesIoClient::new(

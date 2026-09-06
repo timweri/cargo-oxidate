@@ -1,5 +1,5 @@
-use crate::Package;
 use crate::api::FetchError;
+use crate::lockfile::Package;
 use crate::report::{Violation, ViolationKind};
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
