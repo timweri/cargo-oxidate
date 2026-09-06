@@ -111,7 +111,7 @@ fn check_package(
     pkg: &Package,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Vec<report::Violation> {
-    let result = client.fetch_publish_date_with_retry(&pkg.name, &pkg.version);
+    let result = client.fetch_publish_date(&pkg.name, &pkg.version);
 
     if let Err(ref e) = result {
         let severity = match e {
@@ -210,8 +210,6 @@ fn run(cli: Cli) -> Result<bool> {
         );
 
         violations.extend(check_package(&mut client, &freshness_policy, pkg, now));
-
-        client.rate_limit();
     }
 
     // Print report
@@ -237,7 +235,7 @@ fn run(cli: Cli) -> Result<bool> {
                     violation.package
                 );
 
-                let result = client.fetch_all_versions_with_retry(&violation.package);
+                let result = client.fetch_all_versions(&violation.package);
 
                 match result {
                     Ok(versions) => {
@@ -258,15 +256,13 @@ fn run(cli: Cli) -> Result<bool> {
                         );
                     }
                 }
-
-                client.rate_limit();
             }
 
             report::print_suggestions(&suggestions);
         }
     }
 
-    client.save_cache();
+    client.finish();
 
     Ok(!violations.is_empty())
 }
