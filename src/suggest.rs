@@ -10,10 +10,9 @@ pub struct Suggestion {
 }
 
 /// Validates that `--suggest-fix` was given together with `--min-age-days`,
-/// and returns the minimum age to use, or `None` when `--suggest-fix` wasn't
-/// requested at all. Keeping this here, rather than in the entry module,
-/// means the operation below can take the minimum age as a plain value
-/// instead of an `Option` its caller has to unwrap.
+/// returning the minimum age to use, or `None` if `--suggest-fix` wasn't
+/// requested. Lets the caller pass a plain value below instead of unwrapping
+/// an `Option` it already validated.
 pub fn require_min_age(suggest_fix: bool, min_age_days: Option<u64>) -> Result<Option<u64>> {
     if !suggest_fix {
         return Ok(None);
@@ -44,14 +43,11 @@ fn find_compliant_version(
 }
 
 /// Generates suggested compliant versions for every "too new" violation.
-/// Returns `None` when there are no "too new" violations at all, so the
-/// caller prints nothing; returns `Some` (possibly empty) once the flow has
-/// run, so the caller can report "no compliant version found".
+/// Returns `None` when there are no "too new" violations, so the caller
+/// prints nothing; returns `Some` (possibly empty) once the flow has run.
 ///
-/// Owns the too-new filter, the per-package fetch loop, tolerance of a
-/// single package's fetch failure, and the flow's progress output. A
-/// package whose fetch fails, or which has no compliant version, is simply
-/// absent from the result rather than aborting the whole operation.
+/// A package whose fetch fails, or which has no compliant version, is
+/// simply absent from the result rather than aborting the whole operation.
 pub fn generate_suggestions<T: Transport>(
     client: &mut CratesIoClient<T>,
     violations: &[Violation],

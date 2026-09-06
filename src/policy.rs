@@ -7,10 +7,9 @@ use std::collections::HashSet;
 /// The freshness rule: minimum and maximum age thresholds, an exempt list,
 /// and what to do when a publish date cannot be determined.
 ///
-/// Constructed once and evaluated per package. Evaluation is a pure function
-/// of a package, the outcome of a publish-date lookup, and a timestamp. It
-/// performs no I/O, so it is exhaustively testable without a network
-/// connection.
+/// Constructed once and evaluated per package. `evaluate` is a pure function
+/// of a package, a publish-date lookup result, and a timestamp, so it's
+/// testable without a network connection.
 pub struct FreshnessPolicy {
     min_age_days: Option<u64>,
     max_age_days: Option<u64>,
@@ -43,13 +42,10 @@ impl FreshnessPolicy {
         self.exempt.contains(name)
     }
 
-    /// Evaluates a package against the policy given the outcome of a
-    /// publish-date lookup and the current time, returning the Violations
-    /// triggered. A lookup that failed and a lookup that succeeded with no
-    /// date are treated identically: both are "unknown".
-    ///
-    /// Printing a warning when a lookup failed is presentation, not policy,
-    /// and stays with the caller.
+    /// Evaluates a package against the policy given a publish-date lookup
+    /// result and the current time, returning the violations triggered. A
+    /// failed lookup and a successful lookup with no date are both treated
+    /// as "unknown"; warning about a failed lookup is the caller's job.
     pub fn evaluate(
         &self,
         pkg: &Package,

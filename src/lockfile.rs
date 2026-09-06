@@ -10,13 +10,10 @@ pub struct Package {
 /// Loads the crates.io registry packages from a lockfile.
 ///
 /// `path` is the lockfile path as given by the caller (relative or
-/// absolute); `working_dir` is the directory relative paths are resolved
-/// against and the boundary the resolved path must stay within. This is the
-/// tool's one security-relevant check: it resolves and canonicalises the
-/// path, rejects anything that is not a regular file within `working_dir`
-/// (catching both `..` traversal and a symlink escaping the boundary), then
-/// parses the lockfile and keeps only packages sourced from the default
-/// registry, since path and git dependencies aren't published to crates.io.
+/// absolute), resolved against `working_dir` if relative. Rejects anything
+/// that is not a regular file within `working_dir` (`..` traversal and
+/// symlink escapes included), then keeps only packages sourced from the
+/// default registry, since path and git dependencies aren't on crates.io.
 pub fn load(path: &Path, working_dir: &Path) -> Result<Vec<Package>> {
     let resolved = if path.is_absolute() {
         path.to_path_buf()

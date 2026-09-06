@@ -69,10 +69,10 @@ impl std::fmt::Display for TransportError {
 
 impl std::error::Error for TransportError {}
 
-/// The one seam the crates.io client is generic over: issuing a GET request.
-/// Sits at the HTTP level, below retry, status classification, and caching,
-/// so those stay behind the client's interface and are exercised by driving
-/// this trait instead of the network.
+/// The only part of the crates.io client that is generic: issuing a GET
+/// request. Retry, status classification, and caching are all built on top
+/// of this trait, so tests can drive them by implementing it instead of
+/// hitting the network.
 pub trait Transport {
     fn get(&self, url: &str) -> Result<HttpResponse, TransportError>;
 }
