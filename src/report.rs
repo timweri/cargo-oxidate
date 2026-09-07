@@ -94,13 +94,17 @@ pub fn print_report(violations: &[Violation]) {
 }
 
 pub fn print_suggestions(outcomes: &[Outcome]) {
-    if outcomes
-        .iter()
-        .all(|o| !matches!(o, Outcome::Suggest { .. }))
-    {
+    if outcomes.is_empty() {
         println!("\n⚠️  No compliant versions found for any \"too new\" violations.");
         println!("    Consider adding these packages to --exempt if they are trusted.\n");
-    } else {
+        return;
+    }
+
+    let has_suggestion = outcomes
+        .iter()
+        .any(|o| matches!(o, Outcome::Suggest { .. }));
+
+    if has_suggestion {
         println!(
             "\n💡 Suggested fixes for \"too new\" violations (apply top to bottom, then re-run):\n"
         );
@@ -174,10 +178,12 @@ pub fn print_suggestions(outcomes: &[Outcome]) {
         }
     }
 
-    println!(
-        r#"
+    if has_suggestion {
+        println!(
+            r#"
   Suggestions satisfy every version requirement in Cargo.lock and your manifests.
   Source compatibility is not verified: build after applying.
 "#
-    );
+        );
+    }
 }

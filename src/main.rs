@@ -163,11 +163,7 @@ fn run(cli: Cli) -> Result<bool> {
 
     // Generate suggestions if requested
     if let Some(min_age) = suggest_min_age {
-        let cargo_lock_path = if cli.cargo_lock.is_absolute() {
-            cli.cargo_lock.clone()
-        } else {
-            working_dir.join(&cli.cargo_lock)
-        };
+        let cargo_lock_path = lockfile::resolve_path(&cli.cargo_lock, &working_dir);
         let lockfile_dir = cargo_lock_path.parent().unwrap_or(&working_dir);
 
         let (direct_requirements, manifest_warnings) =

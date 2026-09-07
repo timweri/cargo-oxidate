@@ -4,7 +4,7 @@ use crate::manifest::DirectRequirement;
 use crate::report::{Violation, ViolationKind};
 use chrono::{DateTime, Utc};
 use semver::{Version, VersionReq};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// A version requirement currently placed on a package, and who placed it —
@@ -142,6 +142,24 @@ struct GatheredConstraints {
     unverified_dependents: Vec<String>,
 }
 
+/// Maps `(name, version)` to every lockfile package that depends on it,
+/// built once per run so `gather_constraints` doesn't rescan every package
+/// for every "too new" violation.
+type DependentsIndex<'a> = HashMap<(&'a str, &'a str), Vec<&'a Package>>;
+
+fn build_dependents_index(all_packages: &[Package]) -> DependentsIndex<'_> {
+    let mut index: DependentsIndex = HashMap::new();
+    for pkg in all_packages {
+        for dep in &pkg.dependencies {
+            index
+                .entry((dep.name.as_str(), dep.version.as_str()))
+                .or_default()
+                .push(pkg);
+        }
+    }
+    index
+}
+
 /// Gathers every version requirement currently placed on `name` at
 /// `locked_version`: from lockfile-recorded dependents (via the crates.io
 /// sparse index for registry dependents) and from the user's own manifests
@@ -149,7 +167,7 @@ struct GatheredConstraints {
 /// records the edge).
 fn gather_constraints<T: Transport>(
     client: &mut CratesIoClient<T>,
-    all_packages: &[Package],
+    dependents_index: &DependentsIndex,
     direct_requirements: &[DirectRequirement],
     working_dir: &Path,
     name: &str,
@@ -157,13 +175,12 @@ fn gather_constraints<T: Transport>(
 ) -> GatheredConstraints {
     let mut constraints = Vec::new();
     let mut unverified_dependents = Vec::new();
-    let mut manifest_constraints_included = false;
 
-    let dependents = all_packages.iter().filter(|p| {
-        p.dependencies
-            .iter()
-            .any(|d| d.name == name && d.version == locked_version)
-    });
+    let dependents = dependents_index
+        .get(&(name, locked_version))
+        .into_iter()
+        .flatten()
+        .copied();
 
     for dependent in dependents {
         if dependent.is_registry {
@@ -192,9 +209,15 @@ fn gather_constraints<T: Transport>(
                 },
                 Err(_) => unverified_dependents.push(dependent.name.clone()),
             }
-        } else if !manifest_constraints_included {
-            manifest_constraints_included = true;
-            for req in direct_requirements.iter().filter(|r| r.crate_name == name) {
+        } else {
+            // Scoped to this dependent's own manifest, not every manifest in
+            // the workspace that happens to mention the same crate name —
+            // two members can lock the same crate name at different major
+            // versions, each with its own unrelated requirement.
+            for req in direct_requirements
+                .iter()
+                .filter(|r| r.crate_name == name && r.declaring_package == dependent.name)
+            {
                 constraints.push(Constraint {
                     blocker_name: manifest_label(&req.manifest, working_dir),
                     blocker_version: None,
@@ -244,7 +267,7 @@ pub fn generate_suggestions<T: Transport>(
         return None;
     }
 
-    let too_new_names: HashSet<&str> = too_new.iter().map(|v| v.package.as_str()).collect();
+    let dependents_index = build_dependents_index(all_packages);
 
     let mut outcomes = Vec::new();
     eprintln!("\nFetching version suggestions...");
@@ -268,7 +291,7 @@ pub fn generate_suggestions<T: Transport>(
 
         let gathered = gather_constraints(
             client,
-            all_packages,
+            &dependents_index,
             direct_requirements,
             working_dir,
             &violation.package,
@@ -292,8 +315,10 @@ pub fn generate_suggestions<T: Transport>(
                 locked_version: violation.version.clone(),
                 newest_compliant: newest_compliant.to_string(),
                 blocker: Blocker {
-                    also_suggested: blocker.blocker_version.is_some()
-                        && too_new_names.contains(blocker.blocker_name.as_str()),
+                    // Whether `blocker_name` actually resolved to a
+                    // suggestion is only known once every violation has been
+                    // walked, so this starts false and is patched below.
+                    also_suggested: false,
                     name: blocker.blocker_name,
                     version: blocker.blocker_version,
                     req: blocker.req.to_string(),
@@ -305,6 +330,21 @@ pub fn generate_suggestions<T: Transport>(
             },
         };
         outcomes.push(outcome);
+    }
+
+    let suggested_names: HashSet<String> = outcomes
+        .iter()
+        .filter_map(|o| match o {
+            Outcome::Suggest { package, .. } => Some(package.clone()),
+            _ => None,
+        })
+        .collect();
+    for outcome in &mut outcomes {
+        if let Outcome::Blocked { blocker, .. } = outcome
+            && blocker.version.is_some()
+        {
+            blocker.also_suggested = suggested_names.contains(blocker.name.as_str());
+        }
     }
 
     Some(outcomes)
@@ -471,6 +511,7 @@ mod tests {
         use crate::lockfile::PackageRef;
         use crate::report::Aged;
         use std::num::NonZeroU32;
+        use std::path::PathBuf;
         use std::time::Duration;
 
         trait FakeTransportExt {
@@ -518,6 +559,8 @@ mod tests {
             format!(r#"{{"versions":[{}]}}"#, versions.join(","))
         }
 
+        /// Builds a client with retry/pacing delays zeroed out, so the test
+        /// suite doesn't sleep.
         fn fast_client(transport: FakeTransport) -> CratesIoClient<FakeTransport> {
             CratesIoClient::with_transport(
                 transport,
@@ -565,6 +608,13 @@ mod tests {
                         version: v.to_string(),
                     })
                     .collect(),
+            }
+        }
+
+        fn non_registry_pkg(name: &str, version: &str, deps: &[(&str, &str)]) -> Package {
+            Package {
+                is_registry: false,
+                ..pkg(name, version, deps)
             }
         }
 
@@ -823,6 +873,109 @@ mod tests {
             .unwrap();
 
             assert_eq!(outcomes.len(), 2);
+        }
+
+        #[test]
+        fn also_suggested_is_false_when_the_blocker_itself_has_no_suggestion() {
+            // "y" blocks "target", and "y" is itself in the too-new set —
+            // but y's own walk resolves to NoCompliantVersion, not Suggest,
+            // so the blocked message must not claim a fix for y exists.
+            let transport = FakeTransport::default();
+            transport.ok(
+                "target",
+                &versions_body(&[("1.5.0", 5, false), ("1.4.0", 50, false)], now()),
+            );
+            transport.ok("y", &versions_body(&[("1.5.0", 5, false)], now()));
+            transport.index_ok(
+                "y",
+                r#"{"vers":"1.5.0","deps":[{"name":"target","req":"^1.5"}]}"#,
+            );
+            let mut client = fast_client(transport);
+
+            let violations = vec![too_new("target", "1.5.0"), too_new("y", "1.5.0")];
+            let packages = vec![
+                pkg("target", "1.5.0", &[]),
+                pkg("y", "1.5.0", &[("target", "1.5.0")]),
+            ];
+            let outcomes = generate_suggestions(
+                &mut client,
+                &violations,
+                &packages,
+                &[],
+                Path::new("/work"),
+                30,
+                false,
+                now(),
+            )
+            .unwrap();
+
+            match &outcomes[0] {
+                Outcome::Blocked { blocker, .. } => {
+                    assert_eq!(blocker.name, "y");
+                    assert!(
+                        !blocker.also_suggested,
+                        "y has no Suggest outcome of its own"
+                    );
+                }
+                _ => panic!("expected target to be Blocked"),
+            }
+            assert!(matches!(
+                &outcomes[1],
+                Outcome::NoCompliantVersion { package, .. } if package == "y"
+            ));
+        }
+
+        #[test]
+        fn manifest_constraint_is_scoped_to_the_declaring_dependent() {
+            // member_a locks clap@2.5.0 and requires ^2; member_b locks a
+            // different clap version and requires ^3. member_b's unrelated
+            // requirement must not leak into member_a's constraint set.
+            let transport = FakeTransport::default();
+            transport.ok(
+                "clap",
+                &versions_body(&[("2.5.0", 5, false), ("2.0.0", 50, false)], now()),
+            );
+            let mut client = fast_client(transport);
+
+            let direct_requirements = vec![
+                crate::manifest::DirectRequirement {
+                    manifest: PathBuf::from("/work/member_a/Cargo.toml"),
+                    declaring_package: "member_a".to_string(),
+                    crate_name: "clap".to_string(),
+                    req: VersionReq::parse("^2").unwrap(),
+                },
+                crate::manifest::DirectRequirement {
+                    manifest: PathBuf::from("/work/member_b/Cargo.toml"),
+                    declaring_package: "member_b".to_string(),
+                    crate_name: "clap".to_string(),
+                    req: VersionReq::parse("^3").unwrap(),
+                },
+            ];
+            let packages = vec![
+                pkg("clap", "2.5.0", &[]),
+                non_registry_pkg("member_a", "0.1.0", &[("clap", "2.5.0")]),
+                non_registry_pkg("member_b", "0.1.0", &[("clap", "3.1.0")]),
+            ];
+
+            let violations = vec![too_new("clap", "2.5.0")];
+            let outcomes = generate_suggestions(
+                &mut client,
+                &violations,
+                &packages,
+                &direct_requirements,
+                Path::new("/work"),
+                30,
+                false,
+                now(),
+            )
+            .unwrap();
+
+            match &outcomes[0] {
+                Outcome::Suggest {
+                    suggested_version, ..
+                } => assert_eq!(suggested_version, "2.0.0"),
+                _ => panic!("expected clap to be Suggest: member_b's ^3 must not apply"),
+            }
         }
     }
 

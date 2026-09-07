@@ -4,9 +4,13 @@ use std::path::{Path, PathBuf};
 
 /// One version requirement the user's own manifests place on a registry
 /// crate, together with the manifest that placed it (for warnings and
-/// diagnostics).
+/// diagnostics) and the name of the package that manifest declares —
+/// callers use this to scope a requirement to the lockfile dependent that
+/// actually placed it, rather than to every manifest in the workspace that
+/// happens to mention the same crate name.
 pub struct DirectRequirement {
     pub manifest: PathBuf,
+    pub declaring_package: String,
     pub crate_name: String,
     pub req: semver::VersionReq,
 }
@@ -163,15 +167,23 @@ fn collect_requirements(
     out: &mut Vec<DirectRequirement>,
     warnings: &mut Vec<String>,
 ) {
+    // A manifest with no [package] table (a pure workspace root) declares no
+    // crate identity, so it can never be a lockfile dependent — nothing it
+    // lists (ordinarily nothing) could be scoped to it correctly.
+    let Some(declaring_package) = manifest.package.as_ref().map(|p| p.name().to_string()) else {
+        return;
+    };
+
     for deps in all_dep_sets(manifest) {
         for (key, dep) in deps {
-            collect_one(manifest_path, key, dep, out, warnings);
+            collect_one(manifest_path, &declaring_package, key, dep, out, warnings);
         }
     }
 }
 
 fn collect_one(
     manifest_path: &Path,
+    declaring_package: &str,
     key: &str,
     dep: &Dependency,
     out: &mut Vec<DirectRequirement>,
@@ -189,6 +201,7 @@ fn collect_one(
     match dep.try_req() {
         Ok(req) => out.push(DirectRequirement {
             manifest: manifest_path.to_path_buf(),
+            declaring_package: declaring_package.to_string(),
             crate_name,
             req: req.clone(),
         }),

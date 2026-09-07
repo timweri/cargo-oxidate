@@ -1,5 +1,16 @@
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Resolves a possibly-relative lockfile path against `working_dir`, without
+/// touching the filesystem. Shared by `load` (which then canonicalizes and
+/// validates it) and by callers that just need the lockfile's directory.
+pub fn resolve_path(path: &Path, working_dir: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        working_dir.join(path)
+    }
+}
 
 /// A name/version pair identifying a package, used both for lockfile entries
 /// and for the dependency edges between them.
@@ -31,11 +42,7 @@ pub struct Package {
 /// (lockfiles may omit a dependency's version when only one instance of it
 /// exists), so every `PackageRef` here already carries one.
 pub fn load(path: &Path, working_dir: &Path) -> Result<Vec<Package>> {
-    let resolved = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        working_dir.join(path)
-    };
+    let resolved = resolve_path(path, working_dir);
 
     // Canonicalize to resolve symlinks and ".." components
     // (file must exist for canonicalize to succeed)
