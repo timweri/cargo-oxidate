@@ -1,15 +1,16 @@
 use crate::suggest;
 use chrono::{DateTime, Utc};
 
+/// A package's publish date and its resulting age, shared by both
+/// age-threshold violation kinds.
+pub struct Aged {
+    pub published: DateTime<Utc>,
+    pub age_days: i64,
+}
+
 pub enum ViolationKind {
-    TooNew {
-        published: DateTime<Utc>,
-        age_days: i64,
-    },
-    TooOld {
-        published: DateTime<Utc>,
-        age_days: i64,
-    },
+    TooNew(Aged),
+    TooOld(Aged),
     Unknown,
 }
 
@@ -19,22 +20,22 @@ pub struct Violation {
     pub kind: ViolationKind,
 }
 
-fn print_section(header: &str, violations: &[(&Violation, DateTime<Utc>, i64)]) {
+fn print_section(header: &str, violations: &[(&Violation, &Aged)]) {
     if violations.is_empty() {
         return;
     }
     println!("  {header}");
     let days_width = violations
         .iter()
-        .map(|(_, _, age_days)| age_days.to_string().len())
+        .map(|(_, aged)| aged.age_days.to_string().len())
         .max()
         .unwrap_or(1);
-    for (v, published, age_days) in violations {
-        let date_str = published.format("%Y-%m-%d").to_string();
+    for (v, aged) in violations {
+        let date_str = aged.published.format("%Y-%m-%d").to_string();
         println!(
             "    {} | {:>width$} days old | {} {}",
             date_str,
-            age_days,
+            aged.age_days,
             v.package,
             v.version,
             width = days_width
@@ -54,21 +55,15 @@ pub fn print_report(violations: &[Violation]) {
     // Group by kind
     let too_new: Vec<_> = violations
         .iter()
-        .filter_map(|v| match v.kind {
-            ViolationKind::TooNew {
-                published,
-                age_days,
-            } => Some((v, published, age_days)),
+        .filter_map(|v| match &v.kind {
+            ViolationKind::TooNew(aged) => Some((v, aged)),
             _ => None,
         })
         .collect();
     let too_old: Vec<_> = violations
         .iter()
-        .filter_map(|v| match v.kind {
-            ViolationKind::TooOld {
-                published,
-                age_days,
-            } => Some((v, published, age_days)),
+        .filter_map(|v| match &v.kind {
+            ViolationKind::TooOld(aged) => Some((v, aged)),
             _ => None,
         })
         .collect();

@@ -43,7 +43,7 @@ struct Cli {
     timeout: u64,
 
     /// For "too new" violations, suggest cargo update commands to downgrade to compliant versions
-    #[arg(long)]
+    #[arg(long, requires = "min_age_days")]
     suggest_fix: bool,
 
     /// Path to the response cache file (enables caching)
@@ -100,7 +100,7 @@ fn check_package(
         );
     }
 
-    freshness_policy.evaluate(pkg, &result, now)
+    freshness_policy.evaluate(pkg, result.ok().flatten(), now)
 }
 
 fn run(cli: Cli) -> Result<bool> {
@@ -111,7 +111,7 @@ fn run(cli: Cli) -> Result<bool> {
         cli.exempt,
     )?;
 
-    let suggest_min_age = suggest::require_min_age(cli.suggest_fix, cli.min_age_days)?;
+    let suggest_min_age = cli.suggest_fix.then_some(cli.min_age_days).flatten();
 
     let working_dir = std::env::current_dir().context("Failed to get current directory")?;
 
@@ -160,4 +160,22 @@ fn run(cli: Cli) -> Result<bool> {
     client.finish();
 
     Ok(!violations.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suggest_fix_without_min_age_days_fails_to_parse() {
+        let result =
+            Cli::try_parse_from(["cargo-oxidate", "--suggest-fix", "--max-age-days", "30"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn suggest_fix_with_min_age_days_parses() {
+        let result = Cli::try_parse_from(["cargo-oxidate", "--suggest-fix", "--min-age-days", "7"]);
+        assert!(result.is_ok());
+    }
 }

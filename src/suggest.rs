@@ -1,26 +1,11 @@
-use crate::api::{CratesIoClient, CrateVersionInfo, Transport};
+use crate::api::{CrateVersionInfo, CratesIoClient, Transport};
 use crate::report::{Violation, ViolationKind};
-use anyhow::Result;
 use chrono::{DateTime, Utc};
 
 pub struct Suggestion {
     pub package: String,
     pub suggested_version: String,
     pub suggested_age_days: i64,
-}
-
-/// Validates that `--suggest-fix` was given together with `--min-age-days`,
-/// returning the minimum age to use, or `None` if `--suggest-fix` wasn't
-/// requested. Lets the caller pass a plain value below instead of unwrapping
-/// an `Option` it already validated.
-pub fn require_min_age(suggest_fix: bool, min_age_days: Option<u64>) -> Result<Option<u64>> {
-    if !suggest_fix {
-        return Ok(None);
-    }
-
-    min_age_days.map(Some).ok_or_else(|| {
-        anyhow::anyhow!("--suggest-fix requires --min-age-days to be specified")
-    })
 }
 
 /// Finds the newest non-yanked version at least `min_age_days` old as of
@@ -56,7 +41,7 @@ pub fn generate_suggestions<T: Transport>(
 ) -> Option<Vec<Suggestion>> {
     let too_new: Vec<&Violation> = violations
         .iter()
-        .filter(|v| matches!(v.kind, ViolationKind::TooNew { .. }))
+        .filter(|v| matches!(v.kind, ViolationKind::TooNew(_)))
         .collect();
 
     if too_new.is_empty() {
@@ -201,68 +186,30 @@ mod tests {
         assert_eq!(age_days, 70);
     }
 
-    #[test]
-    fn require_min_age_is_none_when_suggest_fix_not_requested() {
-        assert_eq!(require_min_age(false, None).unwrap(), None);
-        assert_eq!(require_min_age(false, Some(7)).unwrap(), None);
-    }
-
-    #[test]
-    fn require_min_age_fails_without_min_age_days() {
-        assert!(require_min_age(true, None).is_err());
-    }
-
-    #[test]
-    fn require_min_age_passes_through_min_age_days() {
-        assert_eq!(require_min_age(true, Some(7)).unwrap(), Some(7));
-    }
-
     mod generate_suggestions_tests {
         use super::*;
-        use crate::api::{HttpResponse, TransportError};
-        use std::cell::RefCell;
-        use std::collections::HashMap;
+        use crate::api::RetryPolicy;
+        use crate::api::test_support::{FakeTransport, ScriptedResponse, versions_url};
+        use crate::report::Aged;
+        use std::num::NonZeroU32;
         use std::time::Duration;
 
-        /// A minimal in-memory transport for driving the suggest flow: each
-        /// crate name maps to a canned all-versions response or a transport
-        /// error.
-        type ScriptedResponse = Result<(u16, String), ()>;
-
-        #[derive(Default)]
-        struct FakeTransport {
-            responses: RefCell<HashMap<String, ScriptedResponse>>,
+        trait FakeTransportExt {
+            fn ok(&self, name: &str, versions_json: &str);
+            fn error(&self, name: &str);
         }
 
-        impl FakeTransport {
+        impl FakeTransportExt for FakeTransport {
             fn ok(&self, name: &str, versions_json: &str) {
-                self.responses
-                    .borrow_mut()
-                    .insert(versions_url(name), Ok((200, versions_json.to_string())));
+                self.push(
+                    &versions_url(name),
+                    ScriptedResponse::Http(200, versions_json.to_string()),
+                );
             }
 
             fn error(&self, name: &str) {
-                self.responses
-                    .borrow_mut()
-                    .insert(versions_url(name), Err(()));
+                self.push(&versions_url(name), ScriptedResponse::Error);
             }
-        }
-
-        impl Transport for FakeTransport {
-            fn get(&self, url: &str) -> Result<HttpResponse, TransportError> {
-                match self.responses.borrow().get(url) {
-                    Some(Ok((status, body))) => Ok(HttpResponse {
-                        status: *status,
-                        body: body.as_bytes().to_vec(),
-                    }),
-                    Some(Err(())) => Err(TransportError("connection timed out".to_string())),
-                    None => panic!("no scripted response for {url}"),
-                }
-            }
-        }
-
-        fn versions_url(name: &str) -> String {
-            format!("https://crates.io/api/v1/crates/{name}")
         }
 
         fn versions_body(entries: &[(&str, i64, bool)], now: DateTime<Utc>) -> String {
@@ -282,21 +229,26 @@ mod tests {
         /// Builds a client with retry/pacing delays zeroed out, so the test
         /// suite doesn't sleep.
         fn fast_client(transport: FakeTransport) -> CratesIoClient<FakeTransport> {
-            let mut client = CratesIoClient::with_transport(transport, None, 24);
-            client.retry_count = 1;
-            client.retry_delay = Duration::from_millis(0);
-            client.pacing_delay = Duration::from_millis(0);
-            client
+            CratesIoClient::with_transport(
+                transport,
+                None,
+                24,
+                RetryPolicy {
+                    retry_count: NonZeroU32::new(1).unwrap(),
+                    retry_delay: Duration::from_millis(0),
+                    pacing_delay: Duration::from_millis(0),
+                },
+            )
         }
 
         fn too_new(package: &str) -> Violation {
             Violation {
                 package: package.to_string(),
                 version: "1.0.0".to_string(),
-                kind: ViolationKind::TooNew {
+                kind: ViolationKind::TooNew(Aged {
                     published: now(),
                     age_days: 1,
-                },
+                }),
             }
         }
 
@@ -304,20 +256,17 @@ mod tests {
             Violation {
                 package: package.to_string(),
                 version: "1.0.0".to_string(),
-                kind: ViolationKind::TooOld {
+                kind: ViolationKind::TooOld(Aged {
                     published: now(),
                     age_days: 1000,
-                },
+                }),
             }
         }
 
         #[test]
         fn only_too_new_violations_are_fetched() {
             let transport = FakeTransport::default();
-            transport.ok(
-                "serde",
-                &versions_body(&[("1.0.0", 50, false)], now()),
-            );
+            transport.ok("serde", &versions_body(&[("1.0.0", 50, false)], now()));
             // "syn" has no scripted response: if it were fetched, the
             // transport would panic.
             let mut client = fast_client(transport);
@@ -333,10 +282,7 @@ mod tests {
         fn a_failed_fetch_does_not_abort_the_others() {
             let transport = FakeTransport::default();
             transport.error("serde");
-            transport.ok(
-                "syn",
-                &versions_body(&[("1.0.0", 50, false)], now()),
-            );
+            transport.ok("syn", &versions_body(&[("1.0.0", 50, false)], now()));
             let mut client = fast_client(transport);
 
             let violations = vec![too_new("serde"), too_new("syn")];
@@ -349,10 +295,7 @@ mod tests {
         #[test]
         fn no_compliant_version_produces_no_suggestion() {
             let transport = FakeTransport::default();
-            transport.ok(
-                "serde",
-                &versions_body(&[("1.0.0", 5, false)], now()),
-            );
+            transport.ok("serde", &versions_body(&[("1.0.0", 5, false)], now()));
             let mut client = fast_client(transport);
 
             let violations = vec![too_new("serde")];

@@ -1,6 +1,5 @@
-use crate::api::FetchError;
 use crate::lockfile::Package;
-use crate::report::{Violation, ViolationKind};
+use crate::report::{Aged, Violation, ViolationKind};
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
 
@@ -42,22 +41,17 @@ impl FreshnessPolicy {
         self.exempt.contains(name)
     }
 
-    /// Evaluates a package against the policy given a publish-date lookup
-    /// result and the current time, returning the violations triggered. A
-    /// failed lookup and a successful lookup with no date are both treated
-    /// as "unknown"; warning about a failed lookup is the caller's job.
+    /// Evaluates a package against the policy given its publish date (`None`
+    /// if the lookup failed or found no date) and the current time,
+    /// returning the violations triggered. Warning about a failed lookup is
+    /// the caller's job.
     pub fn evaluate(
         &self,
         pkg: &Package,
-        outcome: &Result<Option<DateTime<Utc>>, FetchError>,
+        published: Option<DateTime<Utc>>,
         now: DateTime<Utc>,
     ) -> Vec<Violation> {
         let mut violations = Vec::new();
-
-        let published = match outcome {
-            Ok(Some(published)) => Some(*published),
-            Ok(None) | Err(_) => None,
-        };
 
         let Some(published) = published else {
             if !self.exclude_missing {
@@ -78,10 +72,10 @@ impl FreshnessPolicy {
             violations.push(Violation {
                 package: pkg.name.clone(),
                 version: pkg.version.clone(),
-                kind: ViolationKind::TooNew {
+                kind: ViolationKind::TooNew(Aged {
                     published,
                     age_days,
-                },
+                }),
             });
         }
 
@@ -91,10 +85,10 @@ impl FreshnessPolicy {
             violations.push(Violation {
                 package: pkg.name.clone(),
                 version: pkg.version.clone(),
-                kind: ViolationKind::TooOld {
+                kind: ViolationKind::TooOld(Aged {
                     published,
                     age_days,
-                },
+                }),
             });
         }
 
@@ -138,31 +132,31 @@ mod tests {
     fn package_exactly_at_min_age_is_compliant() {
         let now = Utc::now();
         let policy = FreshnessPolicy::new(Some(7), None, false, vec![]).unwrap();
-        let outcome = Ok(Some(published_days_ago(now, 7)));
+        let published = Some(published_days_ago(now, 7));
 
-        assert!(policy.evaluate(&pkg(), &outcome, now).is_empty());
+        assert!(policy.evaluate(&pkg(), published, now).is_empty());
     }
 
     #[test]
     fn package_exactly_at_max_age_is_compliant() {
         let now = Utc::now();
         let policy = FreshnessPolicy::new(None, Some(365), false, vec![]).unwrap();
-        let outcome = Ok(Some(published_days_ago(now, 365)));
+        let published = Some(published_days_ago(now, 365));
 
-        assert!(policy.evaluate(&pkg(), &outcome, now).is_empty());
+        assert!(policy.evaluate(&pkg(), published, now).is_empty());
     }
 
     #[test]
     fn package_one_day_below_min_age_is_too_new() {
         let now = Utc::now();
         let policy = FreshnessPolicy::new(Some(7), None, false, vec![]).unwrap();
-        let outcome = Ok(Some(published_days_ago(now, 6)));
+        let published = Some(published_days_ago(now, 6));
 
-        let violations = policy.evaluate(&pkg(), &outcome, now);
+        let violations = policy.evaluate(&pkg(), published, now);
         assert_eq!(violations.len(), 1);
         assert!(matches!(
             violations[0].kind,
-            ViolationKind::TooNew { age_days: 6, .. }
+            ViolationKind::TooNew(Aged { age_days: 6, .. })
         ));
     }
 
@@ -170,13 +164,13 @@ mod tests {
     fn package_one_day_above_max_age_is_too_old() {
         let now = Utc::now();
         let policy = FreshnessPolicy::new(None, Some(365), false, vec![]).unwrap();
-        let outcome = Ok(Some(published_days_ago(now, 366)));
+        let published = Some(published_days_ago(now, 366));
 
-        let violations = policy.evaluate(&pkg(), &outcome, now);
+        let violations = policy.evaluate(&pkg(), published, now);
         assert_eq!(violations.len(), 1);
         assert!(matches!(
             violations[0].kind,
-            ViolationKind::TooOld { age_days: 366, .. }
+            ViolationKind::TooOld(Aged { age_days: 366, .. })
         ));
     }
 
@@ -185,35 +179,34 @@ mod tests {
         let now = Utc::now();
         let policy = FreshnessPolicy::new(Some(7), Some(365), false, vec![]).unwrap();
 
-        let too_new = policy.evaluate(&pkg(), &Ok(Some(published_days_ago(now, 1))), now);
+        let too_new = policy.evaluate(&pkg(), Some(published_days_ago(now, 1)), now);
         assert!(matches!(
             too_new.as_slice(),
             [Violation {
-                kind: ViolationKind::TooNew { .. },
+                kind: ViolationKind::TooNew(_),
                 ..
             }]
         ));
 
-        let too_old = policy.evaluate(&pkg(), &Ok(Some(published_days_ago(now, 400))), now);
+        let too_old = policy.evaluate(&pkg(), Some(published_days_ago(now, 400)), now);
         assert!(matches!(
             too_old.as_slice(),
             [Violation {
-                kind: ViolationKind::TooOld { .. },
+                kind: ViolationKind::TooOld(_),
                 ..
             }]
         ));
 
-        let compliant = policy.evaluate(&pkg(), &Ok(Some(published_days_ago(now, 100))), now);
+        let compliant = policy.evaluate(&pkg(), Some(published_days_ago(now, 100)), now);
         assert!(compliant.is_empty());
     }
 
     #[test]
-    fn failed_lookup_is_unknown_by_default() {
+    fn missing_publish_date_is_unknown_by_default() {
         let now = Utc::now();
         let policy = FreshnessPolicy::new(Some(7), None, false, vec![]).unwrap();
-        let outcome = Err(FetchError::Retryable("boom".to_string()));
 
-        let violations = policy.evaluate(&pkg(), &outcome, now);
+        let violations = policy.evaluate(&pkg(), None, now);
         assert_eq!(violations.len(), 1);
         assert!(matches!(violations[0].kind, ViolationKind::Unknown));
     }
@@ -222,20 +215,8 @@ mod tests {
     fn exclude_missing_suppresses_unknown() {
         let now = Utc::now();
         let policy = FreshnessPolicy::new(Some(7), None, true, vec![]).unwrap();
-        let outcome = Err(FetchError::Retryable("boom".to_string()));
 
-        assert!(policy.evaluate(&pkg(), &outcome, now).is_empty());
-    }
-
-    #[test]
-    fn successful_lookup_with_no_date_is_treated_as_unknown() {
-        let now = Utc::now();
-        let policy = FreshnessPolicy::new(Some(7), None, false, vec![]).unwrap();
-        let outcome: Result<Option<DateTime<Utc>>, FetchError> = Ok(None);
-
-        let violations = policy.evaluate(&pkg(), &outcome, now);
-        assert_eq!(violations.len(), 1);
-        assert!(matches!(violations[0].kind, ViolationKind::Unknown));
+        assert!(policy.evaluate(&pkg(), None, now).is_empty());
     }
 
     #[test]

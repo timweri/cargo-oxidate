@@ -2,6 +2,7 @@ use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroU32;
 use std::path::Path;
 use std::time::Duration;
 
@@ -113,15 +114,29 @@ impl Transport for UreqTransport {
     }
 }
 
+/// Retry and pacing timing, fixed at construction. Tests build one with
+/// zeroed delays so the suite doesn't sleep; production uses `Default`.
+pub(crate) struct RetryPolicy {
+    pub(crate) retry_count: NonZeroU32,
+    pub(crate) retry_delay: Duration,
+    pub(crate) pacing_delay: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            retry_count: NonZeroU32::new(3).unwrap(),
+            retry_delay: Duration::from_millis(500),
+            pacing_delay: Duration::from_millis(100),
+        }
+    }
+}
+
 pub struct CratesIoClient<T: Transport = UreqTransport> {
     transport: T,
     cache: ResponseCache,
     cache_max_age_hours: u64,
-    // Settable directly by tests (in this module and others, e.g. the
-    // suggest flow tests) so the test suite doesn't sleep.
-    pub(crate) retry_count: u32,
-    pub(crate) retry_delay: Duration,
-    pub(crate) pacing_delay: Duration,
+    retry_policy: RetryPolicy,
 }
 
 impl CratesIoClient<UreqTransport> {
@@ -134,23 +149,23 @@ impl CratesIoClient<UreqTransport> {
             UreqTransport::new(timeout_secs),
             cache_path,
             cache_max_age_hours,
+            RetryPolicy::default(),
         ))
     }
 }
 
 impl<T: Transport> CratesIoClient<T> {
-    pub fn with_transport(
+    pub(crate) fn with_transport(
         transport: T,
         cache_path: Option<&Path>,
         cache_max_age_hours: u64,
+        retry_policy: RetryPolicy,
     ) -> Self {
         Self {
             transport,
             cache: ResponseCache::load(cache_path),
             cache_max_age_hours,
-            retry_count: 3,
-            retry_delay: Duration::from_millis(500),
-            pacing_delay: Duration::from_millis(100),
+            retry_policy,
         }
     }
 
@@ -166,7 +181,7 @@ impl<T: Transport> CratesIoClient<T> {
     /// Sleeps for the inter-request rate limit window. Called only from the
     /// fetch methods' cache-miss path, so a cache hit never pays it.
     fn pace(&self) {
-        std::thread::sleep(self.pacing_delay);
+        std::thread::sleep(self.retry_policy.pacing_delay);
     }
 
     /// Issues a GET, classifies HTTP errors, and parses JSON.
@@ -210,21 +225,24 @@ impl<T: Transport> CratesIoClient<T> {
         &mut self,
         mut op: impl FnMut(&mut Self) -> Result<R, FetchError>,
     ) -> Result<R, FetchError> {
+        let retry_count = self.retry_policy.retry_count.get();
         let mut last_error = None;
 
-        for attempt in 0..self.retry_count {
+        for attempt in 0..retry_count {
             match op(self) {
                 Ok(result) => return Ok(result),
                 Err(FetchError::Permanent(msg)) => return Err(FetchError::Permanent(msg)),
                 Err(e) => {
-                    if attempt + 1 < self.retry_count {
-                        std::thread::sleep(self.retry_delay);
+                    if attempt + 1 < retry_count {
+                        std::thread::sleep(self.retry_policy.retry_delay);
                     }
                     last_error = Some(e);
                 }
             }
         }
 
+        // `retry_count` is a `NonZeroU32`, so the loop above ran at least
+        // once and `last_error` is always populated here.
         Err(last_error.unwrap())
     }
 
@@ -285,14 +303,16 @@ impl<T: Transport> CratesIoClient<T> {
     }
 }
 
+/// Test-only fake `Transport` and URL helpers, shared by this module's own
+/// tests and by the suggest-flow tests in `suggest.rs` (which previously
+/// maintained a second, divergent copy of the same fake).
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_support {
+    use super::{HttpResponse, Transport, TransportError};
     use std::cell::RefCell;
     use std::collections::{HashMap, VecDeque};
-    use std::time::Instant;
 
-    enum ScriptedResponse {
+    pub(crate) enum ScriptedResponse {
         Http(u16, String),
         Error,
     }
@@ -301,17 +321,17 @@ mod tests {
     /// URL, consumed in order. Also records every call made, so tests can
     /// assert on request counts (e.g. "a cache hit issues no request").
     #[derive(Default)]
-    struct FakeTransport {
+    pub(crate) struct FakeTransport {
         responses: RefCell<HashMap<String, VecDeque<ScriptedResponse>>>,
         calls: RefCell<Vec<String>>,
     }
 
     impl FakeTransport {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self::default()
         }
 
-        fn push(&self, url: &str, response: ScriptedResponse) {
+        pub(crate) fn push(&self, url: &str, response: ScriptedResponse) {
             self.responses
                 .borrow_mut()
                 .entry(url.to_string())
@@ -319,7 +339,7 @@ mod tests {
                 .push_back(response);
         }
 
-        fn call_count(&self) -> usize {
+        pub(crate) fn call_count(&self) -> usize {
             self.calls.borrow().len()
         }
     }
@@ -344,12 +364,20 @@ mod tests {
         }
     }
 
+    pub(crate) fn versions_url(name: &str) -> String {
+        format!("https://crates.io/api/v1/crates/{name}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{FakeTransport, ScriptedResponse, versions_url};
+    use super::*;
+    use std::num::NonZeroU32;
+    use std::time::Instant;
+
     fn version_url(name: &str, version: &str) -> String {
         format!("https://crates.io/api/v1/crates/{name}/{version}")
-    }
-
-    fn versions_url(name: &str) -> String {
-        format!("https://crates.io/api/v1/crates/{name}")
     }
 
     fn version_body(created_at: &str) -> String {
@@ -359,10 +387,16 @@ mod tests {
     /// Builds a client with retry/pacing delays zeroed out, so the test
     /// suite doesn't sleep.
     fn fast_client(transport: FakeTransport) -> CratesIoClient<FakeTransport> {
-        let mut client = CratesIoClient::with_transport(transport, None, 24);
-        client.retry_delay = Duration::from_millis(0);
-        client.pacing_delay = Duration::from_millis(0);
-        client
+        CratesIoClient::with_transport(
+            transport,
+            None,
+            24,
+            RetryPolicy {
+                retry_count: NonZeroU32::new(3).unwrap(),
+                retry_delay: Duration::from_millis(0),
+                pacing_delay: Duration::from_millis(0),
+            },
+        )
     }
 
     #[test]
@@ -445,6 +479,27 @@ mod tests {
     }
 
     #[test]
+    fn gives_up_after_a_single_attempt_without_panicking() {
+        let url = version_url("serde", "1.0.0");
+        let transport = FakeTransport::new();
+        transport.push(&url, ScriptedResponse::Http(503, String::new()));
+
+        let mut client = CratesIoClient::with_transport(
+            transport,
+            None,
+            24,
+            RetryPolicy {
+                retry_count: NonZeroU32::new(1).unwrap(),
+                retry_delay: Duration::from_millis(0),
+                pacing_delay: Duration::from_millis(0),
+            },
+        );
+        let result = client.fetch_publish_date("serde", "1.0.0");
+        assert!(matches!(result, Err(FetchError::Retryable(_))));
+        assert_eq!(client.transport.call_count(), 1);
+    }
+
+    #[test]
     fn transport_error_is_retried() {
         let url = version_url("serde", "1.0.0");
         let transport = FakeTransport::new();
@@ -479,9 +534,16 @@ mod tests {
     #[test]
     fn cache_hit_skips_pacing_delay() {
         let transport = FakeTransport::new();
-        let mut client = CratesIoClient::with_transport(transport, None, 24);
-        client.retry_delay = Duration::from_millis(0);
-        client.pacing_delay = Duration::from_millis(300);
+        let mut client = CratesIoClient::with_transport(
+            transport,
+            None,
+            24,
+            RetryPolicy {
+                retry_count: NonZeroU32::new(3).unwrap(),
+                retry_delay: Duration::from_millis(0),
+                pacing_delay: Duration::from_millis(300),
+            },
+        );
         client.cache.set_publish_date(
             "serde",
             "1.0.0",
