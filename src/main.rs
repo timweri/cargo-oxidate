@@ -47,6 +47,14 @@ struct Cli {
     #[arg(long, requires = "min_age_days")]
     suggest_fix: bool,
 
+    /// Consider prerelease versions as suggestion candidates (requires --suggest-fix). Under
+    /// semver, a requirement matches a prerelease only when it names the identical
+    /// major.minor.patch with a prerelease part of its own, so this flag usually changes nothing
+    /// unless a dependent already tracks that exact prerelease line or the locked version is
+    /// itself a prerelease — an empty result with the flag set is expected, not a bug.
+    #[arg(long, requires = "suggest_fix")]
+    include_prerelease: bool,
+
     /// Path to the response cache file (enables caching)
     #[arg(long, env = "CARGO_OXIDATE_CACHE_PATH")]
     cache_path: Option<PathBuf>,
@@ -154,11 +162,32 @@ fn run(cli: Cli) -> Result<bool> {
     report::print_report(&violations);
 
     // Generate suggestions if requested
-    if let Some(min_age) = suggest_min_age
-        && let Some(suggestions) =
-            suggest::generate_suggestions(&mut client, &violations, min_age, now)
-    {
-        report::print_suggestions(&suggestions);
+    if let Some(min_age) = suggest_min_age {
+        let cargo_lock_path = if cli.cargo_lock.is_absolute() {
+            cli.cargo_lock.clone()
+        } else {
+            working_dir.join(&cli.cargo_lock)
+        };
+        let lockfile_dir = cargo_lock_path.parent().unwrap_or(&working_dir);
+
+        let (direct_requirements, manifest_warnings) =
+            manifest::load_direct_requirements(lockfile_dir);
+        for warning in &manifest_warnings {
+            eprintln!("  Warning: {warning}");
+        }
+
+        if let Some(outcomes) = suggest::generate_suggestions(
+            &mut client,
+            &violations,
+            &packages,
+            &direct_requirements,
+            lockfile_dir,
+            min_age,
+            cli.include_prerelease,
+            now,
+        ) {
+            report::print_suggestions(&outcomes);
+        }
     }
 
     client.finish();
