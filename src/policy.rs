@@ -105,6 +105,8 @@ mod tests {
         Package {
             name: "serde".to_string(),
             version: "1.0.0".to_string(),
+            is_registry: true,
+            dependencies: vec![],
         }
     }
 

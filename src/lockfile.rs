@@ -1,19 +1,35 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
-/// A dependency from a lockfile, checked against the crates.io registry.
-pub struct Package {
+/// A name/version pair identifying a package, used both for lockfile entries
+/// and for the dependency edges between them.
+pub struct PackageRef {
     pub name: String,
     pub version: String,
 }
 
-/// Loads the crates.io registry packages from a lockfile.
+/// An entry from `Cargo.lock`. Includes path and git packages (not just
+/// crates.io ones) so that workspace members can appear as dependents in the
+/// requirement graph; `is_registry` tells callers which entries are eligible
+/// for the age check itself.
+pub struct Package {
+    pub name: String,
+    pub version: String,
+    pub is_registry: bool,
+    pub dependencies: Vec<PackageRef>,
+}
+
+/// Loads every package recorded in a lockfile, registry and non-registry
+/// alike.
 ///
 /// `path` is the lockfile path as given by the caller (relative or
 /// absolute), resolved against `working_dir` if relative. Rejects anything
 /// that is not a regular file within `working_dir` (`..` traversal and
-/// symlink escapes included), then keeps only packages sourced from the
-/// default registry, since path and git dependencies aren't on crates.io.
+/// symlink escapes included).
+///
+/// `cargo_lock` resolves each dependency edge to a concrete version itself
+/// (lockfiles may omit a dependency's version when only one instance of it
+/// exists), so every `PackageRef` here already carries one.
 pub fn load(path: &Path, working_dir: &Path) -> Result<Vec<Package>> {
     let resolved = if path.is_absolute() {
         path.to_path_buf()
@@ -55,13 +71,18 @@ pub fn load(path: &Path, working_dir: &Path) -> Result<Vec<Package>> {
     let packages = lockfile
         .packages
         .into_iter()
-        .filter(|p| {
-            // Only check packages from crates.io registry
-            p.source.as_ref().is_some_and(|s| s.is_default_registry())
-        })
         .map(|p| Package {
             name: p.name.as_str().to_string(),
             version: p.version.to_string(),
+            is_registry: p.source.as_ref().is_some_and(|s| s.is_default_registry()),
+            dependencies: p
+                .dependencies
+                .iter()
+                .map(|d| PackageRef {
+                    name: d.name.as_str().to_string(),
+                    version: d.version.to_string(),
+                })
+                .collect(),
         })
         .collect();
 
@@ -84,6 +105,28 @@ version = "{version}"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0000000000000000000000000000000000000000000000000000000000000000"
 "#
+        )
+    }
+
+    fn registry_entry_with_deps(name: &str, version: &str, deps: &[&str]) -> String {
+        let deps_line = if deps.is_empty() {
+            String::new()
+        } else {
+            let list = deps
+                .iter()
+                .map(|d| format!("\"{d}\""))
+                .collect::<Vec<_>>()
+                .join(",\n ");
+            format!("dependencies = [\n {list},\n]\n")
+        };
+        format!(
+            r#"
+[[package]]
+name = "{name}"
+version = "{version}"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0000000000000000000000000000000000000000000000000000000000000000"
+{deps_line}"#
         )
     }
 
@@ -115,7 +158,7 @@ version = "{version}"
     }
 
     #[test]
-    fn only_crates_io_registry_packages_are_kept() {
+    fn non_registry_packages_are_kept_with_the_flag_set() {
         let dir = tempdir().unwrap();
         let contents = format!(
             "{}{}{}",
@@ -127,9 +170,47 @@ version = "{version}"
 
         let packages = load(Path::new("Cargo.lock"), dir.path()).unwrap();
 
-        assert_eq!(packages.len(), 1);
-        assert_eq!(packages[0].name, "serde");
-        assert_eq!(packages[0].version, "1.0.0");
+        assert_eq!(packages.len(), 3);
+        let serde = packages.iter().find(|p| p.name == "serde").unwrap();
+        assert!(serde.is_registry);
+        let rand = packages.iter().find(|p| p.name == "rand").unwrap();
+        assert!(!rand.is_registry);
+        let local = packages.iter().find(|p| p.name == "local-crate").unwrap();
+        assert!(!local.is_registry);
+    }
+
+    #[test]
+    fn dependency_with_explicit_version_resolves() {
+        let dir = tempdir().unwrap();
+        let contents = format!(
+            "{}{}",
+            registry_entry_with_deps("a", "1.0.0", &["b 2.0.0"]),
+            registry_entry("b", "2.0.0"),
+        );
+        write_lockfile(dir.path(), &contents);
+
+        let packages = load(Path::new("Cargo.lock"), dir.path()).unwrap();
+        let a = packages.iter().find(|p| p.name == "a").unwrap();
+        assert_eq!(a.dependencies.len(), 1);
+        assert_eq!(a.dependencies[0].name, "b");
+        assert_eq!(a.dependencies[0].version, "2.0.0");
+    }
+
+    #[test]
+    fn dependency_with_omitted_version_resolves_by_name() {
+        let dir = tempdir().unwrap();
+        let contents = format!(
+            "{}{}",
+            registry_entry_with_deps("a", "1.0.0", &["b"]),
+            registry_entry("b", "2.0.0"),
+        );
+        write_lockfile(dir.path(), &contents);
+
+        let packages = load(Path::new("Cargo.lock"), dir.path()).unwrap();
+        let a = packages.iter().find(|p| p.name == "a").unwrap();
+        assert_eq!(a.dependencies.len(), 1);
+        assert_eq!(a.dependencies[0].name, "b");
+        assert_eq!(a.dependencies[0].version, "2.0.0");
     }
 
     #[test]

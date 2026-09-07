@@ -129,8 +129,11 @@ fn run(cli: Cli) -> Result<bool> {
     let mut violations = Vec::new();
     let now = chrono::Utc::now();
 
-    let total = packages.len();
-    for (i, pkg) in packages.iter().enumerate() {
+    let registry_packages: Vec<&lockfile::Package> =
+        packages.iter().filter(|p| p.is_registry).collect();
+
+    let total = registry_packages.len();
+    for (i, pkg) in registry_packages.iter().enumerate() {
         if freshness_policy.is_exempt(&pkg.name) {
             continue;
         }
