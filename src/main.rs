@@ -6,6 +6,7 @@ use std::process::ExitCode;
 mod api;
 mod cache;
 mod lockfile;
+mod manifest;
 mod policy;
 mod report;
 mod suggest;

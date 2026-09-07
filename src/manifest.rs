@@ -1,0 +1,405 @@
+use cargo_toml::{Dependency, DepsSet, Manifest};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
+/// One version requirement the user's own manifests place on a registry
+/// crate, together with the manifest that placed it (for warnings and
+/// diagnostics).
+pub struct DirectRequirement {
+    pub manifest: PathBuf,
+    pub crate_name: String,
+    pub req: semver::VersionReq,
+}
+
+/// Reads every version requirement the user's own manifests place on
+/// registry crates.
+///
+/// `lockfile_dir` is the directory containing `Cargo.lock`, where the root
+/// `Cargo.toml` is expected to live. Workspace members are expanded from
+/// `[workspace.members]` glob patterns with `[workspace.exclude]` applied,
+/// and path dependencies are followed one level further so that a member
+/// not listed under `members` is still read. `dependencies`,
+/// `dev-dependencies`, `build-dependencies`, and each `[target.*]` table are
+/// all walked; path and git dependencies are skipped since they carry no
+/// registry version.
+///
+/// Neither a missing manifest nor one that fails to parse aborts the run:
+/// each produces a warning in the second return value and is simply
+/// excluded from the (possibly empty) first.
+pub fn load_direct_requirements(lockfile_dir: &Path) -> (Vec<DirectRequirement>, Vec<String>) {
+    let mut warnings = Vec::new();
+    let root_path = lockfile_dir.join("Cargo.toml");
+
+    if !root_path.is_file() {
+        warnings.push(format!(
+            "No Cargo.toml found beside the lockfile at {}; direct dependency requirements were not checked",
+            lockfile_dir.display()
+        ));
+        return (vec![], warnings);
+    }
+
+    let mut seen = HashSet::new();
+    seen.insert(canonical_or(&root_path));
+
+    let mut manifests = Vec::new();
+    match load_manifest(&root_path) {
+        Ok(root) => {
+            if let Some(ws) = &root.workspace {
+                for member_dir in expand_members(lockfile_dir, ws) {
+                    if !seen.insert(canonical_or(&member_dir)) {
+                        continue;
+                    }
+                    let member_path = member_dir.join("Cargo.toml");
+                    match load_manifest(&member_path) {
+                        Ok(m) => manifests.push((member_path, m)),
+                        Err(e) => warnings.push(e),
+                    }
+                }
+            }
+            manifests.push((root_path, root));
+        }
+        Err(e) => warnings.push(e),
+    }
+
+    // Follow path dependencies one level further, so members not listed
+    // under `workspace.members` are still read.
+    let mut followed = Vec::new();
+    for (path, manifest) in &manifests {
+        let base_dir = path.parent().unwrap_or(lockfile_dir);
+        for dep_dir in path_dependency_dirs(base_dir, manifest) {
+            if !seen.insert(canonical_or(&dep_dir)) {
+                continue;
+            }
+            let dep_path = dep_dir.join("Cargo.toml");
+            match load_manifest(&dep_path) {
+                Ok(m) => followed.push((dep_path, m)),
+                Err(e) => warnings.push(e),
+            }
+        }
+    }
+    manifests.extend(followed);
+
+    let mut requirements = Vec::new();
+    for (path, manifest) in &manifests {
+        collect_requirements(path, manifest, &mut requirements, &mut warnings);
+    }
+
+    (requirements, warnings)
+}
+
+fn canonical_or(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn load_manifest(path: &Path) -> Result<Manifest, String> {
+    Manifest::from_path(path)
+        .map_err(|e| format!("Failed to parse manifest {}: {e}", path.display()))
+}
+
+/// Expands `workspace.members` glob patterns against `root_dir`, dropping
+/// anything matching `workspace.exclude`.
+fn expand_members(root_dir: &Path, workspace: &cargo_toml::Workspace) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    for pattern in &workspace.members {
+        let full_pattern = root_dir.join(pattern);
+        let Some(pattern_str) = full_pattern.to_str() else {
+            continue;
+        };
+        let Ok(paths) = glob::glob(pattern_str) else {
+            continue;
+        };
+        for entry in paths.flatten() {
+            if is_excluded(root_dir, &entry, &workspace.exclude) {
+                continue;
+            }
+            dirs.push(entry);
+        }
+    }
+
+    dirs
+}
+
+fn is_excluded(root_dir: &Path, member_dir: &Path, exclude: &[String]) -> bool {
+    let Ok(relative) = member_dir.strip_prefix(root_dir) else {
+        return false;
+    };
+    exclude.iter().any(|pattern| relative.starts_with(pattern))
+}
+
+/// Directories of every path dependency declared in `manifest`'s normal,
+/// dev, build, or target-specific dependency tables.
+fn path_dependency_dirs(base_dir: &Path, manifest: &Manifest) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for deps in all_dep_sets(manifest) {
+        for dep in deps.values() {
+            if let Some(detail) = dep.detail()
+                && let Some(rel_path) = &detail.path
+            {
+                dirs.push(base_dir.join(rel_path));
+            }
+        }
+    }
+    dirs
+}
+
+fn all_dep_sets(manifest: &Manifest) -> Vec<&DepsSet> {
+    let mut sets = vec![
+        &manifest.dependencies,
+        &manifest.dev_dependencies,
+        &manifest.build_dependencies,
+    ];
+    for target in manifest.target.values() {
+        sets.push(&target.dependencies);
+        sets.push(&target.dev_dependencies);
+        sets.push(&target.build_dependencies);
+    }
+    sets
+}
+
+fn collect_requirements(
+    manifest_path: &Path,
+    manifest: &Manifest,
+    out: &mut Vec<DirectRequirement>,
+    warnings: &mut Vec<String>,
+) {
+    for deps in all_dep_sets(manifest) {
+        for (key, dep) in deps {
+            collect_one(manifest_path, key, dep, out, warnings);
+        }
+    }
+}
+
+fn collect_one(
+    manifest_path: &Path,
+    key: &str,
+    dep: &Dependency,
+    out: &mut Vec<DirectRequirement>,
+    warnings: &mut Vec<String>,
+) {
+    // Path and git dependencies aren't registry-versioned.
+    if let Some(detail) = dep.detail()
+        && (detail.path.is_some() || detail.git.is_some())
+    {
+        return;
+    }
+
+    let crate_name = dep.package().unwrap_or(key).to_string();
+
+    match dep.try_req() {
+        Ok(req) => out.push(DirectRequirement {
+            manifest: manifest_path.to_path_buf(),
+            crate_name,
+            req: req.clone(),
+        }),
+        Err(e) => warnings.push(format!(
+            "Could not determine requirement for {crate_name} in {}: {e}",
+            manifest_path.display()
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn write(dir: &Path, rel: &str, contents: &str) -> PathBuf {
+        let path = dir.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    fn find<'a>(reqs: &'a [DirectRequirement], name: &str) -> &'a DirectRequirement {
+        reqs.iter()
+            .find(|r| r.crate_name == name)
+            .unwrap_or_else(|| panic!("no requirement collected for {name}"))
+    }
+
+    #[test]
+    fn plain_string_requirement() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            r#"
+[package]
+name = "root"
+version = "0.1.0"
+
+[dependencies]
+serde = "1.0"
+"#,
+        );
+
+        let (reqs, warnings) = load_direct_requirements(dir.path());
+        assert!(warnings.is_empty());
+        assert_eq!(find(&reqs, "serde").req, semver::VersionReq::parse("1.0").unwrap());
+    }
+
+    #[test]
+    fn detailed_dependency_with_rename() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            r#"
+[package]
+name = "root"
+version = "0.1.0"
+
+[dependencies]
+my_serde = { package = "serde", version = "1.0" }
+"#,
+        );
+
+        let (reqs, warnings) = load_direct_requirements(dir.path());
+        assert!(warnings.is_empty());
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].crate_name, "serde");
+    }
+
+    #[test]
+    fn workspace_inherited_requirement() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            r#"
+[workspace]
+members = ["member"]
+
+[workspace.dependencies]
+serde = "1.0"
+"#,
+        );
+        write(
+            dir.path(),
+            "member/Cargo.toml",
+            r#"
+[package]
+name = "member"
+version = "0.1.0"
+
+[dependencies]
+serde = { workspace = true }
+"#,
+        );
+
+        let (reqs, warnings) = load_direct_requirements(dir.path());
+        assert!(warnings.is_empty());
+        assert_eq!(find(&reqs, "serde").req, semver::VersionReq::parse("1.0").unwrap());
+    }
+
+    #[test]
+    fn target_specific_table() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            r#"
+[package]
+name = "root"
+version = "0.1.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+"#,
+        );
+
+        let (reqs, warnings) = load_direct_requirements(dir.path());
+        assert!(warnings.is_empty());
+        assert_eq!(find(&reqs, "libc").req, semver::VersionReq::parse("0.2").unwrap());
+    }
+
+    #[test]
+    fn workspace_members_glob_with_exclude() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            r#"
+[workspace]
+members = ["crates/*"]
+exclude = ["crates/skip-me"]
+"#,
+        );
+        write(
+            dir.path(),
+            "crates/a/Cargo.toml",
+            r#"
+[package]
+name = "a"
+version = "0.1.0"
+
+[dependencies]
+serde = "1.0"
+"#,
+        );
+        write(
+            dir.path(),
+            "crates/skip-me/Cargo.toml",
+            r#"
+[package]
+name = "skip-me"
+version = "0.1.0"
+
+[dependencies]
+rand = "0.8"
+"#,
+        );
+
+        let (reqs, warnings) = load_direct_requirements(dir.path());
+        assert!(warnings.is_empty());
+        assert!(reqs.iter().any(|r| r.crate_name == "serde"));
+        assert!(!reqs.iter().any(|r| r.crate_name == "rand"));
+    }
+
+    #[test]
+    fn path_dependency_followed_one_level() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            r#"
+[package]
+name = "root"
+version = "0.1.0"
+
+[dependencies]
+helper = { path = "helper" }
+"#,
+        );
+        write(
+            dir.path(),
+            "helper/Cargo.toml",
+            r#"
+[package]
+name = "helper"
+version = "0.1.0"
+
+[dependencies]
+serde = "1.0"
+"#,
+        );
+
+        let (reqs, warnings) = load_direct_requirements(dir.path());
+        assert!(warnings.is_empty());
+        assert!(reqs.iter().any(|r| r.crate_name == "serde"));
+        // The path dependency itself is skipped: it's not registry-versioned.
+        assert!(!reqs.iter().any(|r| r.crate_name == "helper"));
+    }
+
+    #[test]
+    fn missing_manifest_degrades_to_a_warning() {
+        let dir = tempdir().unwrap();
+
+        let (reqs, warnings) = load_direct_requirements(dir.path());
+        assert!(reqs.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("No Cargo.toml"));
+    }
+}
