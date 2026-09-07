@@ -472,10 +472,7 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn index_url(name: &str) -> String {
-        format!(
-            "https://index.crates.io/{}",
-            super::sparse_index_path(name)
-        )
+        format!("https://index.crates.io/{}", super::sparse_index_path(name))
     }
 }
 

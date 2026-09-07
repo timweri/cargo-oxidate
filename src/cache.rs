@@ -306,7 +306,11 @@ mod tests {
                     .with_timezone(&Utc)
             )
         );
-        assert!(cache.get_index_records("serde", Duration::hours(1)).is_none());
+        assert!(
+            cache
+                .get_index_records("serde", Duration::hours(1))
+                .is_none()
+        );
     }
 
     #[test]

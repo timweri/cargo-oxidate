@@ -237,7 +237,10 @@ serde = "1.0"
 
         let (reqs, warnings) = load_direct_requirements(dir.path());
         assert!(warnings.is_empty());
-        assert_eq!(find(&reqs, "serde").req, semver::VersionReq::parse("1.0").unwrap());
+        assert_eq!(
+            find(&reqs, "serde").req,
+            semver::VersionReq::parse("1.0").unwrap()
+        );
     }
 
     #[test]
@@ -291,7 +294,10 @@ serde = { workspace = true }
 
         let (reqs, warnings) = load_direct_requirements(dir.path());
         assert!(warnings.is_empty());
-        assert_eq!(find(&reqs, "serde").req, semver::VersionReq::parse("1.0").unwrap());
+        assert_eq!(
+            find(&reqs, "serde").req,
+            semver::VersionReq::parse("1.0").unwrap()
+        );
     }
 
     #[test]
@@ -312,7 +318,10 @@ libc = "0.2"
 
         let (reqs, warnings) = load_direct_requirements(dir.path());
         assert!(warnings.is_empty());
-        assert_eq!(find(&reqs, "libc").req, semver::VersionReq::parse("0.2").unwrap());
+        assert_eq!(
+            find(&reqs, "libc").req,
+            semver::VersionReq::parse("0.2").unwrap()
+        );
     }
 
     #[test]

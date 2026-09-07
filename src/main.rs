@@ -211,4 +211,27 @@ mod tests {
         let result = Cli::try_parse_from(["cargo-oxidate", "--suggest-fix", "--min-age-days", "7"]);
         assert!(result.is_ok());
     }
+
+    #[test]
+    fn include_prerelease_without_suggest_fix_fails_to_parse() {
+        let result = Cli::try_parse_from([
+            "cargo-oxidate",
+            "--include-prerelease",
+            "--min-age-days",
+            "7",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn include_prerelease_with_suggest_fix_parses() {
+        let result = Cli::try_parse_from([
+            "cargo-oxidate",
+            "--suggest-fix",
+            "--min-age-days",
+            "7",
+            "--include-prerelease",
+        ]);
+        assert!(result.is_ok());
+    }
 }
