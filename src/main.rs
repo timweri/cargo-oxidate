@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 mod api;
 mod cache;
+mod lockfile;
+mod policy;
 mod report;
 mod suggest;
 
@@ -41,7 +43,7 @@ struct Cli {
     timeout: u64,
 
     /// For "too new" violations, suggest cargo update commands to downgrade to compliant versions
-    #[arg(long)]
+    #[arg(long, requires = "min_age_days")]
     suggest_fix: bool,
 
     /// Path to the response cache file (enables caching)
@@ -51,31 +53,6 @@ struct Cli {
     /// Maximum age in hours for cached all-versions responses
     #[arg(long, default_value_t = 24)]
     cache_max_age_hours: u64,
-}
-
-struct Package {
-    name: String,
-    version: String,
-}
-
-fn parse_lockfile(path: &Path) -> Result<Vec<Package>> {
-    let lockfile = cargo_lock::Lockfile::load(path)
-        .context(format!("Could not load lockfile at {}", path.display()))?;
-
-    let packages = lockfile
-        .packages
-        .into_iter()
-        .filter(|p| {
-            // Only check packages from crates.io registry
-            p.source.as_ref().is_some_and(|s| s.is_default_registry())
-        })
-        .map(|p| Package {
-            name: p.name.as_str().to_string(),
-            version: p.version.to_string(),
-        })
-        .collect();
-
-    Ok(packages)
 }
 
 fn main() -> ExitCode {
@@ -106,122 +83,40 @@ fn main() -> ExitCode {
 /// Logs a warning to stderr when the fetch errors out.
 fn check_package(
     client: &mut api::CratesIoClient,
-    pkg: &Package,
-    min_age_days: Option<u64>,
-    max_age_days: Option<u64>,
-    exclude_missing: bool,
+    freshness_policy: &policy::FreshnessPolicy,
+    pkg: &lockfile::Package,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Vec<report::Violation> {
-    let mut violations = Vec::new();
-    let result = client.fetch_publish_date_with_retry(&pkg.name, &pkg.version);
+    let result = client.fetch_publish_date(&pkg.name, &pkg.version);
 
-    match result {
-        Ok(Some(published)) => {
-            let age_days = (chrono::Utc::now() - published).num_days();
-
-            if let Some(min) = min_age_days
-                && age_days < min as i64
-            {
-                violations.push(report::Violation {
-                    package: pkg.name.clone(),
-                    version: pkg.version.clone(),
-                    kind: report::ViolationKind::TooNew,
-                    age_days,
-                    published: Some(published),
-                });
-            }
-
-            if let Some(max) = max_age_days
-                && age_days > max as i64
-            {
-                violations.push(report::Violation {
-                    package: pkg.name.clone(),
-                    version: pkg.version.clone(),
-                    kind: report::ViolationKind::TooOld,
-                    age_days,
-                    published: Some(published),
-                });
-            }
-        }
-        Ok(None) | Err(_) => {
-            if let Err(ref e) = result {
-                let severity = match e {
-                    api::FetchError::Retryable(_) => "transient",
-                    api::FetchError::Permanent(_) => "permanent",
-                };
-                eprintln!(
-                    "\n  Warning: {severity} error checking {}@{}: {e}",
-                    pkg.name, pkg.version
-                );
-            }
-            if !exclude_missing {
-                violations.push(report::Violation {
-                    package: pkg.name.clone(),
-                    version: pkg.version.clone(),
-                    kind: report::ViolationKind::Unknown,
-                    age_days: 0,
-                    published: None,
-                });
-            }
-        }
+    if let Err(ref e) = result {
+        let severity = match e {
+            api::FetchError::Retryable(_) => "transient",
+            api::FetchError::Permanent(_) => "permanent",
+        };
+        eprintln!(
+            "\n  Warning: {severity} error checking {}@{}: {e}",
+            pkg.name, pkg.version
+        );
     }
 
-    violations
+    freshness_policy.evaluate(pkg, result.ok().flatten(), now)
 }
 
 fn run(cli: Cli) -> Result<bool> {
-    // Validate that at least one threshold is set
-    if cli.min_age_days.is_none() && cli.max_age_days.is_none() {
-        anyhow::bail!("At least one of --min-age-days or --max-age-days must be specified");
-    }
+    let freshness_policy = policy::FreshnessPolicy::new(
+        cli.min_age_days,
+        cli.max_age_days,
+        cli.exclude_missing,
+        cli.exempt,
+    )?;
 
-    // Validate that --suggest-fix requires --min-age-days
-    if cli.suggest_fix && cli.min_age_days.is_none() {
-        anyhow::bail!("--suggest-fix requires --min-age-days to be specified");
-    }
+    let suggest_min_age = cli.suggest_fix.then_some(cli.min_age_days).flatten();
 
-    // Validate cargo-lock path
-    let cargo_lock_path = {
-        let path = &cli.cargo_lock;
-
-        // Resolve the path to catch traversal
-        let resolved = if path.is_absolute() {
-            path.clone()
-        } else {
-            std::env::current_dir()
-                .context("Failed to get current directory")?
-                .join(path)
-        };
-
-        // Canonicalize to resolve symlinks and ".." components
-        // (file must exist for canonicalize to succeed)
-        let canonical = resolved.canonicalize().context(format!(
-            "Cargo.lock path does not exist or is not accessible: {}",
-            path.display()
-        ))?;
-
-        // Ensure it's a regular file
-        if !canonical.is_file() {
-            anyhow::bail!("Cargo.lock path is not a regular file: {}", path.display());
-        }
-
-        // Ensure the resolved path is within the current working directory
-        let cwd = std::env::current_dir()
-            .context("Failed to get current directory")?
-            .canonicalize()
-            .context("Failed to canonicalize current directory")?;
-
-        if !canonical.starts_with(&cwd) {
-            anyhow::bail!(
-                "Cargo.lock path escapes the working directory: {}",
-                path.display()
-            );
-        }
-
-        canonical
-    };
+    let working_dir = std::env::current_dir().context("Failed to get current directory")?;
 
     // Parse lockfile
-    let packages = parse_lockfile(&cargo_lock_path).context("Failed to parse Cargo.lock")?;
+    let packages = lockfile::load(&cli.cargo_lock, &working_dir)?;
 
     // Build API client
     let mut client = api::CratesIoClient::new(
@@ -232,11 +127,11 @@ fn run(cli: Cli) -> Result<bool> {
 
     // Check each package
     let mut violations = Vec::new();
-    let exempt_set: std::collections::HashSet<&str> = cli.exempt.iter().map(|s| s.trim()).collect();
+    let now = chrono::Utc::now();
 
     let total = packages.len();
     for (i, pkg) in packages.iter().enumerate() {
-        if exempt_set.contains(pkg.name.as_str()) {
+        if freshness_policy.is_exempt(&pkg.name) {
             continue;
         }
 
@@ -248,70 +143,39 @@ fn run(cli: Cli) -> Result<bool> {
             pkg.version
         );
 
-        violations.extend(check_package(
-            &mut client,
-            pkg,
-            cli.min_age_days,
-            cli.max_age_days,
-            cli.exclude_missing,
-        ));
-
-        client.rate_limit();
+        violations.extend(check_package(&mut client, &freshness_policy, pkg, now));
     }
 
     // Print report
     report::print_report(&violations);
 
     // Generate suggestions if requested
-    if cli.suggest_fix {
-        // Safe to unwrap: validated at start of run()
-        let min_age = cli.min_age_days.unwrap();
-        let mut suggestions = Vec::new();
-        let too_new_violations: Vec<_> = violations
-            .iter()
-            .filter(|v| matches!(v.kind, report::ViolationKind::TooNew))
-            .collect();
-
-        if !too_new_violations.is_empty() {
-            eprintln!("\nFetching version suggestions...");
-            for (i, violation) in too_new_violations.iter().enumerate() {
-                eprintln!(
-                    "  [{}/{}] {}",
-                    i + 1,
-                    too_new_violations.len(),
-                    violation.package
-                );
-
-                let result = client.fetch_all_versions_with_retry(&violation.package);
-
-                match result {
-                    Ok(versions) => {
-                        if let Some((suggested_version, age_days)) =
-                            suggest::find_compliant_version(&versions, min_age)
-                        {
-                            suggestions.push(suggest::Suggestion {
-                                package: violation.package.clone(),
-                                suggested_version,
-                                suggested_age_days: age_days,
-                            });
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "\n  Warning: failed to fetch versions for {}: {e}",
-                            violation.package
-                        );
-                    }
-                }
-
-                client.rate_limit();
-            }
-
-            report::print_suggestions(&suggestions);
-        }
+    if let Some(min_age) = suggest_min_age
+        && let Some(suggestions) =
+            suggest::generate_suggestions(&mut client, &violations, min_age, now)
+    {
+        report::print_suggestions(&suggestions);
     }
 
-    client.save_cache();
+    client.finish();
 
     Ok(!violations.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suggest_fix_without_min_age_days_fails_to_parse() {
+        let result =
+            Cli::try_parse_from(["cargo-oxidate", "--suggest-fix", "--max-age-days", "30"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn suggest_fix_with_min_age_days_parses() {
+        let result = Cli::try_parse_from(["cargo-oxidate", "--suggest-fix", "--min-age-days", "7"]);
+        assert!(result.is_ok());
+    }
 }
