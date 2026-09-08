@@ -233,10 +233,12 @@ fn gather_constraints<T: Transport>(
         // unparseable requirement is annotated instead of silently dropped.
         let matched;
         let unreadable;
+        let mut has_unverified_leftover = false;
         if dependent.is_registry {
             let result = registry_dependent_constraints(client, dependent, name, locked_version);
             matched = result.matched;
             unreadable = result.unreadable;
+            has_unverified_leftover = result.has_unverified_leftover;
             constraints.extend(result.constraints);
         } else {
             let mut manifest_matched = false;
@@ -261,7 +263,7 @@ fn gather_constraints<T: Transport>(
             matched = manifest_matched;
             unreadable = false;
         }
-        if !matched || unreadable {
+        if !matched || unreadable || has_unverified_leftover {
             unverified_dependents.push(dependent.name.clone());
         }
     }
@@ -274,11 +276,27 @@ fn gather_constraints<T: Transport>(
 
 /// Requirements a registry dependent's crates.io index record places on
 /// `name` at `locked_version`. `unreadable` is set on a fetch failure, a
-/// missing index record, or an unparseable requirement.
+/// missing index record, or an unparseable requirement. `has_unverified_leftover`
+/// is set when a matching declaration exists whose applicability couldn't be
+/// settled even though other, mandatory declarations were enforced.
 struct RegistryConstraints {
     constraints: Vec<Constraint>,
     matched: bool,
     unreadable: bool,
+    has_unverified_leftover: bool,
+}
+
+impl RegistryConstraints {
+    /// The index record for the dependent (or the matching version within
+    /// it) couldn't be read at all, so nothing can be enforced.
+    fn unreadable() -> Self {
+        RegistryConstraints {
+            constraints: Vec::new(),
+            matched: false,
+            unreadable: true,
+            has_unverified_leftover: false,
+        }
+    }
 }
 
 fn registry_dependent_constraints<T: Transport>(
@@ -287,26 +305,19 @@ fn registry_dependent_constraints<T: Transport>(
     name: &str,
     locked_version: &str,
 ) -> RegistryConstraints {
-    let mut constraints = Vec::new();
     let mut matched = false;
 
     let Ok(records) = client.fetch_index_record(&dependent.name) else {
-        return RegistryConstraints {
-            constraints,
-            matched,
-            unreadable: true,
-        };
+        return RegistryConstraints::unreadable();
     };
     let Some(record) = records.iter().find(|r| r.vers == dependent.version) else {
-        return RegistryConstraints {
-            constraints,
-            matched,
-            unreadable: true,
-        };
+        return RegistryConstraints::unreadable();
     };
 
     let mut unreadable = false;
-    let mut matching_reqs = Vec::new();
+    // Every matching declaration, alongside whether it alone guarantees the
+    // requirement is active: unconditional (no `target`) and non-optional.
+    let mut matching_reqs: Vec<(VersionReq, bool)> = Vec::new();
     for dep in &record.deps {
         if dep.kind.as_deref() == Some("dev") {
             continue;
@@ -317,7 +328,8 @@ fn registry_dependent_constraints<T: Transport>(
         }
         match VersionReq::parse(&dep.req) {
             Ok(req) if Version::parse(locked_version).is_ok_and(|v| req.matches(&v)) => {
-                matching_reqs.push(req);
+                let mandatory = dep.target.is_none() && dep.optional != Some(true);
+                matching_reqs.push((req, mandatory));
             }
             Ok(_) => {}
             Err(_) => unreadable = true,
@@ -327,24 +339,44 @@ fn registry_dependent_constraints<T: Transport>(
     // Duplicate declarations of the *same* requirement aren't ambiguous —
     // the index lists one entry per target, so a requirement repeated
     // across, say, `cfg(unix)` and `cfg(windows)` tables is still a single
-    // requirement, not competing candidates. Only distinct requirements
-    // signal genuine ambiguity. (Not necessarily adjacent, so a plain
-    // `dedup()` wouldn't catch every repeat.)
-    let mut distinct_reqs: Vec<VersionReq> = Vec::new();
-    for req in matching_reqs {
-        if !distinct_reqs.contains(&req) {
-            distinct_reqs.push(req);
+    // requirement, not competing candidates. (Not necessarily adjacent, so a
+    // plain `dedup()` wouldn't catch every repeat.) A requirement is
+    // mandatory if any declaration producing it is unconditional and
+    // non-optional — such a declaration guarantees the requirement is
+    // active no matter what else matches.
+    let mut distinct: Vec<(VersionReq, bool)> = Vec::new();
+    for (req, mandatory) in matching_reqs {
+        match distinct.iter_mut().find(|(r, _)| *r == req) {
+            Some((_, m)) => *m = *m || mandatory,
+            None => distinct.push((req, mandatory)),
         }
     }
-    let matching_reqs = distinct_reqs;
+    let (mandatory_reqs, uncertain_reqs): (Vec<_>, Vec<_>) =
+        distinct.into_iter().partition(|(_, mandatory)| *mandatory);
 
-    // A single matching declaration is the unique explanation for this
-    // lockfile edge and is enforced as a definite blocker, optional or not.
-    // Several distinct matching declarations (e.g. a normal requirement and
-    // a disabled optional/renamed one both matching the locked version) mean
-    // which one is actually activated can't be established, so none of them
-    // are enforced — the dependent is reported unverified instead.
-    if let [req] = matching_reqs.as_slice() {
+    let mut constraints = Vec::new();
+    let mut has_unverified_leftover = false;
+
+    if !mandatory_reqs.is_empty() {
+        // Every known-mandatory requirement is always active, so all of
+        // them are enforced regardless of how many other, uncertain
+        // declarations also match.
+        matched = true;
+        for (req, _) in mandatory_reqs {
+            constraints.push(Constraint {
+                blocker_name: dependent.name.clone(),
+                blocker_version: Some(dependent.version.clone()),
+                req,
+            });
+        }
+        // A leftover uncertain declaration can't be resolved either way, so
+        // the dependent is still worth flagging even though the mandatory
+        // requirements above are enforced as definite blockers.
+        has_unverified_leftover = !uncertain_reqs.is_empty();
+    } else if let [(req, _)] = uncertain_reqs.as_slice() {
+        // With no mandatory declaration to settle it, a single uncertain
+        // declaration is the unique explanation for this lockfile edge and
+        // is enforced as a definite blocker.
         matched = true;
         constraints.push(Constraint {
             blocker_name: dependent.name.clone(),
@@ -352,11 +384,15 @@ fn registry_dependent_constraints<T: Transport>(
             req: req.clone(),
         });
     }
+    // Otherwise: no matching declaration, or several distinct uncertain
+    // ones with no mandatory declaration to settle it — neither can be
+    // enforced, so the dependent is reported unverified instead.
 
     RegistryConstraints {
         constraints,
         matched,
         unreadable,
+        has_unverified_leftover,
     }
 }
 
@@ -1320,6 +1356,105 @@ mod tests {
                     assert_eq!(blocker.req, "^1.5");
                 }
                 _ => panic!("expected serde to be Blocked by app's unique optional declaration"),
+            }
+        }
+
+        #[test]
+        fn mandatory_requirements_from_different_kinds_both_block() {
+            // "app" declares an unconditional, nonoptional normal
+            // requirement of `^1.5` and an unconditional, nonoptional build
+            // requirement of `^1` on serde. Both are always active, so both
+            // are enforced — the more restrictive one (`^1.5`) rejects the
+            // downgrade to 1.4.0.
+            let transport = FakeTransport::default();
+            transport.ok(
+                "serde",
+                &versions_body(&[("1.5.0", 5, false), ("1.4.0", 50, false)], now()),
+            );
+            transport.index_ok(
+                "app",
+                r#"{"vers":"1.0.0","deps":[{"name":"serde","req":"^1.5"},{"name":"serde","req":"^1","kind":"build"}]}"#,
+            );
+            let mut client = fast_client(transport);
+
+            let violations = vec![too_new("serde", "1.5.0")];
+            let packages = vec![
+                pkg("serde", "1.5.0", &[]),
+                pkg("app", "1.0.0", &[("serde", "1.5.0")]),
+            ];
+            let outcomes = generate_suggestions(
+                &mut client,
+                &violations,
+                &packages,
+                &[],
+                Path::new("/work"),
+                30,
+                false,
+                now(),
+            )
+            .unwrap();
+
+            match &outcomes[0] {
+                Outcome::Blocked {
+                    newest_compliant,
+                    blocker,
+                    ..
+                } => {
+                    assert_eq!(newest_compliant, "1.4.0");
+                    assert_eq!(blocker.name, "app");
+                    assert_eq!(blocker.req, "^1.5");
+                }
+                _ => panic!("expected serde to be Blocked by app's mandatory requirement"),
+            }
+        }
+
+        #[test]
+        fn mandatory_requirement_still_blocks_alongside_uncertain_declaration() {
+            // "app" declares an unconditional, nonoptional normal
+            // requirement of `^1.5`, and a separate disabled, renamed
+            // optional declaration matching a looser `^1`. The mandatory
+            // requirement is enforced regardless of the uncertain one, even
+            // though the uncertain one alone would have permitted the
+            // downgrade.
+            let transport = FakeTransport::default();
+            transport.ok(
+                "serde",
+                &versions_body(&[("1.5.0", 5, false), ("1.4.0", 50, false)], now()),
+            );
+            transport.index_ok(
+                "app",
+                r#"{"vers":"1.0.0","deps":[{"name":"serde","req":"^1.5"},{"name":"serde_new","package":"serde","req":"^1","optional":true}]}"#,
+            );
+            let mut client = fast_client(transport);
+
+            let violations = vec![too_new("serde", "1.5.0")];
+            let packages = vec![
+                pkg("serde", "1.5.0", &[]),
+                pkg("app", "1.0.0", &[("serde", "1.5.0")]),
+            ];
+            let outcomes = generate_suggestions(
+                &mut client,
+                &violations,
+                &packages,
+                &[],
+                Path::new("/work"),
+                30,
+                false,
+                now(),
+            )
+            .unwrap();
+
+            match &outcomes[0] {
+                Outcome::Blocked {
+                    newest_compliant,
+                    blocker,
+                    ..
+                } => {
+                    assert_eq!(newest_compliant, "1.4.0");
+                    assert_eq!(blocker.name, "app");
+                    assert_eq!(blocker.req, "^1.5");
+                }
+                _ => panic!("expected serde to be Blocked by app's mandatory requirement"),
             }
         }
 
