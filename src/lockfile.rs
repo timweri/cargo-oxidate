@@ -13,10 +13,15 @@ pub fn resolve_path(path: &Path, working_dir: &Path) -> PathBuf {
 }
 
 /// A name/version pair identifying a package, used both for lockfile entries
-/// and for the dependency edges between them.
+/// and for the dependency edges between them. `source` is the package's (or
+/// dependency edge's) origin — crates.io, an alternate registry, git, or a
+/// local path — encoded as `cargo_lock::SourceId`'s canonical string, so
+/// same-name/same-version packages from different origins aren't confused
+/// for one another.
 pub struct PackageRef {
     pub name: String,
     pub version: String,
+    pub source: Option<String>,
 }
 
 /// An entry from `Cargo.lock`. Includes path and git packages (not just
@@ -27,6 +32,7 @@ pub struct Package {
     pub name: String,
     pub version: String,
     pub is_registry: bool,
+    pub source: Option<String>,
     pub dependencies: Vec<PackageRef>,
 }
 
@@ -82,12 +88,14 @@ pub fn load(path: &Path, working_dir: &Path) -> Result<Vec<Package>> {
             name: p.name.as_str().to_string(),
             version: p.version.to_string(),
             is_registry: p.source.as_ref().is_some_and(|s| s.is_default_registry()),
+            source: p.source.as_ref().map(|s| s.to_string()),
             dependencies: p
                 .dependencies
                 .iter()
                 .map(|d| PackageRef {
                     name: d.name.as_str().to_string(),
                     version: d.version.to_string(),
+                    source: d.source.as_ref().map(|s| s.to_string()),
                 })
                 .collect(),
         })
@@ -218,6 +226,43 @@ version = "{version}"
         assert_eq!(a.dependencies.len(), 1);
         assert_eq!(a.dependencies[0].name, "b");
         assert_eq!(a.dependencies[0].version, "2.0.0");
+    }
+
+    #[test]
+    fn registry_and_git_packages_carry_distinct_sources() {
+        let dir = tempdir().unwrap();
+        let contents = format!(
+            "{}{}",
+            registry_entry("serde", "1.0.0"),
+            git_entry("serde-fork", "1.0.0"),
+        );
+        write_lockfile(dir.path(), &contents);
+
+        let packages = load(Path::new("Cargo.lock"), dir.path()).unwrap();
+
+        let registry = packages.iter().find(|p| p.name == "serde").unwrap();
+        let git = packages.iter().find(|p| p.name == "serde-fork").unwrap();
+        assert!(registry.source.is_some());
+        assert!(git.source.is_some());
+        assert_ne!(registry.source, git.source);
+    }
+
+    #[test]
+    fn dependency_source_omitted_in_the_lockfile_still_resolves() {
+        // The dependency line ("b" with no version, no source) is the
+        // ordinary, unambiguous case: only one "b" package exists.
+        let dir = tempdir().unwrap();
+        let contents = format!(
+            "{}{}",
+            registry_entry_with_deps("a", "1.0.0", &["b"]),
+            registry_entry("b", "2.0.0"),
+        );
+        write_lockfile(dir.path(), &contents);
+
+        let packages = load(Path::new("Cargo.lock"), dir.path()).unwrap();
+        let a = packages.iter().find(|p| p.name == "a").unwrap();
+        let b = packages.iter().find(|p| p.name == "b").unwrap();
+        assert_eq!(a.dependencies[0].source, b.source);
     }
 
     #[test]
