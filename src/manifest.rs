@@ -2,17 +2,38 @@ use cargo_toml::{Dependency, DepsSet, Manifest};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+/// Which registry a manifest dependency declaration names. A manifest's
+/// `registry` (a Cargo config alias) or `registry-index` (a raw index URL)
+/// field identifies an alternate registry by a different representation
+/// than the source URL recorded against a lockfile package or dependency
+/// edge, and this crate has no access to Cargo's registry configuration to
+/// resolve the alias to a source. Recording that identity — without
+/// claiming it resolves to any particular lockfile source — is enough to
+/// keep it out of the crates.io suggestion flow, which only ever concerns
+/// itself with `CratesIo` requirements.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequirementSource {
+    /// No `registry` or `registry-index` on the declaration: an ordinary
+    /// crates.io dependency.
+    CratesIo,
+    /// An explicitly named alternate registry (alias or raw index URL). The
+    /// identity is kept for diagnostics; it is never matched against a
+    /// lockfile source string.
+    Registry(String),
+}
+
 /// One version requirement the user's own manifests place on a registry
 /// crate, together with the manifest that placed it (for warnings and
-/// diagnostics) and the name of the package that manifest declares —
-/// callers use this to scope a requirement to the lockfile dependent that
-/// actually placed it, rather than to every manifest in the workspace that
-/// happens to mention the same crate name.
+/// diagnostics), the name of the package that manifest declares — callers
+/// use this to scope a requirement to the lockfile dependent that actually
+/// placed it, rather than to every manifest in the workspace that happens to
+/// mention the same crate name — and which registry it was declared against.
 pub struct DirectRequirement {
     pub manifest: PathBuf,
     pub declaring_package: String,
     pub crate_name: String,
     pub req: semver::VersionReq,
+    pub source: RequirementSource,
 }
 
 /// Reads every version requirement the user's own manifests place on
@@ -197,6 +218,7 @@ fn collect_one(
     }
 
     let crate_name = dep.package().unwrap_or(key).to_string();
+    let source = requirement_source(dep);
 
     match dep.try_req() {
         Ok(req) => out.push(DirectRequirement {
@@ -204,11 +226,26 @@ fn collect_one(
             declaring_package: declaring_package.to_string(),
             crate_name,
             req: req.clone(),
+            source,
         }),
         Err(e) => warnings.push(format!(
             "Could not determine requirement for {crate_name} in {}: {e}",
             manifest_path.display()
         )),
+    }
+}
+
+/// The registry a dependency declaration names. `dep` has already passed
+/// through workspace inheritance by the time it reaches here (`from_path`
+/// resolves it), so a `{ workspace = true }` dependency backed by a
+/// workspace-level `registry` is read the same way as one declared directly.
+fn requirement_source(dep: &Dependency) -> RequirementSource {
+    match dep
+        .detail()
+        .and_then(|d| d.registry.clone().or_else(|| d.registry_index.clone()))
+    {
+        Some(registry) => RequirementSource::Registry(registry),
+        None => RequirementSource::CratesIo,
     }
 }
 
@@ -413,6 +450,97 @@ serde = "1.0"
         assert!(reqs.iter().any(|r| r.crate_name == "serde"));
         // The path dependency itself is skipped: it's not registry-versioned.
         assert!(!reqs.iter().any(|r| r.crate_name == "helper"));
+    }
+
+    #[test]
+    fn dependency_table_records_registry_identity() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            r#"
+[package]
+name = "root"
+version = "0.1.0"
+
+[dependencies]
+serde = "1.0"
+priv_serde = { package = "serde", version = "1.0", registry = "priv" }
+
+[dev-dependencies]
+rand = { version = "0.8", registry = "priv" }
+
+[build-dependencies]
+libc = { version = "0.2", registry = "priv" }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.2", registry = "priv" }
+"#,
+        );
+
+        let (reqs, warnings) = load_direct_requirements(dir.path());
+        assert!(warnings.is_empty());
+
+        let crates_io_serde = reqs
+            .iter()
+            .find(|r| r.crate_name == "serde" && r.source == RequirementSource::CratesIo)
+            .expect("plain serde dependency should resolve to crates.io");
+        assert_eq!(
+            crates_io_serde.req,
+            semver::VersionReq::parse("1.0").unwrap()
+        );
+
+        let priv_serde = reqs
+            .iter()
+            .find(|r| r.crate_name == "serde" && r.source != RequirementSource::CratesIo)
+            .expect("renamed serde dependency should record its alternate registry");
+        assert_eq!(
+            priv_serde.source,
+            RequirementSource::Registry("priv".to_string())
+        );
+
+        for name in ["rand", "libc", "nix"] {
+            assert_eq!(
+                find(&reqs, name).source,
+                RequirementSource::Registry("priv".to_string()),
+                "{name} should record its alternate registry"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_inherited_registry_metadata_is_preserved() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            r#"
+[workspace]
+members = ["member"]
+
+[workspace.dependencies]
+serde = { version = "1.0", registry = "priv" }
+"#,
+        );
+        write(
+            dir.path(),
+            "member/Cargo.toml",
+            r#"
+[package]
+name = "member"
+version = "0.1.0"
+
+[dependencies]
+serde = { workspace = true }
+"#,
+        );
+
+        let (reqs, warnings) = load_direct_requirements(dir.path());
+        assert!(warnings.is_empty());
+        assert_eq!(
+            find(&reqs, "serde").source,
+            RequirementSource::Registry("priv".to_string())
+        );
     }
 
     #[test]

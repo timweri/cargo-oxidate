@@ -1,6 +1,6 @@
 use crate::api::{CrateVersionInfo, CratesIoClient, Transport};
 use crate::lockfile::{Package, PackageRef};
-use crate::manifest::DirectRequirement;
+use crate::manifest::{DirectRequirement, RequirementSource};
 use crate::report::{Violation, ViolationKind};
 use chrono::{DateTime, Utc};
 use semver::{Version, VersionReq};
@@ -277,10 +277,17 @@ fn gather_constraints<T: Transport>(
             // Scoped to this dependent's own manifest, not every manifest in
             // the workspace that happens to mention the same crate name —
             // two members can lock the same crate name at different major
-            // versions, each with its own unrelated requirement.
+            // versions, each with its own unrelated requirement. Also scoped
+            // to crates.io declarations: this suggestion flow only ever
+            // targets a crates.io package (see the `is_registry` filter
+            // above `target_source` in `generate_suggestions`), so a
+            // declaration naming an explicit alternate registry can never be
+            // the one that placed this edge and must not be enforced here —
+            // nor must it count toward this dependent being verified.
             for req in direct_requirements
                 .iter()
                 .filter(|r| r.crate_name == name && r.declaring_package == dependent.name)
+                .filter(|r| r.source == RequirementSource::CratesIo)
                 .filter(|r| {
                     Version::parse(locked_version).is_ok_and(|version| r.req.matches(&version))
                 })
@@ -999,6 +1006,7 @@ mod tests {
                     declaring_package: "app".to_string(),
                     crate_name: "foo".to_string(),
                     req: VersionReq::parse(req).unwrap(),
+                    source: RequirementSource::CratesIo,
                 })
                 .collect();
             let index = build_dependents_index(&packages);
@@ -1909,12 +1917,14 @@ mod tests {
                     declaring_package: "member_a".to_string(),
                     crate_name: "clap".to_string(),
                     req: VersionReq::parse("^2").unwrap(),
+                    source: RequirementSource::CratesIo,
                 },
                 crate::manifest::DirectRequirement {
                     manifest: PathBuf::from("/work/member_b/Cargo.toml"),
                     declaring_package: "member_b".to_string(),
                     crate_name: "clap".to_string(),
                     req: VersionReq::parse("^3").unwrap(),
+                    source: RequirementSource::CratesIo,
                 },
             ];
             let packages = vec![
@@ -2296,6 +2306,330 @@ mod tests {
                 "expected the source-qualified spec to resolve without an ambiguous-specification error: {}",
                 String::from_utf8_lossy(&qualified.stderr)
             );
+        }
+    }
+
+    /// Covers a manifest crate name declared against two different
+    /// registries at once: an ordinary crates.io requirement and one
+    /// explicitly pinned to a renamed private registry. The renamed
+    /// declaration must never be treated as if it constrained the crates.io
+    /// package this flow actually suggests a downgrade for, nor may it
+    /// silently mark the declaring dependent as unverified when the
+    /// crates.io declaration alone already verifies it.
+    mod manifest_registry_identity_tests {
+        use super::*;
+        use crate::api::RetryPolicy;
+        use crate::api::test_support::{FakeTransport, ScriptedResponse, versions_url};
+        use crate::manifest::load_direct_requirements;
+        use crate::report::Aged;
+        use std::num::NonZeroU32;
+        use std::time::Duration;
+        use tempfile::tempdir;
+
+        const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+        const PRIVATE_SOURCE: &str = "registry+https://example.com/priv-index";
+
+        fn versions_body(entries: &[(&str, i64, bool)]) -> String {
+            let versions: Vec<String> = entries
+                .iter()
+                .map(|(num, days_ago, yanked)| {
+                    let created_at = now() - chrono::Duration::days(*days_ago);
+                    format!(
+                        r#"{{"num":"{num}","created_at":"{}","yanked":{yanked}}}"#,
+                        created_at.to_rfc3339()
+                    )
+                })
+                .collect();
+            format!(r#"{{"versions":[{}]}}"#, versions.join(","))
+        }
+
+        fn fast_client(transport: FakeTransport) -> CratesIoClient<FakeTransport> {
+            CratesIoClient::with_transport(
+                transport,
+                None,
+                24,
+                RetryPolicy {
+                    retry_count: NonZeroU32::new(1).unwrap(),
+                    retry_delay: Duration::from_millis(0),
+                    pacing_delay: Duration::from_millis(0),
+                },
+            )
+        }
+
+        fn too_new(package: &str, locked_version: &str) -> Violation {
+            Violation {
+                package: package.to_string(),
+                version: locked_version.to_string(),
+                kind: ViolationKind::TooNew(Aged {
+                    published: now(),
+                    age_days: 1,
+                }),
+            }
+        }
+
+        fn write_manifest(dir: &Path, contents: &str) {
+            std::fs::write(dir.join("Cargo.toml"), contents).unwrap();
+        }
+
+        /// A "foo" package locked at 1.9.0 on each of `CRATES_IO_SOURCE` and
+        /// `PRIVATE_SOURCE`, both depended on by workspace member "app" via
+        /// source-qualified lockfile dependency edges — the shape a real
+        /// lockfile resolves to when a same-name/same-version package exists
+        /// on more than one registry.
+        fn packages_with_dual_source_foo() -> Vec<Package> {
+            vec![
+                Package {
+                    name: "foo".to_string(),
+                    version: "1.9.0".to_string(),
+                    is_registry: true,
+                    source: Some(CRATES_IO_SOURCE.to_string()),
+                    dependencies: vec![],
+                },
+                Package {
+                    name: "foo".to_string(),
+                    version: "1.9.0".to_string(),
+                    is_registry: false,
+                    source: Some(PRIVATE_SOURCE.to_string()),
+                    dependencies: vec![],
+                },
+                Package {
+                    name: "app".to_string(),
+                    version: "0.1.0".to_string(),
+                    is_registry: false,
+                    source: None,
+                    dependencies: vec![
+                        PackageRef {
+                            name: "foo".to_string(),
+                            version: "1.9.0".to_string(),
+                            source: Some(CRATES_IO_SOURCE.to_string()),
+                        },
+                        PackageRef {
+                            name: "foo".to_string(),
+                            version: "1.9.0".to_string(),
+                            source: Some(PRIVATE_SOURCE.to_string()),
+                        },
+                    ],
+                },
+            ]
+        }
+
+        #[test]
+        fn crates_io_declaration_is_enforced_while_the_renamed_registry_declaration_is_excluded() {
+            // "app" depends on crates.io foo ^1.0 and a renamed
+            // private-registry foo pinned to =1.9.0; both resolve to foo
+            // 1.9.0 in the lockfile. Only the crates.io declaration should
+            // count toward foo's suggestion: it doesn't block 1.8.0, so foo
+            // should suggest it, and the =1.9.0 renamed declaration must not
+            // spuriously block a package it was never written for.
+            let dir = tempdir().unwrap();
+            write_manifest(
+                dir.path(),
+                r#"
+[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+foo = "^1.0"
+foo_priv = { package = "foo", version = "=1.9.0", registry = "priv" }
+"#,
+            );
+            let (direct_requirements, warnings) = load_direct_requirements(dir.path());
+            assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+
+            let transport = FakeTransport::default();
+            transport.push(
+                &versions_url("foo"),
+                ScriptedResponse::Http(
+                    200,
+                    versions_body(&[("1.9.0", 5, false), ("1.8.0", 50, false)]),
+                ),
+            );
+            let mut client = fast_client(transport);
+
+            let violations = vec![too_new("foo", "1.9.0")];
+            let packages = packages_with_dual_source_foo();
+            let outcomes = generate_suggestions(
+                &mut client,
+                &violations,
+                &packages,
+                &direct_requirements,
+                dir.path(),
+                30,
+                false,
+                now(),
+            )
+            .unwrap();
+
+            match &outcomes[0] {
+                Outcome::Suggest {
+                    package_spec,
+                    suggested_version,
+                    unverified_dependents,
+                    ..
+                } => {
+                    assert_eq!(suggested_version, "1.8.0");
+                    assert_eq!(package_spec, &format!("{CRATES_IO_SOURCE}#foo"));
+                    assert!(
+                        unverified_dependents.is_empty(),
+                        "app is verified by its crates.io ^1.0 declaration: {unverified_dependents:?}"
+                    );
+                }
+                Outcome::Blocked { blocker, .. } => panic!(
+                    "expected foo to be Suggest, but was Blocked by {} \
+                     (the renamed-registry declaration must have leaked in)",
+                    blocker.name
+                ),
+                _ => panic!("expected foo to be Suggest"),
+            }
+        }
+
+        #[test]
+        fn reverse_roles_still_block_via_the_crates_io_declaration() {
+            // Same fixture, roles swapped: crates.io foo is now pinned to
+            // =1.9.0 and the renamed private-registry foo carries the
+            // lenient ^1.0. The crates.io pin must still block the
+            // downgrade, reported as the blocker.
+            let dir = tempdir().unwrap();
+            write_manifest(
+                dir.path(),
+                r#"
+[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+foo = "=1.9.0"
+foo_priv = { package = "foo", version = "^1.0", registry = "priv" }
+"#,
+            );
+            let (direct_requirements, warnings) = load_direct_requirements(dir.path());
+            assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+
+            let transport = FakeTransport::default();
+            transport.push(
+                &versions_url("foo"),
+                ScriptedResponse::Http(
+                    200,
+                    versions_body(&[("1.9.0", 5, false), ("1.8.0", 50, false)]),
+                ),
+            );
+            let mut client = fast_client(transport);
+
+            let violations = vec![too_new("foo", "1.9.0")];
+            let packages = packages_with_dual_source_foo();
+            let outcomes = generate_suggestions(
+                &mut client,
+                &violations,
+                &packages,
+                &direct_requirements,
+                dir.path(),
+                30,
+                false,
+                now(),
+            )
+            .unwrap();
+
+            match &outcomes[0] {
+                Outcome::Blocked {
+                    newest_compliant,
+                    blocker,
+                    ..
+                } => {
+                    assert_eq!(newest_compliant, "1.8.0");
+                    assert_eq!(blocker.name, "Cargo.toml");
+                    assert_eq!(blocker.version, None);
+                    assert_eq!(blocker.req, "=1.9.0");
+                }
+                _ => panic!("expected foo to be Blocked by the crates.io declaration"),
+            }
+        }
+
+        #[test]
+        fn a_second_crates_io_declaration_for_the_same_identity_still_blocks() {
+            // Both declarations are ordinary crates.io dependencies — no
+            // registry collision at all — one lenient, one restrictive.
+            // Guards against the crates.io source filter collapsing
+            // enforcement down to a single matching declaration.
+            let dir = tempdir().unwrap();
+            write_manifest(
+                dir.path(),
+                r#"
+[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+foo = "^1.0"
+foo_pinned = { package = "foo", version = "=1.9.0" }
+"#,
+            );
+            let (direct_requirements, warnings) = load_direct_requirements(dir.path());
+            assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+            assert_eq!(direct_requirements.len(), 2);
+            assert!(
+                direct_requirements
+                    .iter()
+                    .all(|r| r.source == RequirementSource::CratesIo)
+            );
+
+            let transport = FakeTransport::default();
+            transport.push(
+                &versions_url("foo"),
+                ScriptedResponse::Http(
+                    200,
+                    versions_body(&[("1.9.0", 5, false), ("1.8.0", 50, false)]),
+                ),
+            );
+            let mut client = fast_client(transport);
+
+            let violations = vec![too_new("foo", "1.9.0")];
+            let packages = vec![
+                Package {
+                    name: "foo".to_string(),
+                    version: "1.9.0".to_string(),
+                    is_registry: true,
+                    source: Some(CRATES_IO_SOURCE.to_string()),
+                    dependencies: vec![],
+                },
+                Package {
+                    name: "app".to_string(),
+                    version: "0.1.0".to_string(),
+                    is_registry: false,
+                    source: None,
+                    dependencies: vec![PackageRef {
+                        name: "foo".to_string(),
+                        version: "1.9.0".to_string(),
+                        source: Some(CRATES_IO_SOURCE.to_string()),
+                    }],
+                },
+            ];
+            let outcomes = generate_suggestions(
+                &mut client,
+                &violations,
+                &packages,
+                &direct_requirements,
+                dir.path(),
+                30,
+                false,
+                now(),
+            )
+            .unwrap();
+
+            match &outcomes[0] {
+                Outcome::Blocked {
+                    newest_compliant,
+                    blocker,
+                    ..
+                } => {
+                    assert_eq!(newest_compliant, "1.8.0");
+                    assert_eq!(blocker.req, "=1.9.0");
+                }
+                _ => panic!(
+                    "expected foo to be Blocked by the restrictive =1.9.0 declaration \
+                     alongside the lenient ^1.0 one"
+                ),
+            }
         }
     }
 }
