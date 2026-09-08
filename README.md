@@ -36,12 +36,15 @@ At least one of `--min-age-days` or `--max-age-days` must be specified.
 
 ## `--suggest-fix`
 
-`--suggest-fix` finds the newest older version that satisfies every dependency requirement in
-your lockfile and workspace manifests. It prints a `cargo update` command Cargo accepts.
+`--suggest-fix` finds the newest older version that satisfies, on a best-effort basis, every
+dependency requirement it can verify from your lockfile and workspace manifests, and prints a
+`cargo update` command for it. Some requirements can't be verified (for example, an optional
+dependency behind a feature flag not enabled in your manifests) — such suggestions are annotated,
+and Cargo may still reject them.
 
-The tool does not build your project. Run your tests after applying a suggestion. If no version
-fits, it reports the requirement that prevents a downgrade. Apply suggestions in order, then run
-the command again.
+The tool does not build your project and does not guarantee Cargo will accept every suggested
+command. Run your tests after applying a suggestion. If no version fits, it reports the
+requirement that prevents a downgrade. Apply suggestions in order, then run the command again.
 
 ## Exit Codes
 

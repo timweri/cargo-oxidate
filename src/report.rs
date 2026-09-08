@@ -181,8 +181,10 @@ pub fn print_suggestions(outcomes: &[Outcome]) {
     if has_suggestion {
         println!(
             r#"
-  Suggestions satisfy every version requirement in Cargo.lock and your manifests.
-  Source compatibility is not verified: build after applying.
+  Suggestions satisfy, on a best-effort basis, the version requirements verified from
+  Cargo.lock and your manifests. Requirements marked "unverified" above were not checked
+  and Cargo may still reject that suggestion. Source compatibility is not verified: build
+  or test after applying.
 "#
         );
     }
