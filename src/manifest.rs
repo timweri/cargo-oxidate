@@ -10,16 +10,32 @@ use std::path::{Path, PathBuf};
 /// resolve the alias to a source. Recording that identity — without
 /// claiming it resolves to any particular lockfile source — is enough to
 /// keep it out of the crates.io suggestion flow, which only ever concerns
-/// itself with `CratesIo` requirements.
+/// itself with `CratesIo` requirements. Cargo reserves `crates-io` as the
+/// name of the default registry and also accepts its index URL directly, so
+/// both are recognized as `CratesIo` rather than an alternate registry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequirementSource {
-    /// No `registry` or `registry-index` on the declaration: an ordinary
+    /// No `registry`/`registry-index` on the declaration, or one explicitly
+    /// naming crates.io itself (`crates-io`, or its index URL): an ordinary
     /// crates.io dependency.
     CratesIo,
     /// An explicitly named alternate registry (alias or raw index URL). The
     /// identity is kept for diagnostics; it is never matched against a
     /// lockfile source string.
     Registry(String),
+}
+
+/// The identities Cargo treats as naming crates.io itself: the reserved
+/// `crates-io` registry alias, and crates.io's own git and sparse index
+/// URLs (either of which `registry-index` may name directly).
+const CRATES_IO_REGISTRY_NAME: &str = "crates-io";
+const CRATES_IO_GIT_INDEX: &str = "https://github.com/rust-lang/crates.io-index";
+const CRATES_IO_SPARSE_INDEX: &str = "sparse+https://index.crates.io/";
+
+fn is_crates_io_identity(registry: &str) -> bool {
+    registry == CRATES_IO_REGISTRY_NAME
+        || registry == CRATES_IO_GIT_INDEX
+        || registry == CRATES_IO_SPARSE_INDEX
 }
 
 /// One version requirement the user's own manifests place on a registry
@@ -244,6 +260,7 @@ fn requirement_source(dep: &Dependency) -> RequirementSource {
         .detail()
         .and_then(|d| d.registry.clone().or_else(|| d.registry_index.clone()))
     {
+        Some(registry) if is_crates_io_identity(&registry) => RequirementSource::CratesIo,
         Some(registry) => RequirementSource::Registry(registry),
         None => RequirementSource::CratesIo,
     }
@@ -541,6 +558,39 @@ serde = { workspace = true }
             find(&reqs, "serde").source,
             RequirementSource::Registry("priv".to_string())
         );
+    }
+
+    #[test]
+    fn explicit_crates_io_registry_identity_is_recognized() {
+        // `registry = "crates-io"` is Cargo's reserved name for the default
+        // registry, and a `registry-index` naming crates.io's own index URL
+        // directly is the same registry under its literal address. Neither
+        // is an alternate registry, so both must be `CratesIo`.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            r#"
+[package]
+name = "root"
+version = "0.1.0"
+
+[dependencies]
+by_name = { package = "serde", version = "1.0", registry = "crates-io" }
+by_git_index = { package = "rand", version = "0.8", registry-index = "https://github.com/rust-lang/crates.io-index" }
+by_sparse_index = { package = "libc", version = "0.2", registry-index = "sparse+https://index.crates.io/" }
+"#,
+        );
+
+        let (reqs, warnings) = load_direct_requirements(dir.path());
+        assert!(warnings.is_empty());
+        for name in ["serde", "rand", "libc"] {
+            assert_eq!(
+                find(&reqs, name).source,
+                RequirementSource::CratesIo,
+                "{name} should resolve to crates.io"
+            );
+        }
     }
 
     #[test]

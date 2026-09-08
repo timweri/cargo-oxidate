@@ -2546,6 +2546,72 @@ foo_priv = { package = "foo", version = "^1.0", registry = "priv" }
         }
 
         #[test]
+        fn explicit_crates_io_registry_name_still_blocks() {
+            // Same fixture as `reverse_roles_still_block_via_the_crates_io_declaration`,
+            // but the crates.io declaration names its registry explicitly
+            // via the reserved `crates-io` alias instead of omitting
+            // `registry` altogether. It must still be recognized as
+            // crates.io and enforced, not excluded as an unrecognized
+            // alternate registry.
+            let dir = tempdir().unwrap();
+            write_manifest(
+                dir.path(),
+                r#"
+[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+foo = { version = "=1.9.0", registry = "crates-io" }
+foo_priv = { package = "foo", version = "^1.0", registry = "priv" }
+"#,
+            );
+            let (direct_requirements, warnings) = load_direct_requirements(dir.path());
+            assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+
+            let transport = FakeTransport::default();
+            transport.push(
+                &versions_url("foo"),
+                ScriptedResponse::Http(
+                    200,
+                    versions_body(&[("1.9.0", 5, false), ("1.8.0", 50, false)]),
+                ),
+            );
+            let mut client = fast_client(transport);
+
+            let violations = vec![too_new("foo", "1.9.0")];
+            let packages = packages_with_dual_source_foo();
+            let outcomes = generate_suggestions(
+                &mut client,
+                &violations,
+                &packages,
+                &direct_requirements,
+                dir.path(),
+                30,
+                false,
+                now(),
+            )
+            .unwrap();
+
+            match &outcomes[0] {
+                Outcome::Blocked {
+                    newest_compliant,
+                    blocker,
+                    ..
+                } => {
+                    assert_eq!(newest_compliant, "1.8.0");
+                    assert_eq!(blocker.name, "Cargo.toml");
+                    assert_eq!(blocker.version, None);
+                    assert_eq!(blocker.req, "=1.9.0");
+                }
+                _ => panic!(
+                    "expected foo to be Blocked by the explicit crates-io declaration, \
+                     not excluded as an unrecognized alternate registry"
+                ),
+            }
+        }
+
+        #[test]
         fn a_second_crates_io_declaration_for_the_same_identity_still_blocks() {
             // Both declarations are ordinary crates.io dependencies — no
             // registry collision at all — one lenient, one restrictive.
