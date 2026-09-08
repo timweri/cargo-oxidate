@@ -154,8 +154,7 @@ pub fn print_suggestions(outcomes: &[Outcome]) {
                     };
                     let also_suggested = if blocker.also_suggested {
                         format!(
-                            " ({} also has a suggested downgrade above; apply it first and re-run)",
-                            blocker.name
+                            " ({source} also has a suggested downgrade above; applying it may unblock this, so re-run to check)"
                         )
                     } else {
                         String::new()

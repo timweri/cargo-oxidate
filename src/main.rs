@@ -47,11 +47,7 @@ struct Cli {
     #[arg(long, requires = "min_age_days")]
     suggest_fix: bool,
 
-    /// Consider prerelease versions as suggestion candidates (requires --suggest-fix). Under
-    /// semver, a requirement matches a prerelease only when it names the identical
-    /// major.minor.patch with a prerelease part of its own, so this flag usually changes nothing
-    /// unless a dependent already tracks that exact prerelease line or the locked version is
-    /// itself a prerelease — an empty result with the flag set is expected, not a bug.
+    /// Consider prerelease versions as suggestion candidates (requires --suggest-fix)
     #[arg(long, requires = "suggest_fix")]
     include_prerelease: bool,
 

@@ -21,8 +21,10 @@ pub struct Blocker {
     pub name: String,
     pub version: Option<String>,
     pub req: String,
-    /// Set when `name` is itself a package this run suggests downgrading —
-    /// applying that suggestion first may unblock this one.
+    /// Set when this blocker's own `name` and `version` is itself a package
+    /// this run suggests downgrading. That suggestion may unblock this one,
+    /// though nothing here checks whether the older version relaxes its
+    /// requirement.
     pub also_suggested: bool,
 }
 
@@ -183,33 +185,19 @@ fn gather_constraints<T: Transport>(
         .copied();
 
     for dependent in dependents {
+        // A dependent counts as verified only if every requirement it
+        // records on `name` parsed and at least one matches the locked
+        // version. A fetch failure, a missing index record, or an
+        // unparseable requirement is annotated instead of silently dropped.
+        let matched;
+        let unreadable;
         if dependent.is_registry {
-            match client.fetch_index_record(&dependent.name) {
-                Ok(records) => match records.iter().find(|r| r.vers == dependent.version) {
-                    Some(record) => {
-                        for dep in &record.deps {
-                            if dep.kind.as_deref() == Some("dev") {
-                                continue;
-                            }
-                            let real_name = dep.package.as_deref().unwrap_or(&dep.name);
-                            if real_name != name {
-                                continue;
-                            }
-                            match VersionReq::parse(&dep.req) {
-                                Ok(req) => constraints.push(Constraint {
-                                    blocker_name: dependent.name.clone(),
-                                    blocker_version: Some(dependent.version.clone()),
-                                    req,
-                                }),
-                                Err(_) => unverified_dependents.push(dependent.name.clone()),
-                            }
-                        }
-                    }
-                    None => unverified_dependents.push(dependent.name.clone()),
-                },
-                Err(_) => unverified_dependents.push(dependent.name.clone()),
-            }
+            let result = registry_dependent_constraints(client, dependent, name, locked_version);
+            matched = result.matched;
+            unreadable = result.unreadable;
+            constraints.extend(result.constraints);
         } else {
+            let mut manifest_matched = false;
             // Scoped to this dependent's own manifest, not every manifest in
             // the workspace that happens to mention the same crate name —
             // two members can lock the same crate name at different major
@@ -217,19 +205,91 @@ fn gather_constraints<T: Transport>(
             for req in direct_requirements
                 .iter()
                 .filter(|r| r.crate_name == name && r.declaring_package == dependent.name)
+                .filter(|r| {
+                    Version::parse(locked_version).is_ok_and(|version| r.req.matches(&version))
+                })
             {
+                manifest_matched = true;
                 constraints.push(Constraint {
                     blocker_name: manifest_label(&req.manifest, working_dir),
                     blocker_version: None,
                     req: req.req.clone(),
                 });
             }
+            matched = manifest_matched;
+            unreadable = false;
+        }
+        if !matched || unreadable {
+            unverified_dependents.push(dependent.name.clone());
         }
     }
 
     GatheredConstraints {
         constraints,
         unverified_dependents,
+    }
+}
+
+/// Requirements a registry dependent's crates.io index record places on
+/// `name` at `locked_version`. `unreadable` is set on a fetch failure, a
+/// missing index record, or an unparseable requirement.
+struct RegistryConstraints {
+    constraints: Vec<Constraint>,
+    matched: bool,
+    unreadable: bool,
+}
+
+fn registry_dependent_constraints<T: Transport>(
+    client: &mut CratesIoClient<T>,
+    dependent: &Package,
+    name: &str,
+    locked_version: &str,
+) -> RegistryConstraints {
+    let mut constraints = Vec::new();
+    let mut matched = false;
+
+    let Ok(records) = client.fetch_index_record(&dependent.name) else {
+        return RegistryConstraints {
+            constraints,
+            matched,
+            unreadable: true,
+        };
+    };
+    let Some(record) = records.iter().find(|r| r.vers == dependent.version) else {
+        return RegistryConstraints {
+            constraints,
+            matched,
+            unreadable: true,
+        };
+    };
+
+    let mut unreadable = false;
+    for dep in &record.deps {
+        if dep.kind.as_deref() == Some("dev") {
+            continue;
+        }
+        let real_name = dep.package.as_deref().unwrap_or(&dep.name);
+        if real_name != name {
+            continue;
+        }
+        match VersionReq::parse(&dep.req) {
+            Ok(req) if Version::parse(locked_version).is_ok_and(|v| req.matches(&v)) => {
+                matched = true;
+                constraints.push(Constraint {
+                    blocker_name: dependent.name.clone(),
+                    blocker_version: Some(dependent.version.clone()),
+                    req,
+                });
+            }
+            Ok(_) => {}
+            Err(_) => unreadable = true,
+        }
+    }
+
+    RegistryConstraints {
+        constraints,
+        matched,
+        unreadable,
     }
 }
 
@@ -315,7 +375,7 @@ pub fn generate_suggestions<T: Transport>(
                 locked_version: violation.version.clone(),
                 newest_compliant: newest_compliant.to_string(),
                 blocker: Blocker {
-                    // Whether `blocker_name` actually resolved to a
+                    // Whether this blocker's own locked version resolved to a
                     // suggestion is only known once every violation has been
                     // walked, so this starts false and is patched below.
                     also_suggested: false,
@@ -332,18 +392,25 @@ pub fn generate_suggestions<T: Transport>(
         outcomes.push(outcome);
     }
 
-    let suggested_names: HashSet<String> = outcomes
+    // Keyed by locked version as well as name. A suggestion for one locked
+    // version of a package says nothing about another version of it, which
+    // may have no compliant version at all.
+    let suggested: HashSet<(String, String)> = outcomes
         .iter()
         .filter_map(|o| match o {
-            Outcome::Suggest { package, .. } => Some(package.clone()),
+            Outcome::Suggest {
+                package,
+                locked_version,
+                ..
+            } => Some((package.clone(), locked_version.clone())),
             _ => None,
         })
         .collect();
     for outcome in &mut outcomes {
         if let Outcome::Blocked { blocker, .. } = outcome
-            && blocker.version.is_some()
+            && let Some(version) = &blocker.version
         {
-            blocker.also_suggested = suggested_names.contains(blocker.name.as_str());
+            blocker.also_suggested = suggested.contains(&(blocker.name.clone(), version.clone()));
         }
     }
 
@@ -615,6 +682,94 @@ mod tests {
             Package {
                 is_registry: false,
                 ..pkg(name, version, deps)
+            }
+        }
+
+        #[test]
+        fn aliased_registry_requirements_follow_the_locked_version() {
+            let transport = FakeTransport::default();
+            transport.index_ok("app", r#"{"vers":"1.0.0","deps":[{"name":"foo_old","package":"foo","req":"^1"},{"name":"foo_new","package":"foo","req":"^2"}]}"#);
+            let mut client = fast_client(transport);
+            let packages = vec![pkg("app", "1.0.0", &[("foo", "1.5.0"), ("foo", "2.5.0")])];
+            let index = build_dependents_index(&packages);
+            for (locked, candidate) in [("1.5.0", "1.4.0"), ("2.5.0", "2.4.0")] {
+                let gathered =
+                    gather_constraints(&mut client, &index, &[], Path::new("/work"), "foo", locked);
+                assert_eq!(gathered.constraints.len(), 1);
+                assert!(gathered.unverified_dependents.is_empty());
+                assert!(matches!(
+                    walk(
+                        vec![(Version::parse(candidate).unwrap(), 50)],
+                        gathered.constraints
+                    ),
+                    WalkResult::Suggest(_, _)
+                ));
+            }
+        }
+
+        #[test]
+        fn unmatched_registry_requirements_are_unverified() {
+            let transport = FakeTransport::default();
+            transport.index_ok(
+                "app",
+                r#"{"vers":"1.0.0","deps":[{"name":"foo","req":"^1.5"}]}"#,
+            );
+            let mut client = fast_client(transport);
+            let packages = vec![pkg("app", "1.0.0", &[("foo", "1.4.0")])];
+            let index = build_dependents_index(&packages);
+            let gathered =
+                gather_constraints(&mut client, &index, &[], Path::new("/work"), "foo", "1.4.0");
+            assert!(gathered.constraints.is_empty());
+            assert_eq!(gathered.unverified_dependents, ["app"]);
+        }
+
+        #[test]
+        fn missing_non_registry_requirements_are_unverified() {
+            let mut client = fast_client(FakeTransport::default());
+            let packages = vec![non_registry_pkg("git-app", "1.0.0", &[("foo", "1.5.0")])];
+            let index = build_dependents_index(&packages);
+            let gathered =
+                gather_constraints(&mut client, &index, &[], Path::new("/work"), "foo", "1.5.0");
+            assert!(gathered.constraints.is_empty());
+            assert_eq!(gathered.unverified_dependents, ["git-app"]);
+        }
+
+        #[test]
+        fn aliased_manifest_requirements_follow_the_locked_version() {
+            let mut client = fast_client(FakeTransport::default());
+            let packages = vec![non_registry_pkg(
+                "app",
+                "1.0.0",
+                &[("foo", "1.5.0"), ("foo", "2.5.0")],
+            )];
+            let requirements: Vec<_> = ["^1", "^2"]
+                .into_iter()
+                .map(|req| DirectRequirement {
+                    manifest: "/work/Cargo.toml".into(),
+                    declaring_package: "app".to_string(),
+                    crate_name: "foo".to_string(),
+                    req: VersionReq::parse(req).unwrap(),
+                })
+                .collect();
+            let index = build_dependents_index(&packages);
+            for (locked, candidate) in [("1.5.0", "1.4.0"), ("2.5.0", "2.4.0")] {
+                let gathered = gather_constraints(
+                    &mut client,
+                    &index,
+                    &requirements,
+                    Path::new("/work"),
+                    "foo",
+                    locked,
+                );
+                assert_eq!(gathered.constraints.len(), 1);
+                assert!(gathered.unverified_dependents.is_empty());
+                assert!(matches!(
+                    walk(
+                        vec![(Version::parse(candidate).unwrap(), 50)],
+                        gathered.constraints
+                    ),
+                    WalkResult::Suggest(_, _)
+                ));
             }
         }
 
@@ -923,6 +1078,74 @@ mod tests {
                 &outcomes[1],
                 Outcome::NoCompliantVersion { package, .. } if package == "y"
             ));
+        }
+
+        #[test]
+        fn also_suggested_is_false_when_only_another_version_of_the_blocker_is_suggested() {
+            // "foo" is locked at both 1.5.0 and 2.5.0. Only 1.5.0 resolves to
+            // a Suggest; the 2.5.0 that blocks "target" has no compliant
+            // version, so the blocked message must not point at the unrelated
+            // 1.5.0 downgrade.
+            let transport = FakeTransport::default();
+            transport.ok(
+                "target",
+                &versions_body(&[("1.5.0", 5, false), ("1.4.0", 50, false)], now()),
+            );
+            transport.ok(
+                "foo",
+                &versions_body(
+                    &[
+                        ("1.5.0", 5, false),
+                        ("1.4.0", 50, false),
+                        ("2.5.0", 5, false),
+                    ],
+                    now(),
+                ),
+            );
+            transport.index_ok(
+                "foo",
+                r#"{"vers":"2.5.0","deps":[{"name":"target","req":"^1.5"}]}"#,
+            );
+            let mut client = fast_client(transport);
+
+            let violations = vec![
+                too_new("target", "1.5.0"),
+                too_new("foo", "1.5.0"),
+                too_new("foo", "2.5.0"),
+            ];
+            let packages = vec![
+                pkg("target", "1.5.0", &[]),
+                pkg("foo", "1.5.0", &[]),
+                pkg("foo", "2.5.0", &[("target", "1.5.0")]),
+            ];
+            let outcomes = generate_suggestions(
+                &mut client,
+                &violations,
+                &packages,
+                &[],
+                Path::new("/work"),
+                30,
+                false,
+                now(),
+            )
+            .unwrap();
+
+            assert!(
+                matches!(&outcomes[1], Outcome::Suggest { package, locked_version, .. }
+                    if package == "foo" && locked_version == "1.5.0"),
+                "foo 1.5.0 should be suggested, otherwise the test proves nothing"
+            );
+            match &outcomes[0] {
+                Outcome::Blocked { blocker, .. } => {
+                    assert_eq!(blocker.name, "foo");
+                    assert_eq!(blocker.version.as_deref(), Some("2.5.0"));
+                    assert!(
+                        !blocker.also_suggested,
+                        "the suggestion is for foo 1.5.0, which does not unblock foo 2.5.0"
+                    );
+                }
+                _ => panic!("expected target to be Blocked"),
+            }
         }
 
         #[test]
