@@ -1202,15 +1202,16 @@ mod tests {
         fn restrictive_unrelated_local_requirement_does_not_block_the_external_dependents_target() {
             // The local "app" shares the git dependent's name and version,
             // but has no dependency edge of its own onto "foo" at all — its
-            // manifest requirement is unrelated noise. Even though it's
-            // restrictive, it must not block foo's downgrade for the git
+            // manifest requirement is unrelated noise. The requirement
+            // matches the locked version but would block candidate 1.4.0;
+            // even so, it must not block foo's downgrade for the git
             // dependent, whose own requirement can't be read at all.
             let mut client = fast_client(FakeTransport::default());
             let packages = vec![
                 external_pkg("app", "1.0.0", GIT_SOURCE, &[("foo", "1.5.0")]),
                 non_registry_pkg("app", "1.0.0", &[]),
             ];
-            let requirements = vec![local_requirement("app", "1.0.0", "foo", "^2")];
+            let requirements = vec![local_requirement("app", "1.0.0", "foo", "^1.5")];
             let index = build_dependents_index(&packages);
 
             let gathered = gather_constraints(
@@ -2942,6 +2943,7 @@ foo_pinned = { package = "foo", version = "=1.9.0" }
         const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
         const GIT_SOURCE: &str =
             "git+https://github.com/example/vendor#0000000000000000000000000000000000000000";
+        const ALT_REGISTRY_SOURCE: &str = "registry+https://example.com/priv-index";
 
         fn versions_body(entries: &[(&str, i64, bool)]) -> String {
             let versions: Vec<String> = entries
@@ -3172,8 +3174,9 @@ foo = "^1.0"
             // "app" is a real local dependent whose manifest permits the
             // downgrade; "vendor" is a git dependent that also locks foo at
             // the same version, but nothing here can read its requirement.
-            // The suggestion must reflect app's real (permissive)
-            // constraint while still flagging vendor as unverified.
+            // 1.8.0 is the newer, otherwise-preferred candidate, but app's
+            // manifest rejects it, so enforcement must fall back to 1.8.5
+            // while still flagging vendor as unverified.
             let dir = tempdir().unwrap();
             write_manifest(
                 dir.path(),
@@ -3184,7 +3187,7 @@ name = "app"
 version = "0.1.0"
 
 [dependencies]
-foo = "^1.0"
+foo = "^1.8.5"
 "#,
             );
             let (direct_requirements, warnings) = load_direct_requirements(dir.path());
@@ -3195,7 +3198,11 @@ foo = "^1.0"
                 &versions_url("foo"),
                 ScriptedResponse::Http(
                     200,
-                    versions_body(&[("1.9.0", 5, false), ("1.8.0", 50, false)]),
+                    versions_body(&[
+                        ("1.9.0", 5, false),
+                        ("1.8.0", 40, false),
+                        ("1.8.5", 50, false),
+                    ]),
                 ),
             );
             let mut client = fast_client(transport);
@@ -3250,10 +3257,182 @@ foo = "^1.0"
                     unverified_dependents,
                     ..
                 } => {
-                    assert_eq!(suggested_version, "1.8.0");
+                    assert_eq!(suggested_version, "1.8.5");
                     assert_eq!(unverified_dependents, &["vendor".to_string()]);
                 }
                 _ => panic!("expected foo to be Suggest, with vendor marked unverified"),
+            }
+        }
+
+        #[test]
+        fn git_dependent_sharing_a_local_packages_identity_is_not_verified_by_its_manifest() {
+            // A git "app" and the local "app" share name and version; the
+            // local manifest permits the downgrade but was never the git
+            // dependent's own, so it must not verify it.
+            let dir = tempdir().unwrap();
+            write_manifest(
+                dir.path(),
+                "Cargo.toml",
+                r#"
+[package]
+name = "app"
+version = "1.0.0"
+
+[dependencies]
+foo = "^1.0"
+"#,
+            );
+            let (direct_requirements, warnings) = load_direct_requirements(dir.path());
+            assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+
+            let transport = FakeTransport::default();
+            transport.push(
+                &versions_url("foo"),
+                ScriptedResponse::Http(
+                    200,
+                    versions_body(&[("1.9.0", 5, false), ("1.8.0", 50, false)]),
+                ),
+            );
+            let mut client = fast_client(transport);
+
+            let violations = vec![too_new("foo", "1.9.0")];
+            let packages = vec![
+                Package {
+                    name: "foo".to_string(),
+                    version: "1.9.0".to_string(),
+                    is_registry: true,
+                    source: Some(CRATES_IO_SOURCE.to_string()),
+                    dependencies: vec![],
+                },
+                Package {
+                    name: "app".to_string(),
+                    version: "1.0.0".to_string(),
+                    is_registry: false,
+                    source: Some(GIT_SOURCE.to_string()),
+                    dependencies: vec![PackageRef {
+                        name: "foo".to_string(),
+                        version: "1.9.0".to_string(),
+                        source: Some(CRATES_IO_SOURCE.to_string()),
+                    }],
+                },
+                Package {
+                    name: "app".to_string(),
+                    version: "1.0.0".to_string(),
+                    is_registry: false,
+                    source: None,
+                    dependencies: vec![],
+                },
+            ];
+            let outcomes = generate_suggestions(
+                &mut client,
+                &violations,
+                &packages,
+                &direct_requirements,
+                dir.path(),
+                30,
+                false,
+                now(),
+            )
+            .unwrap();
+
+            match &outcomes[0] {
+                Outcome::Suggest {
+                    suggested_version,
+                    unverified_dependents,
+                    ..
+                } => {
+                    assert_eq!(suggested_version, "1.8.0");
+                    assert_eq!(unverified_dependents, &["app".to_string()]);
+                }
+                _ => panic!("expected foo to be Suggest, with the git app marked unverified"),
+            }
+        }
+
+        #[test]
+        fn alternate_registry_dependent_sharing_a_local_packages_identity_is_not_verified_by_its_manifest()
+         {
+            // An alternate-registry "app" and the local "app" share name and
+            // version; the local manifest permits the downgrade but was
+            // never the alternate-registry dependent's own, so it must not
+            // verify it.
+            let dir = tempdir().unwrap();
+            write_manifest(
+                dir.path(),
+                "Cargo.toml",
+                r#"
+[package]
+name = "app"
+version = "1.0.0"
+
+[dependencies]
+foo = "^1.0"
+"#,
+            );
+            let (direct_requirements, warnings) = load_direct_requirements(dir.path());
+            assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+
+            let transport = FakeTransport::default();
+            transport.push(
+                &versions_url("foo"),
+                ScriptedResponse::Http(
+                    200,
+                    versions_body(&[("1.9.0", 5, false), ("1.8.0", 50, false)]),
+                ),
+            );
+            let mut client = fast_client(transport);
+
+            let violations = vec![too_new("foo", "1.9.0")];
+            let packages = vec![
+                Package {
+                    name: "foo".to_string(),
+                    version: "1.9.0".to_string(),
+                    is_registry: true,
+                    source: Some(CRATES_IO_SOURCE.to_string()),
+                    dependencies: vec![],
+                },
+                Package {
+                    name: "app".to_string(),
+                    version: "1.0.0".to_string(),
+                    is_registry: false,
+                    source: Some(ALT_REGISTRY_SOURCE.to_string()),
+                    dependencies: vec![PackageRef {
+                        name: "foo".to_string(),
+                        version: "1.9.0".to_string(),
+                        source: Some(CRATES_IO_SOURCE.to_string()),
+                    }],
+                },
+                Package {
+                    name: "app".to_string(),
+                    version: "1.0.0".to_string(),
+                    is_registry: false,
+                    source: None,
+                    dependencies: vec![],
+                },
+            ];
+            let outcomes = generate_suggestions(
+                &mut client,
+                &violations,
+                &packages,
+                &direct_requirements,
+                dir.path(),
+                30,
+                false,
+                now(),
+            )
+            .unwrap();
+
+            match &outcomes[0] {
+                Outcome::Suggest {
+                    suggested_version,
+                    unverified_dependents,
+                    ..
+                } => {
+                    assert_eq!(suggested_version, "1.8.0");
+                    assert_eq!(unverified_dependents, &["app".to_string()]);
+                }
+                _ => panic!(
+                    "expected foo to be Suggest, with the alternate-registry app marked unverified"
+                ),
             }
         }
     }
