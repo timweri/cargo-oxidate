@@ -70,7 +70,11 @@ pub struct DirectRequirement {
 /// not listed under `members` is still read. `dependencies`,
 /// `dev-dependencies`, `build-dependencies`, and each `[target.*]` table are
 /// all walked; path and git dependencies are skipped since they carry no
-/// registry version.
+/// registry version. A path dependency followed this way is a workspace
+/// member — and so has its `dev-dependencies` collected — exactly when the
+/// root manifest has a `[workspace]` table and the dependency's directory
+/// lies inside the workspace root, unless it matches `workspace.exclude`;
+/// matching Cargo's own behavior.
 ///
 /// Neither a missing manifest nor one that fails to parse aborts the run:
 /// each produces a warning in the second return value and is simply
@@ -90,38 +94,52 @@ pub fn load_direct_requirements(lockfile_dir: &Path) -> (Vec<DirectRequirement>,
     let mut seen = HashSet::new();
     seen.insert(canonical_or(&root_path));
 
-    let mut manifests = Vec::new();
+    // `bool` marks whether the manifest is a workspace member (root or a
+    // `workspace.members` entry) as opposed to a followed path dependency.
+    let mut manifests: Vec<(PathBuf, Manifest, bool)> = Vec::new();
+    let mut has_workspace = false;
+    let mut workspace_exclude: Vec<String> = Vec::new();
     match load_manifest(&root_path) {
         Ok(root) => {
             if let Some(ws) = &root.workspace {
+                has_workspace = true;
+                workspace_exclude = ws.exclude.clone();
                 for member_dir in expand_members(lockfile_dir, ws) {
                     if !seen.insert(canonical_or(&member_dir)) {
                         continue;
                     }
                     let member_path = member_dir.join("Cargo.toml");
                     match load_manifest(&member_path) {
-                        Ok(m) => manifests.push((member_path, m)),
+                        Ok(m) => manifests.push((member_path, m, true)),
                         Err(e) => warnings.push(e),
                     }
                 }
             }
-            manifests.push((root_path, root));
+            manifests.push((root_path, root, true));
         }
         Err(e) => warnings.push(e),
     }
 
     // Follow path dependencies one level further, so members not listed
-    // under `workspace.members` are still read.
+    // under `workspace.members` are still read. A followed dependency is
+    // itself a workspace member exactly when the root has a `[workspace]`
+    // table and its directory lies inside the workspace root, unless it
+    // matches `workspace.exclude` — matching Cargo's own behavior.
+    let canonical_root_dir = canonical_or(lockfile_dir);
     let mut followed = Vec::new();
-    for (path, manifest) in &manifests {
+    for (path, manifest, _) in &manifests {
         let base_dir = path.parent().unwrap_or(lockfile_dir);
         for dep_dir in path_dependency_dirs(base_dir, manifest) {
             if !seen.insert(canonical_or(&dep_dir)) {
                 continue;
             }
             let dep_path = dep_dir.join("Cargo.toml");
+            let canonical_dep_dir = canonical_or(&dep_dir);
+            let is_member = has_workspace
+                && canonical_dep_dir.starts_with(&canonical_root_dir)
+                && !is_excluded(&canonical_root_dir, &canonical_dep_dir, &workspace_exclude);
             match load_manifest(&dep_path) {
-                Ok(m) => followed.push((dep_path, m)),
+                Ok(m) => followed.push((dep_path, m, is_member)),
                 Err(e) => warnings.push(e),
             }
         }
@@ -129,8 +147,8 @@ pub fn load_direct_requirements(lockfile_dir: &Path) -> (Vec<DirectRequirement>,
     manifests.extend(followed);
 
     let mut requirements = Vec::new();
-    for (path, manifest) in &manifests {
-        collect_requirements(path, manifest, &mut requirements, &mut warnings);
+    for (path, manifest, is_member) in &manifests {
+        collect_requirements(path, manifest, *is_member, &mut requirements, &mut warnings);
     }
 
     (requirements, warnings)
@@ -180,7 +198,7 @@ fn is_excluded(root_dir: &Path, member_dir: &Path, exclude: &[String]) -> bool {
 /// dev, build, or target-specific dependency tables.
 fn path_dependency_dirs(base_dir: &Path, manifest: &Manifest) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    for deps in all_dep_sets(manifest) {
+    for deps in all_dep_sets(manifest, true) {
         for dep in deps.values() {
             if let Some(detail) = dep.detail()
                 && let Some(rel_path) = &detail.path
@@ -192,16 +210,17 @@ fn path_dependency_dirs(base_dir: &Path, manifest: &Manifest) -> Vec<PathBuf> {
     dirs
 }
 
-fn all_dep_sets(manifest: &Manifest) -> Vec<&DepsSet> {
-    let mut sets = vec![
-        &manifest.dependencies,
-        &manifest.dev_dependencies,
-        &manifest.build_dependencies,
-    ];
+fn all_dep_sets(manifest: &Manifest, include_dev: bool) -> Vec<&DepsSet> {
+    let mut sets = vec![&manifest.dependencies, &manifest.build_dependencies];
+    if include_dev {
+        sets.push(&manifest.dev_dependencies);
+    }
     for target in manifest.target.values() {
         sets.push(&target.dependencies);
-        sets.push(&target.dev_dependencies);
         sets.push(&target.build_dependencies);
+        if include_dev {
+            sets.push(&target.dev_dependencies);
+        }
     }
     sets
 }
@@ -209,6 +228,7 @@ fn all_dep_sets(manifest: &Manifest) -> Vec<&DepsSet> {
 fn collect_requirements(
     manifest_path: &Path,
     manifest: &Manifest,
+    include_dev: bool,
     out: &mut Vec<DirectRequirement>,
     warnings: &mut Vec<String>,
 ) {
@@ -226,7 +246,7 @@ fn collect_requirements(
     // by this point, so a resolvable version is already resolved here.
     let declaring_version = package.version.get().ok().map(|v| v.to_string());
 
-    for deps in all_dep_sets(manifest) {
+    for deps in all_dep_sets(manifest, include_dev) {
         for (key, dep) in deps {
             collect_one(
                 manifest_path,
@@ -574,6 +594,166 @@ serde = "1.0"
         assert!(reqs.iter().any(|r| r.crate_name == "serde"));
         // The path dependency itself is skipped: it's not registry-versioned.
         assert!(!reqs.iter().any(|r| r.crate_name == "helper"));
+    }
+
+    #[test]
+    fn followed_path_dependency_dev_dependencies_are_skipped() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            r#"
+[package]
+name = "root"
+version = "0.1.0"
+
+[dependencies]
+helper = { path = "helper" }
+
+[dev-dependencies]
+baz = "3"
+"#,
+        );
+        write(
+            dir.path(),
+            "helper/Cargo.toml",
+            r#"
+[package]
+name = "helper"
+version = "0.1.0"
+
+[dependencies]
+foo = "1"
+
+[dev-dependencies]
+bar = "2"
+"#,
+        );
+
+        let (reqs, warnings) = load_direct_requirements(dir.path());
+        assert!(warnings.is_empty());
+        // helper is not a workspace member, so Cargo ignores its
+        // dev-dependencies.
+        assert!(reqs.iter().any(|r| r.crate_name == "foo"));
+        assert!(!reqs.iter().any(|r| r.crate_name == "bar"));
+        // The root is a workspace member, so its dev-dependencies are
+        // still collected.
+        assert!(reqs.iter().any(|r| r.crate_name == "baz"));
+    }
+
+    #[test]
+    fn in_tree_path_dependency_of_workspace_is_a_member() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            r#"
+[workspace]
+members = []
+
+[package]
+name = "root"
+version = "0.1.0"
+
+[dependencies]
+helper = { path = "helper" }
+"#,
+        );
+        write(
+            dir.path(),
+            "helper/Cargo.toml",
+            r#"
+[package]
+name = "helper"
+version = "0.1.0"
+
+[dev-dependencies]
+foo = "=1.9.0"
+"#,
+        );
+
+        let (reqs, warnings) = load_direct_requirements(dir.path());
+        assert!(warnings.is_empty());
+        let foo = find(&reqs, "foo");
+        assert_eq!(foo.req, semver::VersionReq::parse("=1.9.0").unwrap());
+        assert_eq!(foo.declaring_package, "helper");
+    }
+
+    #[test]
+    fn excluded_in_tree_path_dependency_is_not_a_member() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            r#"
+[workspace]
+members = []
+exclude = ["helper"]
+
+[package]
+name = "root"
+version = "0.1.0"
+
+[dependencies]
+helper = { path = "helper" }
+"#,
+        );
+        write(
+            dir.path(),
+            "helper/Cargo.toml",
+            r#"
+[package]
+name = "helper"
+version = "0.1.0"
+
+[dependencies]
+bar = "1"
+
+[dev-dependencies]
+foo = "=1.9.0"
+"#,
+        );
+
+        let (reqs, warnings) = load_direct_requirements(dir.path());
+        assert!(warnings.is_empty());
+        assert!(!reqs.iter().any(|r| r.crate_name == "foo"));
+        assert!(reqs.iter().any(|r| r.crate_name == "bar"));
+    }
+
+    #[test]
+    fn out_of_tree_path_dependency_is_not_a_member() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "ws/Cargo.toml",
+            r#"
+[workspace]
+members = []
+
+[package]
+name = "root"
+version = "0.1.0"
+
+[dependencies]
+helper = { path = "../helper" }
+"#,
+        );
+        write(
+            dir.path(),
+            "helper/Cargo.toml",
+            r#"
+[package]
+name = "helper"
+version = "0.1.0"
+
+[dev-dependencies]
+foo = "=1.9.0"
+"#,
+        );
+
+        let (reqs, warnings) = load_direct_requirements(&dir.path().join("ws"));
+        assert!(warnings.is_empty());
+        assert!(!reqs.iter().any(|r| r.crate_name == "foo"));
     }
 
     #[test]

@@ -2925,6 +2925,112 @@ foo_pinned = { package = "foo", version = "=1.9.0" }
                 ),
             }
         }
+
+        /// "helper" is a path dependency of root "app", not a workspace
+        /// member. Cargo ignores the dev-dependencies of a non-member path
+        /// dependency, so helper's `[dev-dependencies] foo = "=1.9.0"` must
+        /// not block a downgrade that only helper's own `[dependencies] foo
+        /// = "1"` would allow.
+        #[test]
+        fn dev_dependency_of_a_non_member_path_dependency_does_not_block() {
+            let dir = tempdir().unwrap();
+            write_manifest(
+                dir.path(),
+                r#"
+[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+helper = { path = "helper" }
+"#,
+            );
+            std::fs::create_dir_all(dir.path().join("helper")).unwrap();
+            write_manifest(
+                &dir.path().join("helper"),
+                r#"
+[package]
+name = "helper"
+version = "0.1.0"
+
+[dependencies]
+foo = "1"
+
+[dev-dependencies]
+foo = "=1.9.0"
+"#,
+            );
+            let (direct_requirements, warnings) = load_direct_requirements(dir.path());
+            assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+
+            let transport = FakeTransport::default();
+            transport.push(
+                &versions_url("foo"),
+                ScriptedResponse::Http(
+                    200,
+                    versions_body(&[("1.9.0", 5, false), ("1.8.0", 50, false)]),
+                ),
+            );
+            let mut client = fast_client(transport);
+
+            let violations = vec![too_new("foo", "1.9.0")];
+            let packages = vec![
+                Package {
+                    name: "foo".to_string(),
+                    version: "1.9.0".to_string(),
+                    is_registry: true,
+                    source: Some(CRATES_IO_SOURCE.to_string()),
+                    dependencies: vec![],
+                },
+                Package {
+                    name: "helper".to_string(),
+                    version: "0.1.0".to_string(),
+                    is_registry: false,
+                    source: None,
+                    dependencies: vec![PackageRef {
+                        name: "foo".to_string(),
+                        version: "1.9.0".to_string(),
+                        source: Some(CRATES_IO_SOURCE.to_string()),
+                    }],
+                },
+                Package {
+                    name: "app".to_string(),
+                    version: "0.1.0".to_string(),
+                    is_registry: false,
+                    source: None,
+                    dependencies: vec![PackageRef {
+                        name: "helper".to_string(),
+                        version: "0.1.0".to_string(),
+                        source: None,
+                    }],
+                },
+            ];
+            let outcomes = generate_suggestions(
+                &mut client,
+                &violations,
+                &packages,
+                &direct_requirements,
+                dir.path(),
+                30,
+                false,
+                now(),
+            )
+            .unwrap();
+
+            match &outcomes[0] {
+                Outcome::Suggest {
+                    suggested_version, ..
+                } => {
+                    assert_eq!(suggested_version, "1.8.0");
+                }
+                Outcome::Blocked { blocker, .. } => panic!(
+                    "expected foo to be Suggest, but was Blocked by {} \
+                     (helper's dev-dependency must be ignored: it isn't a workspace member)",
+                    blocker.name
+                ),
+                _ => panic!("expected foo to be Suggest"),
+            }
+        }
     }
 
     /// Covers matching a real local dependent's manifest requirement against
