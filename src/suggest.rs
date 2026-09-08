@@ -34,6 +34,11 @@ pub struct Blocker {
 pub enum Outcome {
     Suggest {
         package: String,
+        /// The pkgid to print in the update command: the bare package name,
+        /// or `{source}#{package}` when another package in the lockfile
+        /// shares this name and locked version, so the abbreviated spec
+        /// would be ambiguous to Cargo.
+        package_spec: String,
         locked_version: String,
         suggested_version: String,
         suggested_age_days: i64,
@@ -411,6 +416,30 @@ fn manifest_label(path: &Path, working_dir: &Path) -> String {
         .to_string()
 }
 
+/// The pkgid to print in an update command for `name` at `version`:
+/// abbreviated to the bare name, unless another package in `all_packages`
+/// shares the name and version — a path or git package, say — in which case
+/// Cargo would reject the abbreviated spec as ambiguous. Qualifying with
+/// `target_source` (the source of the package the suggestion is actually
+/// for) disambiguates it, per Cargo's package ID specification grammar:
+/// `[<kind>+]<url>#<name>@<version>`.
+fn build_package_spec(
+    name: &str,
+    version: &str,
+    target_source: Option<&str>,
+    all_packages: &[Package],
+) -> String {
+    let is_ambiguous = all_packages
+        .iter()
+        .filter(|p| p.name == name && p.version == version)
+        .count()
+        > 1;
+    match (is_ambiguous, target_source) {
+        (true, Some(source)) => format!("{source}#{name}"),
+        _ => name.to_string(),
+    }
+}
+
 /// Generates one outcome for every "too new" violation. Returns `None` when
 /// there are no "too new" violations, so the caller prints nothing; returns
 /// `Some` (possibly empty) once the flow has run.
@@ -472,6 +501,13 @@ pub fn generate_suggestions<T: Transport>(
             })
             .and_then(|p| p.source.as_deref());
 
+        let package_spec = build_package_spec(
+            &violation.package,
+            &violation.version,
+            target_source,
+            all_packages,
+        );
+
         let gathered = gather_constraints(
             client,
             &dependents_index,
@@ -486,6 +522,7 @@ pub fn generate_suggestions<T: Transport>(
         let outcome = match walk(candidates, gathered.constraints) {
             WalkResult::Suggest(version, age_days) => Outcome::Suggest {
                 package: violation.package.clone(),
+                package_spec: package_spec.clone(),
                 locked_version: violation.version.clone(),
                 suggested_version: version.to_string(),
                 suggested_age_days: age_days,
@@ -1177,6 +1214,90 @@ mod tests {
                     _ => "other".to_string(),
                 }
             );
+        }
+
+        #[test]
+        fn source_collision_yields_a_source_qualified_package_spec() {
+            // Same fixture as above: a crates.io "serde" and a git "serde"
+            // both locked at 1.5.0. Cargo would reject the abbreviated
+            // `serde@1.5.0` spec as ambiguous, so the suggestion for the
+            // registry package must qualify it with the registry source.
+            let transport = FakeTransport::default();
+            transport.ok(
+                "serde",
+                &versions_body(&[("1.5.0", 5, false), ("1.4.0", 50, false)], now()),
+            );
+            let mut client = fast_client(transport);
+
+            let registry_source = "registry+https://github.com/rust-lang/crates.io-index";
+            let git_source =
+                "git+https://github.com/example/serde#0000000000000000000000000000000000000000";
+
+            let packages = vec![
+                Package {
+                    name: "serde".to_string(),
+                    version: "1.5.0".to_string(),
+                    is_registry: true,
+                    source: Some(registry_source.to_string()),
+                    dependencies: vec![],
+                },
+                Package {
+                    name: "serde".to_string(),
+                    version: "1.5.0".to_string(),
+                    is_registry: false,
+                    source: Some(git_source.to_string()),
+                    dependencies: vec![],
+                },
+            ];
+
+            let violations = vec![too_new("serde", "1.5.0")];
+            let outcomes = generate_suggestions(
+                &mut client,
+                &violations,
+                &packages,
+                &[],
+                Path::new("/work"),
+                30,
+                false,
+                now(),
+            )
+            .unwrap();
+
+            match &outcomes[0] {
+                Outcome::Suggest { package_spec, .. } => {
+                    assert_eq!(package_spec, &format!("{registry_source}#serde"));
+                }
+                _ => panic!("expected serde to be Suggest"),
+            }
+        }
+
+        #[test]
+        fn no_collision_keeps_the_abbreviated_package_spec() {
+            let transport = FakeTransport::default();
+            transport.ok(
+                "serde",
+                &versions_body(&[("1.5.0", 5, false), ("1.4.0", 50, false)], now()),
+            );
+            let mut client = fast_client(transport);
+
+            let violations = vec![too_new("serde", "1.5.0")];
+            let packages = vec![pkg("serde", "1.5.0", &[])];
+            let outcomes = generate_suggestions(
+                &mut client,
+                &violations,
+                &packages,
+                &[],
+                Path::new("/work"),
+                30,
+                false,
+                now(),
+            )
+            .unwrap();
+
+            match &outcomes[0] {
+                Outcome::Suggest { package_spec, .. } => assert_eq!(package_spec, "serde"),
+                _ => panic!("expected serde to be Suggest"),
+            }
         }
 
         #[test]
@@ -1971,6 +2092,181 @@ mod tests {
                 &outcomes[3],
                 Outcome::NoCompliantVersion { package, .. } if package == "delta"
             ));
+        }
+    }
+
+    /// Builds a real Cargo project with a source collision — a crates.io
+    /// package and a path package sharing a name and locked version — and
+    /// runs a real `cargo` against the spec `build_package_spec` produces,
+    /// to verify it's the source-qualified pkgid Cargo itself expects,
+    /// rather than merely a string this crate assumes is valid.
+    mod source_collision_cargo_tests {
+        use super::*;
+        use sha2::{Digest, Sha256};
+        use std::process::Command;
+
+        const CRATE_NAME: &str = "semver";
+        const CRATE_VERSION: &str = "1.0.28";
+
+        /// Writes a minimal crate (`Cargo.toml` + `src/lib.rs`) at `dir`.
+        fn write_crate_source(dir: &Path, name: &str, version: &str) {
+            std::fs::create_dir_all(dir.join("src")).unwrap();
+            std::fs::write(
+                dir.join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n"
+                ),
+            )
+            .unwrap();
+            std::fs::write(dir.join("src/lib.rs"), "").unwrap();
+        }
+
+        /// Packs `crate_dir` (already containing a `{name}-{version}`
+        /// top-level directory) into a `.crate` tarball, Cargo's own
+        /// publish format.
+        fn pack_crate_tarball(crate_dir: &Path, name: &str, version: &str) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            {
+                let encoder =
+                    flate2::write::GzEncoder::new(&mut bytes, flate2::Compression::default());
+                let mut builder = tar::Builder::new(encoder);
+                builder
+                    .append_dir_all(format!("{name}-{version}"), crate_dir)
+                    .unwrap();
+                builder.finish().unwrap();
+            }
+            bytes
+        }
+
+        /// Assembles a local-registry source (see Cargo's source-replacement
+        /// docs) at `registry_dir`, containing one crate. Local-registry
+        /// index entries are sharded by name length: a 4+ character name
+        /// shards under its first two, then next two, characters.
+        fn write_local_registry(registry_dir: &Path, name: &str, version: &str) {
+            let build_dir = registry_dir
+                .join(".build")
+                .join(format!("{name}-{version}"));
+            write_crate_source(&build_dir, name, version);
+            let tarball = pack_crate_tarball(&build_dir, name, version);
+
+            std::fs::write(
+                registry_dir.join(format!("{name}-{version}.crate")),
+                &tarball,
+            )
+            .unwrap();
+
+            let cksum = Sha256::digest(&tarball)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            let shard = registry_dir
+                .join("index")
+                .join(&name[0..2])
+                .join(&name[2..4]);
+            std::fs::create_dir_all(&shard).unwrap();
+            std::fs::write(
+                shard.join(name),
+                format!(
+                    r#"{{"name":"{name}","vers":"{version}","deps":[],"cksum":"{cksum}","features":{{}},"yanked":false}}"#
+                ),
+            )
+            .unwrap();
+        }
+
+        fn run_cargo(args: &[&str], cwd: &Path) -> std::process::Output {
+            Command::new("cargo")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("failed to run cargo")
+        }
+
+        #[test]
+        fn qualified_spec_resolves_where_the_abbreviated_spec_is_ambiguous() {
+            let root = tempfile::tempdir().unwrap();
+            let registry_dir = root.path().join("registry");
+            let workspace_dir = root.path().join("workspace");
+
+            write_local_registry(&registry_dir, CRATE_NAME, CRATE_VERSION);
+            write_crate_source(
+                &workspace_dir.join("vendor-semver"),
+                CRATE_NAME,
+                CRATE_VERSION,
+            );
+
+            std::fs::create_dir_all(workspace_dir.join(".cargo")).unwrap();
+            std::fs::write(
+                workspace_dir.join(".cargo/config.toml"),
+                format!(
+                    "[source.local-vendor]\nlocal-registry = \"{}\"\n\n[source.crates-io]\nreplace-with = \"local-vendor\"\n",
+                    registry_dir.display()
+                ),
+            )
+            .unwrap();
+            std::fs::create_dir_all(workspace_dir.join("src")).unwrap();
+            std::fs::write(workspace_dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+            std::fs::write(
+                workspace_dir.join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{CRATE_NAME} = \"{CRATE_VERSION}\"\n{CRATE_NAME}-path = {{ package = \"{CRATE_NAME}\", path = \"vendor-semver\" }}\n"
+                ),
+            )
+            .unwrap();
+
+            let lock = run_cargo(&["generate-lockfile", "--offline"], &workspace_dir);
+            assert!(
+                lock.status.success(),
+                "generate-lockfile failed: {}",
+                String::from_utf8_lossy(&lock.stderr)
+            );
+
+            let packages = crate::lockfile::load(Path::new("Cargo.lock"), &workspace_dir).unwrap();
+            let target_source = packages
+                .iter()
+                .find(|p| p.name == CRATE_NAME && p.is_registry)
+                .and_then(|p| p.source.as_deref());
+            let spec = build_package_spec(CRATE_NAME, CRATE_VERSION, target_source, &packages);
+            assert!(
+                spec.contains('#'),
+                "expected a source-qualified spec for a name/version collision, got {spec}"
+            );
+
+            // The abbreviated spec really is ambiguous in this fixture —
+            // otherwise the qualified spec above proves nothing.
+            let abbreviated = run_cargo(
+                &[
+                    "update",
+                    "--offline",
+                    "-p",
+                    &format!("{CRATE_NAME}@{CRATE_VERSION}"),
+                    "--precise",
+                    CRATE_VERSION,
+                ],
+                &workspace_dir,
+            );
+            assert!(
+                !abbreviated.status.success()
+                    && String::from_utf8_lossy(&abbreviated.stderr).contains("ambiguous"),
+                "expected the abbreviated spec to be ambiguous in this fixture: {}",
+                String::from_utf8_lossy(&abbreviated.stderr)
+            );
+
+            let qualified = run_cargo(
+                &[
+                    "update",
+                    "--offline",
+                    "-p",
+                    &format!("{spec}@{CRATE_VERSION}"),
+                    "--precise",
+                    CRATE_VERSION,
+                ],
+                &workspace_dir,
+            );
+            assert!(
+                qualified.status.success(),
+                "expected the source-qualified spec to resolve without an ambiguous-specification error: {}",
+                String::from_utf8_lossy(&qualified.stderr)
+            );
         }
     }
 }

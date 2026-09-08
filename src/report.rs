@@ -111,11 +111,12 @@ pub fn print_suggestions(outcomes: &[Outcome]) {
 
         for outcome in outcomes {
             if let Outcome::Suggest {
-                package,
+                package_spec,
                 locked_version,
                 suggested_version,
                 suggested_age_days,
                 unverified_dependents,
+                ..
             } = outcome
             {
                 let annotation = if unverified_dependents.is_empty() {
@@ -127,7 +128,7 @@ pub fn print_suggestions(outcomes: &[Outcome]) {
                     )
                 };
                 println!(
-                    "    cargo update -p {package}@{locked_version} --precise {suggested_version}    # {suggested_age_days} days old{annotation}"
+                    "    cargo update -p {package_spec}@{locked_version} --precise {suggested_version}    # {suggested_age_days} days old{annotation}"
                 );
             }
         }
