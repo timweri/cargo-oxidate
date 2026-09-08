@@ -99,11 +99,13 @@ fn filter_candidates(
             if !same_compatible_zone(locked, &parsed) {
                 return None;
             }
-            // `Version`'s `Ord` compares precedence per the semver spec:
-            // build metadata never affects it, so this also rejects a
-            // version differing from `locked` only in build metadata, and
-            // prereleases order below the release they precede.
-            if parsed >= *locked {
+            // `Version`'s `Ord` breaks precedence ties on build metadata,
+            // so a version differing from `locked` only in build metadata
+            // would otherwise slip past a plain `>=` comparison despite
+            // having equal semantic precedence. `cmp_precedence` follows
+            // the semver spec instead: it ignores build metadata, and
+            // orders prereleases below the release they precede.
+            if parsed.cmp_precedence(locked) != std::cmp::Ordering::Less {
                 return None;
             }
             let age_days = (now - v.created_at).num_days();
@@ -693,6 +695,19 @@ mod tests {
                 make_version("1.3.0+build.1", 100, false),
             ];
             let result = filter_candidates(&versions, &v("1.3.0"), 30, now(), false);
+            assert!(result.is_empty());
+        }
+
+        #[test]
+        fn excludes_versions_equal_in_precedence_to_a_locked_version_with_build_metadata() {
+            // Locked itself carries build metadata this time: candidates
+            // differing only in build metadata (or lacking it) still have
+            // equal semantic precedence and must not be offered.
+            let versions = vec![
+                make_version("1.3.0", 100, false),
+                make_version("1.3.0+build.1", 100, false),
+            ];
+            let result = filter_candidates(&versions, &v("1.3.0+build.2"), 30, now(), false);
             assert!(result.is_empty());
         }
 
