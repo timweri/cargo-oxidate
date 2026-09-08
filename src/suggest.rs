@@ -69,9 +69,10 @@ fn same_compatible_zone(a: &Version, b: &Version) -> bool {
 }
 
 /// Filters `versions` to non-yanked, at least `min_age_days` old as of
-/// `now`, within the caret-compatible zone of `locked`, sorted newest first
-/// by publish date. Prereleases are excluded unless `allow_prerelease` is
-/// set or `locked` is itself a prerelease.
+/// `now`, strictly older in semantic precedence than `locked`, within the
+/// caret-compatible zone of `locked`, sorted newest first by publish date.
+/// Prereleases are excluded unless `allow_prerelease` is set or `locked` is
+/// itself a prerelease.
 fn filter_candidates(
     versions: &[CrateVersionInfo],
     locked: &Version,
@@ -91,6 +92,13 @@ fn filter_candidates(
                 return None;
             }
             if !same_compatible_zone(locked, &parsed) {
+                return None;
+            }
+            // `Version`'s `Ord` compares precedence per the semver spec:
+            // build metadata never affects it, so this also rejects a
+            // version differing from `locked` only in build metadata, and
+            // prereleases order below the release they precede.
+            if parsed >= *locked {
                 return None;
             }
             let age_days = (now - v.created_at).num_days();
@@ -572,11 +580,11 @@ mod tests {
                 make_version("1.0.0", 100, false),
                 make_version("1.1.0", 50, true),   // yanked
                 make_version("1.2.0", 40, false),  // compliant, same major as locked
-                make_version("2.0.0", 200, false), // different major: out of range
+                make_version("0.9.0", 200, false), // different major: out of range
                 make_version("1.3.0", 5, false),   // too new (min age 30)
             ];
 
-            let result = filter_candidates(&versions, &v("1.0.0"), 30, now(), false);
+            let result = filter_candidates(&versions, &v("1.5.0"), 30, now(), false);
             let nums: Vec<String> = result.iter().map(|(ver, _)| ver.to_string()).collect();
             // Newest-first by publish date among the two survivors.
             assert_eq!(nums, vec!["1.2.0".to_string(), "1.0.0".to_string()]);
@@ -590,7 +598,7 @@ mod tests {
                 make_version("1.2.0", 50, false),
             ];
 
-            let result = filter_candidates(&versions, &v("1.0.0"), 30, now(), false);
+            let result = filter_candidates(&versions, &v("1.5.0"), 30, now(), false);
             let nums: Vec<String> = result.iter().map(|(ver, _)| ver.to_string()).collect();
             assert_eq!(nums, vec!["1.2.0", "1.0.0", "1.1.0"]);
         }
@@ -605,17 +613,58 @@ mod tests {
         #[test]
         fn prerelease_included_with_flag_when_range_matches() {
             // Same compatible zone (1.0.0), prerelease allowed by the flag.
-            let versions = vec![make_version("1.0.0-beta.2", 100, false)];
-            let result = filter_candidates(&versions, &v("1.0.0-beta.1"), 30, now(), true);
+            let versions = vec![make_version("1.0.0-beta.1", 100, false)];
+            let result = filter_candidates(&versions, &v("1.0.0-beta.2"), 30, now(), true);
             assert_eq!(result.len(), 1);
-            assert_eq!(result[0].0.to_string(), "1.0.0-beta.2");
+            assert_eq!(result[0].0.to_string(), "1.0.0-beta.1");
         }
 
         #[test]
         fn prerelease_allowed_when_locked_is_itself_a_prerelease() {
+            let versions = vec![make_version("1.0.0-beta.1", 100, false)];
+            let result = filter_candidates(&versions, &v("1.0.0-beta.2"), 30, now(), false);
+            assert_eq!(result.len(), 1);
+        }
+
+        #[test]
+        fn excludes_a_higher_version_published_earlier_than_locked() {
+            // "1.4.0" was published before "1.3.0" but is a higher semantic
+            // version, so it must never be offered as a downgrade even
+            // though it's older on the publish timeline.
+            let versions = vec![
+                make_version("1.4.0", 100, false),
+                make_version("1.3.0", 50, false),
+            ];
+            let result = filter_candidates(&versions, &v("1.3.0"), 30, now(), false);
+            let nums: Vec<String> = result.iter().map(|(ver, _)| ver.to_string()).collect();
+            assert!(nums.is_empty(), "expected no candidates, got {nums:?}");
+        }
+
+        #[test]
+        fn excludes_a_version_equal_in_precedence_including_build_metadata_only_differences() {
+            let versions = vec![
+                make_version("1.3.0", 100, false),
+                make_version("1.3.0+build.1", 100, false),
+            ];
+            let result = filter_candidates(&versions, &v("1.3.0"), 30, now(), false);
+            assert!(result.is_empty());
+        }
+
+        #[test]
+        fn excludes_stable_release_above_a_locked_prerelease() {
+            // A stable release outranks any prerelease of the same
+            // major.minor.patch, so it must not be offered as a "downgrade"
+            // from a locked prerelease.
+            let versions = vec![make_version("1.0.0", 100, false)];
+            let result = filter_candidates(&versions, &v("1.0.0-beta.1"), 30, now(), false);
+            assert!(result.is_empty());
+        }
+
+        #[test]
+        fn excludes_a_later_prerelease_above_a_locked_prerelease() {
             let versions = vec![make_version("1.0.0-beta.2", 100, false)];
             let result = filter_candidates(&versions, &v("1.0.0-beta.1"), 30, now(), false);
-            assert_eq!(result.len(), 1);
+            assert!(result.is_empty());
         }
     }
 
@@ -943,11 +992,14 @@ mod tests {
         fn a_failed_fetch_does_not_abort_the_others() {
             let transport = FakeTransport::default();
             transport.error("serde");
-            transport.ok("syn", &versions_body(&[("1.0.0", 50, false)], now()));
+            transport.ok(
+                "syn",
+                &versions_body(&[("1.0.0", 50, false), ("1.1.0", 5, false)], now()),
+            );
             let mut client = fast_client(transport);
 
-            let violations = vec![too_new("serde", "1.0.0"), too_new("syn", "1.0.0")];
-            let packages = vec![pkg("serde", "1.0.0", &[]), pkg("syn", "1.0.0", &[])];
+            let violations = vec![too_new("serde", "1.0.0"), too_new("syn", "1.1.0")];
+            let packages = vec![pkg("serde", "1.0.0", &[]), pkg("syn", "1.1.0", &[])];
             let outcomes = generate_suggestions(
                 &mut client,
                 &violations,
@@ -1207,17 +1259,20 @@ mod tests {
         #[test]
         fn dev_kind_edge_from_a_transitive_dependent_is_ignored() {
             let transport = FakeTransport::default();
-            transport.ok("serde", &versions_body(&[("1.4.0", 50, false)], now()));
+            transport.ok(
+                "serde",
+                &versions_body(&[("1.5.0", 5, false), ("1.4.0", 50, false)], now()),
+            );
             transport.index_ok(
                 "app",
                 r#"{"vers":"1.0.0","deps":[{"name":"serde","req":"^1.5","kind":"dev"}]}"#,
             );
             let mut client = fast_client(transport);
 
-            let violations = vec![too_new("serde", "1.4.0")];
+            let violations = vec![too_new("serde", "1.5.0")];
             let packages = vec![
-                pkg("serde", "1.4.0", &[]),
-                pkg("app", "1.0.0", &[("serde", "1.4.0")]),
+                pkg("serde", "1.5.0", &[]),
+                pkg("app", "1.0.0", &[("serde", "1.5.0")]),
             ];
             let outcomes = generate_suggestions(
                 &mut client,
@@ -1514,14 +1569,17 @@ mod tests {
         #[test]
         fn failed_index_fetch_yields_suggestion_with_unverified_annotation() {
             let transport = FakeTransport::default();
-            transport.ok("serde", &versions_body(&[("1.4.0", 50, false)], now()));
+            transport.ok(
+                "serde",
+                &versions_body(&[("1.5.0", 5, false), ("1.4.0", 50, false)], now()),
+            );
             transport.index_error("app");
             let mut client = fast_client(transport);
 
-            let violations = vec![too_new("serde", "1.4.0")];
+            let violations = vec![too_new("serde", "1.5.0")];
             let packages = vec![
-                pkg("serde", "1.4.0", &[]),
-                pkg("app", "1.0.0", &[("serde", "1.4.0")]),
+                pkg("serde", "1.5.0", &[]),
+                pkg("app", "1.0.0", &[("serde", "1.5.0")]),
             ];
             let outcomes = generate_suggestions(
                 &mut client,
