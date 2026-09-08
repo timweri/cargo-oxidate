@@ -40,13 +40,21 @@ fn is_crates_io_identity(registry: &str) -> bool {
 
 /// One version requirement the user's own manifests place on a registry
 /// crate, together with the manifest that placed it (for warnings and
-/// diagnostics), the name of the package that manifest declares — callers
-/// use this to scope a requirement to the lockfile dependent that actually
-/// placed it, rather than to every manifest in the workspace that happens to
-/// mention the same crate name — and which registry it was declared against.
+/// diagnostics), the name and version of the package that manifest declares
+/// — callers use this identity, not just the name, to scope a requirement to
+/// the lockfile dependent that actually placed it, rather than to every
+/// manifest in the workspace that happens to mention the same crate name, or
+/// to an unrelated package that happens to share the declaring package's
+/// name — and which registry it was declared against.
+///
+/// `declaring_version` is `None` when the declaring package's version
+/// couldn't be determined — most commonly a `version.workspace = true` whose
+/// value the workspace root doesn't actually supply — so callers must treat
+/// it as unresolvable identity rather than a wildcard.
 pub struct DirectRequirement {
     pub manifest: PathBuf,
     pub declaring_package: String,
+    pub declaring_version: Option<String>,
     pub crate_name: String,
     pub req: semver::VersionReq,
     pub source: RequirementSource,
@@ -207,13 +215,28 @@ fn collect_requirements(
     // A manifest with no [package] table (a pure workspace root) declares no
     // crate identity, so it can never be a lockfile dependent — nothing it
     // lists (ordinarily nothing) could be scoped to it correctly.
-    let Some(declaring_package) = manifest.package.as_ref().map(|p| p.name().to_string()) else {
+    let Some(package) = manifest.package.as_ref() else {
         return;
     };
+    let declaring_package = package.name().to_string();
+    // `version.get()` fails only when the version is still
+    // `workspace = true` and workspace inheritance never actually resolved
+    // it (e.g. the workspace root has no `[workspace.package]` value for
+    // it). `Manifest::from_path` has already applied workspace inheritance
+    // by this point, so a resolvable version is already resolved here.
+    let declaring_version = package.version.get().ok().map(|v| v.to_string());
 
     for deps in all_dep_sets(manifest) {
         for (key, dep) in deps {
-            collect_one(manifest_path, &declaring_package, key, dep, out, warnings);
+            collect_one(
+                manifest_path,
+                &declaring_package,
+                declaring_version.as_deref(),
+                key,
+                dep,
+                out,
+                warnings,
+            );
         }
     }
 }
@@ -221,6 +244,7 @@ fn collect_requirements(
 fn collect_one(
     manifest_path: &Path,
     declaring_package: &str,
+    declaring_version: Option<&str>,
     key: &str,
     dep: &Dependency,
     out: &mut Vec<DirectRequirement>,
@@ -240,6 +264,7 @@ fn collect_one(
         Ok(req) => out.push(DirectRequirement {
             manifest: manifest_path.to_path_buf(),
             declaring_package: declaring_package.to_string(),
+            declaring_version: declaring_version.map(str::to_string),
             crate_name,
             req: req.clone(),
             source,
@@ -307,6 +332,88 @@ serde = "1.0"
         assert_eq!(
             find(&reqs, "serde").req,
             semver::VersionReq::parse("1.0").unwrap()
+        );
+        assert_eq!(find(&reqs, "serde").declaring_package, "root");
+        assert_eq!(
+            find(&reqs, "serde").declaring_version.as_deref(),
+            Some("0.1.0")
+        );
+    }
+
+    #[test]
+    fn workspace_inherited_declaring_version_is_resolved() {
+        // "member"'s own `version` is inherited from the workspace root, not
+        // written directly — the requirement's declaring identity must
+        // still resolve to the workspace-supplied version, not go missing.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            r#"
+[workspace]
+members = ["member"]
+
+[workspace.package]
+version = "2.3.4"
+"#,
+        );
+        write(
+            dir.path(),
+            "member/Cargo.toml",
+            r#"
+[package]
+name = "member"
+version.workspace = true
+
+[dependencies]
+serde = "1.0"
+"#,
+        );
+
+        let (reqs, warnings) = load_direct_requirements(dir.path());
+        assert!(warnings.is_empty());
+        assert_eq!(
+            find(&reqs, "serde").declaring_version.as_deref(),
+            Some("2.3.4")
+        );
+    }
+
+    #[test]
+    fn unresolvable_declaring_version_is_reported_as_unavailable() {
+        // "member" inherits its version from the workspace, but the
+        // workspace root supplies no `[workspace.package]` value for it —
+        // the version genuinely can't be determined, and must come back as
+        // `None` rather than some guessed-at value.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            r#"
+[workspace]
+members = ["member"]
+"#,
+        );
+        write(
+            dir.path(),
+            "member/Cargo.toml",
+            r#"
+[package]
+name = "member"
+version.workspace = true
+
+[dependencies]
+serde = "1.0"
+"#,
+        );
+
+        let (reqs, warnings) = load_direct_requirements(dir.path());
+        assert!(
+            !warnings.is_empty(),
+            "expected a warning about the unresolved workspace field"
+        );
+        assert!(
+            reqs.is_empty(),
+            "the member's manifest failed to load, so it collects no requirements"
         );
     }
 
