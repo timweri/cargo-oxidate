@@ -180,6 +180,23 @@ fn build_dependents_index(all_packages: &[Package]) -> DependentsIndex<'_> {
     index
 }
 
+/// Maps `(name, version)` to every lockfile package sharing them, built once
+/// per run so the target-source lookup and the ambiguity check in
+/// `generate_suggestions` don't each rescan every package for every "too
+/// new" violation.
+type NameVersionIndex<'a> = HashMap<(&'a str, &'a str), Vec<&'a Package>>;
+
+fn build_name_version_index(all_packages: &[Package]) -> NameVersionIndex<'_> {
+    let mut index: NameVersionIndex = HashMap::new();
+    for pkg in all_packages {
+        index
+            .entry((pkg.name.as_str(), pkg.version.as_str()))
+            .or_default()
+            .push(pkg);
+    }
+    index
+}
+
 /// The source(s) a dependency edge could refer to. An edge that already
 /// carries a source names it exactly. An edge without one refers either to
 /// a path package sharing the name and version — cargo only omits the
@@ -417,23 +434,12 @@ fn manifest_label(path: &Path, working_dir: &Path) -> String {
 }
 
 /// The pkgid to print in an update command for `name` at `version`:
-/// abbreviated to the bare name, unless another package in `all_packages`
-/// shares the name and version — a path or git package, say — in which case
-/// Cargo would reject the abbreviated spec as ambiguous. Qualifying with
-/// `target_source` (the source of the package the suggestion is actually
-/// for) disambiguates it, per Cargo's package ID specification grammar:
-/// `[<kind>+]<url>#<name>@<version>`.
-fn build_package_spec(
-    name: &str,
-    version: &str,
-    target_source: Option<&str>,
-    all_packages: &[Package],
-) -> String {
-    let is_ambiguous = all_packages
-        .iter()
-        .filter(|p| p.name == name && p.version == version)
-        .count()
-        > 1;
+/// abbreviated to the bare name, unless another package shares the name and
+/// version — a path or git package, say — in which case Cargo would reject
+/// the abbreviated spec as ambiguous. Qualifying with `target_source` (the
+/// source of the package the suggestion is actually for) disambiguates it,
+/// per Cargo's package ID specification grammar: `[<kind>+]<url>#<name>@<version>`.
+fn build_package_spec(name: &str, target_source: Option<&str>, is_ambiguous: bool) -> String {
     match (is_ambiguous, target_source) {
         (true, Some(source)) => format!("{source}#{name}"),
         _ => name.to_string(),
@@ -468,6 +474,7 @@ pub fn generate_suggestions<T: Transport>(
     }
 
     let dependents_index = build_dependents_index(all_packages);
+    let name_version_index = build_name_version_index(all_packages);
 
     let mut outcomes = Vec::new();
     eprintln!("\nFetching version suggestions...");
@@ -489,23 +496,25 @@ pub fn generate_suggestions<T: Transport>(
             }
         };
 
+        let same_name_version = name_version_index
+            .get(&(violation.package.as_str(), violation.version.as_str()))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+
         // Violations are only ever raised for registry packages (see the
         // `is_registry` filter that builds `violations`), so the crates.io
         // entry matching this name and version is the one this violation
         // refers to — not any git or alternate-registry package that
         // happens to share the same name and version.
-        let target_source = all_packages
+        let target_source = same_name_version
             .iter()
-            .find(|p| {
-                p.name == violation.package && p.version == violation.version && p.is_registry
-            })
+            .find(|p| p.is_registry)
             .and_then(|p| p.source.as_deref());
 
         let package_spec = build_package_spec(
             &violation.package,
-            &violation.version,
             target_source,
-            all_packages,
+            same_name_version.len() > 1,
         );
 
         let gathered = gather_constraints(
@@ -522,7 +531,7 @@ pub fn generate_suggestions<T: Transport>(
         let outcome = match walk(candidates, gathered.constraints) {
             WalkResult::Suggest(version, age_days) => Outcome::Suggest {
                 package: violation.package.clone(),
-                package_spec: package_spec.clone(),
+                package_spec,
                 locked_version: violation.version.clone(),
                 suggested_version: version.to_string(),
                 suggested_age_days: age_days,
@@ -2225,7 +2234,12 @@ mod tests {
                 .iter()
                 .find(|p| p.name == CRATE_NAME && p.is_registry)
                 .and_then(|p| p.source.as_deref());
-            let spec = build_package_spec(CRATE_NAME, CRATE_VERSION, target_source, &packages);
+            let is_ambiguous = packages
+                .iter()
+                .filter(|p| p.name == CRATE_NAME && p.version == CRATE_VERSION)
+                .count()
+                > 1;
+            let spec = build_package_spec(CRATE_NAME, target_source, is_ambiguous);
             assert!(
                 spec.contains('#'),
                 "expected a source-qualified spec for a name/version collision, got {spec}"
