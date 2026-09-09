@@ -2,32 +2,16 @@ use cargo_toml::{Dependency, DepsSet, Manifest};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-/// Which registry a manifest dependency declaration names. A manifest's
-/// `registry` (a Cargo config alias) or `registry-index` (a raw index URL)
-/// field identifies an alternate registry by a different representation
-/// than the source URL recorded against a lockfile package or dependency
-/// edge, and this crate has no access to Cargo's registry configuration to
-/// resolve the alias to a source. Recording that identity — without
-/// claiming it resolves to any particular lockfile source — is enough to
-/// keep it out of the crates.io suggestion flow, which only ever concerns
-/// itself with `CratesIo` requirements. Cargo reserves `crates-io` as the
-/// name of the default registry and also accepts its index URL directly, so
-/// both are recognized as `CratesIo` rather than an alternate registry.
+/// A manifest registry identity; aliases are not lockfile source URLs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequirementSource {
-    /// No `registry`/`registry-index` on the declaration, or one explicitly
-    /// naming crates.io itself (`crates-io`, or its index URL): an ordinary
-    /// crates.io dependency.
+    /// The default registry or its accepted name/index identities.
     CratesIo,
-    /// An explicitly named alternate registry (alias or raw index URL). The
-    /// identity is kept for diagnostics; it is never matched against a
-    /// lockfile source string.
+    /// An alternate registry alias or raw index, retained for diagnostics.
     Registry(String),
 }
 
-/// The identities Cargo treats as naming crates.io itself: the reserved
-/// `crates-io` registry alias, and crates.io's own git and sparse index
-/// URLs (either of which `registry-index` may name directly).
+/// Registry values Cargo treats as crates.io.
 const CRATES_IO_REGISTRY_NAME: &str = "crates-io";
 const CRATES_IO_GIT_INDEX: &str = "https://github.com/rust-lang/crates.io-index";
 const CRATES_IO_SPARSE_INDEX: &str = "sparse+https://index.crates.io/";
@@ -38,19 +22,8 @@ fn is_crates_io_identity(registry: &str) -> bool {
         || registry == CRATES_IO_SPARSE_INDEX
 }
 
-/// One version requirement the user's own manifests place on a registry
-/// crate, together with the manifest that placed it (for warnings and
-/// diagnostics), the name and version of the package that manifest declares
-/// — callers use this identity, not just the name, to scope a requirement to
-/// the lockfile dependent that actually placed it, rather than to every
-/// manifest in the workspace that happens to mention the same crate name, or
-/// to an unrelated package that happens to share the declaring package's
-/// name — and which registry it was declared against.
-///
-/// `declaring_version` is `None` when the declaring package's version
-/// couldn't be determined — most commonly a `version.workspace = true` whose
-/// value the workspace root doesn't actually supply — so callers must treat
-/// it as unresolvable identity rather than a wildcard.
+/// A registry requirement scoped to its declaring package and registry.
+/// A missing `declaring_version` is unresolved, never a wildcard.
 pub struct DirectRequirement {
     pub manifest: PathBuf,
     pub declaring_package: String,
@@ -60,25 +33,10 @@ pub struct DirectRequirement {
     pub source: RequirementSource,
 }
 
-/// Reads every version requirement the user's own manifests place on
-/// registry crates.
-///
-/// `lockfile_dir` is the directory containing `Cargo.lock`, where the root
-/// `Cargo.toml` is expected to live. Workspace members are expanded from
-/// `[workspace.members]` glob patterns with `[workspace.exclude]` applied,
-/// and path dependencies are followed one level further so that a member
-/// not listed under `members` is still read. `dependencies`,
-/// `dev-dependencies`, `build-dependencies`, and each `[target.*]` table are
-/// all walked; path and git dependencies are skipped since they carry no
-/// registry version. A path dependency followed this way is a workspace
-/// member — and so has its `dev-dependencies` collected — exactly when the
-/// root manifest has a `[workspace]` table and the dependency's directory
-/// lies inside the workspace root, unless it matches `workspace.exclude`;
-/// matching Cargo's own behavior.
-///
-/// Neither a missing manifest nor one that fails to parse aborts the run:
-/// each produces a warning in the second return value and is simply
-/// excluded from the (possibly empty) first.
+/// Collects registry requirements from the root, members, and one-level path
+/// dependencies. Members and in-tree, non-excluded path dependencies include
+/// dev dependencies. Missing or invalid manifests produce warnings and are
+/// excluded.
 pub fn load_direct_requirements(lockfile_dir: &Path) -> (Vec<DirectRequirement>, Vec<String>) {
     let mut warnings = Vec::new();
     let root_path = lockfile_dir.join("Cargo.toml");
@@ -120,11 +78,7 @@ pub fn load_direct_requirements(lockfile_dir: &Path) -> (Vec<DirectRequirement>,
         Err(e) => warnings.push(e),
     }
 
-    // Follow path dependencies one level further, so members not listed
-    // under `workspace.members` are still read. A followed dependency is
-    // itself a workspace member exactly when the root has a `[workspace]`
-    // table and its directory lies inside the workspace root, unless it
-    // matches `workspace.exclude` — matching Cargo's own behavior.
+    // Follow one level; only in-tree, non-excluded dependencies are members.
     let canonical_root_dir = canonical_or(lockfile_dir);
     let mut followed = Vec::new();
     for (path, manifest, _) in &manifests {
@@ -232,67 +186,41 @@ fn collect_requirements(
     out: &mut Vec<DirectRequirement>,
     warnings: &mut Vec<String>,
 ) {
-    // A manifest with no [package] table (a pure workspace root) declares no
-    // crate identity, so it can never be a lockfile dependent — nothing it
-    // lists (ordinarily nothing) could be scoped to it correctly.
+    // A workspace root without [package] has no crate identity to scope.
     let Some(package) = manifest.package.as_ref() else {
         return;
     };
     let declaring_package = package.name().to_string();
-    // `version.get()` fails only when the version is still
-    // `workspace = true` and workspace inheritance never actually resolved
-    // it (e.g. the workspace root has no `[workspace.package]` value for
-    // it). `Manifest::from_path` has already applied workspace inheritance
-    // by this point, so a resolvable version is already resolved here.
+    // Only unresolved `workspace = true` versions fail here; from_path
+    // already applies resolvable workspace inheritance.
     let declaring_version = package.version.get().ok().map(|v| v.to_string());
 
     for deps in all_dep_sets(manifest, include_dev) {
         for (key, dep) in deps {
-            collect_one(
-                manifest_path,
-                &declaring_package,
-                declaring_version.as_deref(),
-                key,
-                dep,
-                out,
-                warnings,
-            );
+            // Path and git dependencies aren't registry-versioned.
+            if let Some(detail) = dep.detail()
+                && (detail.path.is_some() || detail.git.is_some())
+            {
+                continue;
+            }
+
+            let crate_name = dep.package().unwrap_or(key).to_string();
+            let source = requirement_source(dep);
+            match dep.try_req() {
+                Ok(req) => out.push(DirectRequirement {
+                    manifest: manifest_path.to_path_buf(),
+                    declaring_package: declaring_package.clone(),
+                    declaring_version: declaring_version.clone(),
+                    crate_name,
+                    req: req.clone(),
+                    source,
+                }),
+                Err(e) => warnings.push(format!(
+                    "Could not determine requirement for {crate_name} in {}: {e}",
+                    manifest_path.display()
+                )),
+            }
         }
-    }
-}
-
-fn collect_one(
-    manifest_path: &Path,
-    declaring_package: &str,
-    declaring_version: Option<&str>,
-    key: &str,
-    dep: &Dependency,
-    out: &mut Vec<DirectRequirement>,
-    warnings: &mut Vec<String>,
-) {
-    // Path and git dependencies aren't registry-versioned.
-    if let Some(detail) = dep.detail()
-        && (detail.path.is_some() || detail.git.is_some())
-    {
-        return;
-    }
-
-    let crate_name = dep.package().unwrap_or(key).to_string();
-    let source = requirement_source(dep);
-
-    match dep.try_req() {
-        Ok(req) => out.push(DirectRequirement {
-            manifest: manifest_path.to_path_buf(),
-            declaring_package: declaring_package.to_string(),
-            declaring_version: declaring_version.map(str::to_string),
-            crate_name,
-            req: req.clone(),
-            source,
-        }),
-        Err(e) => warnings.push(format!(
-            "Could not determine requirement for {crate_name} in {}: {e}",
-            manifest_path.display()
-        )),
     }
 }
 

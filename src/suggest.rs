@@ -7,37 +7,28 @@ use semver::{Version, VersionReq};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-/// A version requirement currently placed on a package, and who placed it —
-/// either a dependent recorded in the lockfile (`blocker_version: Some`) or
-/// one of the user's own manifests (`blocker_version: None`).
+/// A requirement placed by a lockfile dependent or the user's manifest.
 pub struct Constraint {
     pub blocker_name: String,
     pub blocker_version: Option<String>,
     pub req: VersionReq,
 }
 
-/// The package and requirement standing in the way of a downgrade.
+/// The package and requirement blocking a downgrade.
 pub struct Blocker {
     pub name: String,
     pub version: Option<String>,
     pub req: String,
-    /// Set when this blocker's own `name` and `version` is itself a package
-    /// this run suggests downgrading. That suggestion may unblock this one,
-    /// though nothing here checks whether the older version relaxes its
-    /// requirement.
+    /// Whether this run also suggests downgrading this locked package.
     pub also_suggested: bool,
 }
 
-/// The single outcome of checking one "too new" violation: a working
-/// suggestion, a package nothing could unblock, or one with no candidate
-/// old enough in range at all.
+/// The result of checking one "too new" violation.
 pub enum Outcome {
     Suggest {
         package: String,
-        /// The pkgid to print in the update command: the bare package name,
-        /// or `{source}#{package}` when another package in the lockfile
-        /// shares this name and locked version, so the abbreviated spec
-        /// would be ambiguous to Cargo.
+        /// Bare name unless a same-name, same-version package makes Cargo's
+        /// abbreviated pkgid ambiguous, then `{source}#{package}`.
         package_spec: String,
         locked_version: String,
         suggested_version: String,
@@ -56,13 +47,8 @@ pub enum Outcome {
     },
 }
 
-/// Whether `a` and `b` fall in the same caret-compatible zone: the same
-/// leading nonzero component (major, or minor when major is 0, or patch
-/// when both are 0) — cargo's own notion of "compatible" versions. Unlike
-/// parsing `^{a}` as a requirement and matching `b` against it, this is
-/// symmetric, which is what bounding a *downgrade* search needs: a caret
-/// requirement built from the locked version only ever accepts versions at
-/// or above it.
+/// Whether `a` and `b` share Cargo's symmetric caret-compatible zone: major,
+/// minor when major is zero, or patch when both are zero.
 fn same_compatible_zone(a: &Version, b: &Version) -> bool {
     if a.major != 0 || b.major != 0 {
         a.major == b.major
@@ -73,11 +59,8 @@ fn same_compatible_zone(a: &Version, b: &Version) -> bool {
     }
 }
 
-/// Filters `versions` to non-yanked, at least `min_age_days` old as of
-/// `now`, strictly older in semantic precedence than `locked`, within the
-/// caret-compatible zone of `locked`, sorted newest first by publish date.
-/// Prereleases are excluded unless `allow_prerelease` is set or `locked` is
-/// itself a prerelease.
+/// Keeps old-enough, non-yanked compatible versions older than `locked`,
+/// newest first. Excludes prereleases unless allowed or `locked` is one.
 fn filter_candidates(
     versions: &[CrateVersionInfo],
     locked: &Version,
@@ -128,8 +111,8 @@ enum WalkResult {
 
 /// Walks `candidates` (already filtered and sorted newest first) looking for
 /// the first one every constraint accepts. When none does, reports the
-/// newest candidate and the first constraint it fails.
-fn walk(candidates: Vec<(Version, i64)>, constraints: Vec<Constraint>) -> WalkResult {
+/// newest candidate and the constraint responsible for the block.
+fn walk(candidates: Vec<(Version, i64)>, mut constraints: Vec<Constraint>) -> WalkResult {
     let Some((newest, _)) = candidates.first() else {
         return WalkResult::NoCompliantVersion;
     };
@@ -141,30 +124,31 @@ fn walk(candidates: Vec<(Version, i64)>, constraints: Vec<Constraint>) -> WalkRe
         }
     }
 
-    let blocker = constraints
-        .into_iter()
-        .find(|c| !c.req.matches(&newest))
+    // Prefer a constraint that rejects every candidate: that one alone makes
+    // the downgrade impossible. Falling back to the first constraint the
+    // newest candidate fails only misattributes when no single constraint
+    // blocks everything — there the block is a genuine combination, and this
+    // still explains why the newest candidate was rejected.
+    let blocker_idx = constraints
+        .iter()
+        .position(|c| candidates.iter().all(|(v, _)| !c.req.matches(v)))
+        .or_else(|| constraints.iter().position(|c| !c.req.matches(&newest)))
         .expect("newest candidate was rejected, so some constraint must reject it");
+    let blocker = constraints.swap_remove(blocker_idx);
     WalkResult::Blocked {
         newest_compliant: newest,
         blocker,
     }
 }
 
-/// Every registry-crate dependent (from the lockfile) whose recorded
-/// requirement on `name` could not be read, kept as a display name rather
-/// than aborting the constraint gathering.
+/// Constraints plus dependent labels whose requirements remain unverified.
 struct GatheredConstraints {
     constraints: Vec<Constraint>,
     unverified_dependents: Vec<String>,
 }
 
-/// Maps `(name, version, source)` to every lockfile package that depends on
-/// it, built once per run so `gather_constraints` doesn't rescan every
-/// package for every "too new" violation. `source` distinguishes same-name,
-/// same-version packages from different origins (crates.io, an alternate
-/// registry, git) so a dependent of one doesn't leak into another's
-/// constraint set.
+/// Dependents keyed by full package identity, including source, so equal name
+/// and version from different origins never share constraints.
 type DependentsIndex<'a> = HashMap<(&'a str, &'a str, Option<&'a str>), Vec<&'a Package>>;
 
 fn build_dependents_index(all_packages: &[Package]) -> DependentsIndex<'_> {
@@ -182,10 +166,7 @@ fn build_dependents_index(all_packages: &[Package]) -> DependentsIndex<'_> {
     index
 }
 
-/// Maps `(name, version)` to every lockfile package sharing them, built once
-/// per run so the target-source lookup and the ambiguity check in
-/// `generate_suggestions` don't each rescan every package for every "too
-/// new" violation.
+/// Packages keyed by name and version for source lookup and pkgid ambiguity.
 type NameVersionIndex<'a> = HashMap<(&'a str, &'a str), Vec<&'a Package>>;
 
 fn build_name_version_index(all_packages: &[Package]) -> NameVersionIndex<'_> {
@@ -199,17 +180,9 @@ fn build_name_version_index(all_packages: &[Package]) -> NameVersionIndex<'_> {
     index
 }
 
-/// The source(s) a dependency edge could refer to. An edge that already
-/// carries a source names it exactly. An edge without one refers either to
-/// a path package sharing the name and version — cargo only omits the
-/// source when the resolved target genuinely has none, so a path package is
-/// the definite target even when a same-name/same-version registry package
-/// also exists — or, absent any such path package, to whichever single
-/// package the edge names, resolved here against the lockfile's own package
-/// list. If more than one still shares the name and version (and the edge
-/// still has no source to disambiguate with), the edge is kept under every
-/// one of them rather than guessed at, so an edge that's genuinely ambiguous
-/// still counts as a dependent everywhere it might apply.
+/// Resolves an edge's source. An explicit source wins; an unsourced edge
+/// definitely targets a matching path package. Otherwise retain every
+/// same-name, same-version source, so an ambiguous edge applies everywhere.
 fn resolve_dependency_sources<'a>(
     dep: &'a PackageRef,
     all_packages: &'a [Package],
@@ -235,11 +208,7 @@ fn resolve_dependency_sources<'a>(
     }
 }
 
-/// Gathers every version requirement currently placed on `name` at
-/// `locked_version` from `source`: from lockfile-recorded dependents (via
-/// the crates.io sparse index for registry dependents) and from the user's
-/// own manifests (via `direct_requirements`, included whenever a
-/// non-registry dependent records the edge).
+/// Gathers requirements from registry dependents and local manifests.
 fn gather_constraints<T: Transport>(
     client: &mut CratesIoClient<T>,
     dependents_index: &DependentsIndex,
@@ -259,38 +228,17 @@ fn gather_constraints<T: Transport>(
         .copied();
 
     for dependent in dependents {
-        // A dependent counts as verified only if every requirement it
-        // records on `name` parsed and at least one matches the locked
-        // version. A fetch failure, a missing index record, or an
-        // unparseable requirement is annotated instead of silently dropped.
-        let matched;
-        let unreadable;
-        let mut has_unverified_leftover = false;
-        if dependent.is_registry {
+        let unverified = if dependent.is_registry {
             let result = registry_dependent_constraints(client, dependent, name, locked_version);
-            matched = result.matched;
-            unreadable = result.unreadable;
-            has_unverified_leftover = result.has_unverified_leftover;
+            let unverified = result.unverified;
             constraints.extend(result.constraints);
+            unverified
         } else if dependent.source.is_none() {
-            // No lockfile source means a local (path/workspace) package —
-            // `is_registry` only tells us this isn't crates.io, not that it's
-            // local, so a git or alternate-registry dependent (which does
-            // carry a source) must not fall into this branch. Only a local
-            // dependent's own manifest can be read directly.
-            let mut manifest_matched = false;
-            // Scoped to this dependent's own manifest, not every manifest in
-            // the workspace that happens to mention the same crate name —
-            // two members can lock the same crate name at different major
-            // versions, each with its own unrelated requirement. Matched by
-            // the declaring package's name *and* version, since an unrelated
-            // local package can share the dependent's name without being it.
-            // Also scoped to crates.io declarations: this suggestion flow
-            // only ever targets a crates.io package (see the `is_registry`
-            // filter above `target_source` in `generate_suggestions`), so a
-            // declaration naming an explicit alternate registry can never be
-            // the one that placed this edge and must not be enforced here —
-            // nor must it count toward this dependent being verified.
+            // Only an unsourced non-registry dependent is local; other
+            // sources cannot be verified through a workspace manifest.
+            let constraint_count = constraints.len();
+            // Match the declaring package's name and version, and only its
+            // crates.io declarations, to avoid unrelated local requirements.
             for req in direct_requirements
                 .iter()
                 .filter(|r| r.crate_name == name && r.declaring_package == dependent.name)
@@ -300,24 +248,18 @@ fn gather_constraints<T: Transport>(
                     Version::parse(locked_version).is_ok_and(|version| r.req.matches(&version))
                 })
             {
-                manifest_matched = true;
                 constraints.push(Constraint {
                     blocker_name: manifest_label(&req.manifest, working_dir),
                     blocker_version: None,
                     req: req.req.clone(),
                 });
             }
-            matched = manifest_matched;
-            unreadable = false;
+            constraints.len() == constraint_count
         } else {
-            // A git or alternate-registry dependent: nothing here can read
-            // its actual requirement, local manifest or otherwise, so it
-            // stays unverified regardless of what any local package's own
-            // manifest happens to say.
-            matched = false;
-            unreadable = false;
-        }
-        if !matched || unreadable || has_unverified_leftover {
+            // Git and alternate-registry requirements cannot be read here.
+            true
+        };
+        if unverified {
             unverified_dependents.push(dependent.name.clone());
         }
     }
@@ -329,15 +271,10 @@ fn gather_constraints<T: Transport>(
 }
 
 /// Requirements a registry dependent's crates.io index record places on
-/// `name` at `locked_version`. `unreadable` is set on a fetch failure, a
-/// missing index record, or an unparseable requirement. `has_unverified_leftover`
-/// is set when a matching declaration exists whose applicability couldn't be
-/// settled even though other, mandatory declarations were enforced.
+/// `name` at `locked_version`, plus whether an uncertain declaration remains.
 struct RegistryConstraints {
     constraints: Vec<Constraint>,
-    matched: bool,
-    unreadable: bool,
-    has_unverified_leftover: bool,
+    unverified: bool,
 }
 
 impl RegistryConstraints {
@@ -346,9 +283,7 @@ impl RegistryConstraints {
     fn unreadable() -> Self {
         RegistryConstraints {
             constraints: Vec::new(),
-            matched: false,
-            unreadable: true,
-            has_unverified_leftover: false,
+            unverified: true,
         }
     }
 }
@@ -359,8 +294,6 @@ fn registry_dependent_constraints<T: Transport>(
     name: &str,
     locked_version: &str,
 ) -> RegistryConstraints {
-    let mut matched = false;
-
     let Ok(records) = client.fetch_index_record(&dependent.name) else {
         return RegistryConstraints::unreadable();
     };
@@ -368,10 +301,10 @@ fn registry_dependent_constraints<T: Transport>(
         return RegistryConstraints::unreadable();
     };
 
-    let mut unreadable = false;
     // Every matching declaration, alongside whether it alone guarantees the
     // requirement is active: unconditional (no `target`) and non-optional.
-    let mut matching_reqs: Vec<(VersionReq, bool)> = Vec::new();
+    let mut requirements: Vec<(VersionReq, bool)> = Vec::new();
+    let mut unverified = false;
     for dep in &record.deps {
         if dep.kind.as_deref() == Some("dev") {
             continue;
@@ -383,70 +316,45 @@ fn registry_dependent_constraints<T: Transport>(
         match VersionReq::parse(&dep.req) {
             Ok(req) if Version::parse(locked_version).is_ok_and(|v| req.matches(&v)) => {
                 let mandatory = dep.target.is_none() && dep.optional != Some(true);
-                matching_reqs.push((req, mandatory));
+                match requirements
+                    .iter_mut()
+                    .find(|(existing, _)| *existing == req)
+                {
+                    Some((_, existing_mandatory)) => *existing_mandatory |= mandatory,
+                    None => requirements.push((req, mandatory)),
+                }
             }
             Ok(_) => {}
-            Err(_) => unreadable = true,
+            Err(_) => unverified = true,
         }
     }
-
-    // Duplicate declarations of the *same* requirement aren't ambiguous —
-    // the index lists one entry per target, so a requirement repeated
-    // across, say, `cfg(unix)` and `cfg(windows)` tables is still a single
-    // requirement, not competing candidates. (Not necessarily adjacent, so a
-    // plain `dedup()` wouldn't catch every repeat.) A requirement is
-    // mandatory if any declaration producing it is unconditional and
-    // non-optional — such a declaration guarantees the requirement is
-    // active no matter what else matches.
-    let mut distinct: Vec<(VersionReq, bool)> = Vec::new();
-    for (req, mandatory) in matching_reqs {
-        match distinct.iter_mut().find(|(r, _)| *r == req) {
-            Some((_, m)) => *m = *m || mandatory,
-            None => distinct.push((req, mandatory)),
-        }
-    }
-    let (mandatory_reqs, uncertain_reqs): (Vec<_>, Vec<_>) =
-        distinct.into_iter().partition(|(_, mandatory)| *mandatory);
 
     let mut constraints = Vec::new();
-    let mut has_unverified_leftover = false;
-
-    if !mandatory_reqs.is_empty() {
-        // Every known-mandatory requirement is always active, so all of
-        // them are enforced regardless of how many other, uncertain
-        // declarations also match.
-        matched = true;
-        for (req, _) in mandatory_reqs {
-            constraints.push(Constraint {
-                blocker_name: dependent.name.clone(),
-                blocker_version: Some(dependent.version.clone()),
-                req,
-            });
+    if requirements.iter().any(|(_, mandatory)| *mandatory) {
+        // A mandatory declaration makes every matching mandatory requirement
+        // definite; matching uncertain declarations remain annotations.
+        for (req, mandatory) in requirements {
+            if mandatory {
+                constraints.push(Constraint {
+                    blocker_name: dependent.name.clone(),
+                    blocker_version: Some(dependent.version.clone()),
+                    req,
+                });
+            } else {
+                unverified = true;
+            }
         }
-        // A leftover uncertain declaration can't be resolved either way, so
-        // the dependent is still worth flagging even though the mandatory
-        // requirements above are enforced as definite blockers.
-        has_unverified_leftover = !uncertain_reqs.is_empty();
-    } else if let [(req, _)] = uncertain_reqs.as_slice() {
-        // With no mandatory declaration to settle it, a single uncertain
-        // declaration is the unique explanation for this lockfile edge and
-        // is enforced as a definite blocker.
-        matched = true;
+    } else if let [(req, _)] = requirements.as_slice() {
+        // One uncertain declaration is the unique explanation for the edge.
         constraints.push(Constraint {
             blocker_name: dependent.name.clone(),
             blocker_version: Some(dependent.version.clone()),
             req: req.clone(),
         });
     }
-    // Otherwise: no matching declaration, or several distinct uncertain
-    // ones with no mandatory declaration to settle it — neither can be
-    // enforced, so the dependent is reported unverified instead.
-
     RegistryConstraints {
+        unverified: unverified || constraints.is_empty(),
         constraints,
-        matched,
-        unreadable,
-        has_unverified_leftover,
     }
 }
 
@@ -457,12 +365,7 @@ fn manifest_label(path: &Path, working_dir: &Path) -> String {
         .to_string()
 }
 
-/// The pkgid to print in an update command for `name` at `version`:
-/// abbreviated to the bare name, unless another package shares the name and
-/// version — a path or git package, say — in which case Cargo would reject
-/// the abbreviated spec as ambiguous. Qualifying with `target_source` (the
-/// source of the package the suggestion is actually for) disambiguates it,
-/// per Cargo's package ID specification grammar: `[<kind>+]<url>#<name>@<version>`.
+/// Uses a source-qualified pkgid when a shared name and version is ambiguous.
 fn build_package_spec(name: &str, target_source: Option<&str>, is_ambiguous: bool) -> String {
     match (is_ambiguous, target_source) {
         (true, Some(source)) => format!("{source}#{name}"),
@@ -470,13 +373,8 @@ fn build_package_spec(name: &str, target_source: Option<&str>, is_ambiguous: boo
     }
 }
 
-/// Generates one outcome for every "too new" violation. Returns `None` when
-/// there are no "too new" violations, so the caller prints nothing; returns
-/// `Some` (possibly empty) once the flow has run.
-///
-/// A package whose own version list fails to fetch is simply absent from
-/// the result, matching the tool's established tolerance for per-package
-/// fetch failures.
+/// Generates outcomes for "too new" violations, or `None` when there are none.
+/// Ignores packages whose version list cannot be fetched.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_suggestions<T: Transport>(
     client: &mut CratesIoClient<T>,
@@ -525,11 +423,8 @@ pub fn generate_suggestions<T: Transport>(
             .map(Vec::as_slice)
             .unwrap_or_default();
 
-        // Violations are only ever raised for registry packages (see the
-        // `is_registry` filter that builds `violations`), so the crates.io
-        // entry matching this name and version is the one this violation
-        // refers to — not any git or alternate-registry package that
-        // happens to share the same name and version.
+        // This registry package is the violation target, even if another
+        // source shares its name and version.
         let target_source = same_name_version
             .iter()
             .find(|p| p.is_registry)
@@ -793,6 +688,38 @@ mod tests {
                     assert_eq!(newest_compliant.to_string(), "1.3.0");
                     assert_eq!(blocker.blocker_name, "dep");
                     assert_eq!(blocker.req.to_string(), "^2.0");
+                }
+                _ => panic!("expected Blocked"),
+            }
+        }
+
+        #[test]
+        // Pins that the blocker is the constraint rejecting every candidate.
+        // `<=1.3` comes first and rejects the newest candidate, but 1.2.0
+        // satisfies it — only `>=1.4.5` makes every downgrade impossible.
+        fn blocker_is_the_constraint_that_rejects_every_candidate() {
+            let candidates = vec![(v("1.4.0"), 5), (v("1.2.0"), 20)];
+            let constraints = vec![constraint("<=1.3"), constraint(">=1.4.5")];
+
+            match walk(candidates, constraints) {
+                WalkResult::Blocked { blocker, .. } => {
+                    assert_eq!(blocker.req.to_string(), ">=1.4.5");
+                }
+                _ => panic!("expected Blocked"),
+            }
+        }
+
+        #[test]
+        // Pins the fallback: when no single constraint rejects every
+        // candidate, the block is a genuine combination, so we fall back to
+        // the first constraint that rejects the newest candidate.
+        fn blocker_falls_back_when_no_single_constraint_blocks_all_candidates() {
+            let candidates = vec![(v("1.4.0"), 5), (v("1.2.0"), 20)];
+            let constraints = vec![constraint("<=1.3"), constraint(">=1.4")];
+
+            match walk(candidates, constraints) {
+                WalkResult::Blocked { blocker, .. } => {
+                    assert_eq!(blocker.req.to_string(), "<=1.3");
                 }
                 _ => panic!("expected Blocked"),
             }
