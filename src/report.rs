@@ -1,4 +1,4 @@
-use crate::suggest;
+use crate::suggest::Outcome;
 use chrono::{DateTime, Utc};
 
 /// A package's publish date and its resulting age, shared by both
@@ -93,27 +93,99 @@ pub fn print_report(violations: &[Violation]) {
     }
 }
 
-pub fn print_suggestions(suggestions: &[suggest::Suggestion]) {
-    if suggestions.is_empty() {
+pub fn print_suggestions(outcomes: &[Outcome]) {
+    if outcomes.is_empty() {
         println!("\n⚠️  No compliant versions found for any \"too new\" violations.");
         println!("    Consider adding these packages to --exempt if they are trusted.\n");
         return;
     }
 
-    println!("\n💡 Suggested fixes for \"too new\" violations:\n");
+    let has_suggestion = outcomes
+        .iter()
+        .any(|o| matches!(o, Outcome::Suggest { .. }));
 
-    for s in suggestions {
+    if has_suggestion {
         println!(
-            "    cargo update -p {} --precise {}    # {} days old",
-            s.package, s.suggested_version, s.suggested_age_days
+            "\n💡 Suggested fixes for \"too new\" violations (apply top to bottom, then re-run):\n"
         );
+
+        for outcome in outcomes {
+            if let Outcome::Suggest {
+                package_spec,
+                locked_version,
+                suggested_version,
+                suggested_age_days,
+                unverified_dependents,
+                ..
+            } = outcome
+            {
+                let annotation = if unverified_dependents.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "   (requirement of {} unverified)",
+                        unverified_dependents.join(", ")
+                    )
+                };
+                println!(
+                    "    cargo update -p {package_spec}@{locked_version} --precise {suggested_version}    # {suggested_age_days} days old{annotation}"
+                );
+            }
+        }
     }
 
-    println!(
-        r#"
-  Note: These suggestions pick the newest version that satisfies --min-age-days.
-  They may not be compatible with your Cargo.toml version requirements.
-  For transitive dependencies, run `cargo tree -i <pkg>` to find the parent.
+    let blocked: Vec<&Outcome> = outcomes
+        .iter()
+        .filter(|o| !matches!(o, Outcome::Suggest { .. }))
+        .collect();
+
+    if !blocked.is_empty() {
+        println!("\n⛔ No compatible compliant version:\n");
+        for outcome in blocked {
+            match outcome {
+                Outcome::Blocked {
+                    package,
+                    locked_version,
+                    newest_compliant,
+                    blocker,
+                } => {
+                    let source = match &blocker.version {
+                        Some(v) => format!("{} {v}", blocker.name),
+                        None => blocker.name.clone(),
+                    };
+                    let also_suggested = if blocker.also_suggested {
+                        format!(
+                            " ({source} also has a suggested downgrade above; applying it may unblock this, so re-run to check)"
+                        )
+                    } else {
+                        String::new()
+                    };
+                    println!(
+                        "    {package} {locked_version}: newest compliant is {newest_compliant}, but {source} requires {}{also_suggested}",
+                        blocker.req
+                    );
+                }
+                Outcome::NoCompliantVersion {
+                    package,
+                    locked_version,
+                } => {
+                    println!(
+                        "    {package} {locked_version}: no version at least the minimum age old within its compatible range"
+                    );
+                }
+                Outcome::Suggest { .. } => unreachable!(),
+            }
+        }
+    }
+
+    if has_suggestion {
+        println!(
+            r#"
+  Suggestions satisfy, on a best-effort basis, the version requirements verified from
+  Cargo.lock and your manifests. Requirements marked "unverified" above were not checked
+  and Cargo may still reject that suggestion. Source compatibility is not verified: build
+  or test after applying.
 "#
-    );
+        );
+    }
 }

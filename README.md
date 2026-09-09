@@ -28,10 +28,23 @@ cargo-oxidate Cargo.lock --min-age-days 14 --max-age-days 730
 | `--exclude-missing` | Don't flag packages with unknown publish dates |
 | `--timeout N` | HTTP timeout in seconds (default: 10) |
 | `--suggest-fix` | For "too new" violations, suggest `cargo update` commands to downgrade |
+| `--include-prerelease` | Consider prerelease versions as suggestion candidates (requires `--suggest-fix`) |
 | `--cache-path PATH` | Enable response caching at PATH (or set `CARGO_OXIDATE_CACHE_PATH`) |
 | `--cache-max-age-hours N` | Max age for cached version listings (default: 24) |
 
 At least one of `--min-age-days` or `--max-age-days` must be specified.
+
+## `--suggest-fix`
+
+`--suggest-fix` finds the newest older version that satisfies, on a best-effort basis, every
+dependency requirement it can verify from your lockfile and workspace manifests, and prints a
+`cargo update` command for it. Some requirements can't be verified (for example, an optional
+dependency behind a feature flag not enabled in your manifests) — such suggestions are annotated,
+and Cargo may still reject them.
+
+The tool does not build your project and does not guarantee Cargo will accept every suggested
+command. Run your tests after applying a suggestion. If no version fits, it reports the
+requirement that prevents a downgrade. Apply suggestions in order, then run the command again.
 
 ## Exit Codes
 

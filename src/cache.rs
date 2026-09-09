@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::api::CrateVersionInfo;
+use crate::api::{CrateVersionInfo, IndexRecord};
 
 const CACHE_VERSION: u32 = 1;
 
@@ -13,12 +13,20 @@ struct CacheData {
     version: u32,
     publish_dates: HashMap<String, DateTime<Utc>>,
     all_versions: HashMap<String, AllVersionsEntry>,
+    #[serde(default)]
+    index_records: HashMap<String, IndexRecordsEntry>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct AllVersionsEntry {
     fetched_at: DateTime<Utc>,
     versions: Vec<CrateVersionInfo>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct IndexRecordsEntry {
+    fetched_at: DateTime<Utc>,
+    records: Vec<IndexRecord>,
 }
 
 pub struct ResponseCache {
@@ -104,6 +112,26 @@ impl ResponseCache {
             versions,
         };
         self.data.all_versions.insert(name.to_string(), entry);
+        self.dirty = true;
+    }
+
+    pub fn get_index_records(&self, name: &str, max_age: Duration) -> Option<Vec<IndexRecord>> {
+        let entry = self.data.index_records.get(name)?;
+        let age = Utc::now() - entry.fetched_at;
+
+        if age > max_age {
+            return None;
+        }
+
+        Some(entry.records.clone())
+    }
+
+    pub fn set_index_records(&mut self, name: &str, records: Vec<IndexRecord>) {
+        let entry = IndexRecordsEntry {
+            fetched_at: Utc::now(),
+            records,
+        };
+        self.data.index_records.insert(name.to_string(), entry);
         self.dirty = true;
     }
 
@@ -255,6 +283,34 @@ mod tests {
         cache.set_publish_date("serde", "1.0.0", sample_date());
         // Should not panic or error even though there's no path.
         cache.save().unwrap();
+    }
+
+    #[test]
+    fn cache_file_without_index_records_still_loads() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cache.json");
+
+        // A cache file as written by a release before index_records existed.
+        std::fs::write(
+            &path,
+            r#"{"version":1,"publish_dates":{"serde/1.0.0":"2020-01-01T00:00:00Z"},"all_versions":{}}"#,
+        )
+        .unwrap();
+
+        let cache = ResponseCache::load(Some(&path));
+        assert_eq!(
+            cache.get_publish_date("serde", "1.0.0"),
+            Some(
+                DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )
+        );
+        assert!(
+            cache
+                .get_index_records("serde", Duration::hours(1))
+                .is_none()
+        );
     }
 
     #[test]
