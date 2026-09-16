@@ -187,7 +187,86 @@ fn suggest_fix_cli_retains_best_effort_qualification() {
     );
     assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("requirement of consumer unverified"),
+        "stdout was:\n{stdout}"
+    );
     assert!(stdout.contains("best-effort"), "stdout was:\n{stdout}");
+    assert!(
+        stdout.contains("apply top to bottom, then re-run"),
+        "stdout was:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("or test after applying"),
+        "stdout was:\n{stdout}"
+    );
+}
+
+#[test]
+fn suggest_fix_cli_reports_same_named_git_parent_once() {
+    let project = tempdir().unwrap();
+    fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("Cargo.lock"),
+        r#"version = 4
+
+[[package]]
+name = "app"
+version = "0.1.0"
+
+[[package]]
+name = "parent"
+version = "1.0.0"
+source = "git+https://github.com/example/parent?tag=v1#1111111111111111111111111111111111111111"
+dependencies = [
+ "foo",
+]
+
+[[package]]
+name = "parent"
+version = "2.0.0"
+source = "git+https://github.com/example/parent?tag=v2#2222222222222222222222222222222222222222"
+dependencies = [
+ "foo",
+]
+
+[[package]]
+name = "foo"
+version = "1.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0000000000000000000000000000000000000000000000000000000000000000"
+"#,
+    )
+    .unwrap();
+    let cache = write_cache(
+        project.path(),
+        &[("foo", "1.9.0", 2, vec![("1.9.0", 2), ("1.7.0", 80)])],
+    );
+    let output = run_oxidate(
+        project.path(),
+        &[
+            "--min-age-days",
+            "30",
+            "--suggest-fix",
+            "--cache-path",
+            cache.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("cargo update -p foo@1.9.0 --precise 1.7.0"),
+        "stdout was:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("(requirement of parent unverified)"),
+        "stdout was:\n{stdout}"
+    );
+    assert!(!stdout.contains("parent, parent"), "stdout was:\n{stdout}");
 }
 
 #[test]

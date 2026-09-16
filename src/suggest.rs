@@ -1,5 +1,5 @@
 use crate::api::{CrateVersionInfo, CratesIoClient, Transport};
-use crate::lockfile::{Package, PackageRef};
+use crate::lockfile::Package;
 use crate::manifest::{DirectRequirement, RequirementSource};
 use crate::report::{Violation, ViolationKind};
 use chrono::{DateTime, Utc};
@@ -155,12 +155,14 @@ fn build_dependents_index(all_packages: &[Package]) -> DependentsIndex<'_> {
     let mut index: DependentsIndex = HashMap::new();
     for pkg in all_packages {
         for dep in &pkg.dependencies {
-            for source in resolve_dependency_sources(dep, all_packages) {
-                index
-                    .entry((dep.name.as_str(), dep.version.as_str(), source))
-                    .or_default()
-                    .push(pkg);
-            }
+            index
+                .entry((
+                    dep.name.as_str(),
+                    dep.version.as_str(),
+                    dep.source.as_deref(),
+                ))
+                .or_default()
+                .push(pkg);
         }
     }
     index
@@ -180,68 +182,91 @@ fn build_name_version_index(all_packages: &[Package]) -> NameVersionIndex<'_> {
     index
 }
 
-/// Resolves an edge's source. An explicit source wins; an unsourced edge
-/// definitely targets a matching path package. Otherwise retain every
-/// same-name, same-version source, so an ambiguous edge applies everywhere.
-fn resolve_dependency_sources<'a>(
-    dep: &'a PackageRef,
-    all_packages: &'a [Package],
-) -> Vec<Option<&'a str>> {
-    if let Some(source) = dep.source.as_deref() {
-        return vec![Some(source)];
-    }
-    let has_path_match = all_packages
-        .iter()
-        .any(|p| p.name == dep.name && p.version == dep.version && p.source.is_none());
-    if has_path_match {
-        return vec![None];
-    }
-    let matches: Vec<Option<&str>> = all_packages
-        .iter()
-        .filter(|p| p.name == dep.name && p.version == dep.version)
-        .map(|p| p.source.as_deref())
-        .collect();
-    if matches.is_empty() {
-        vec![None]
-    } else {
-        matches
-    }
-}
-
 /// Multiple versions are ambiguous only when their matching requirements differ.
 fn is_ambiguous(locked_versions: usize, distinct_requirements: usize) -> bool {
     locked_versions > 1 && distinct_requirements > 1
 }
 
 /// Count versions within the eligible source, ignoring duplicate edges.
-fn eligible_locked_versions<'a>(
-    dependent: &'a Package,
-    all_packages: &'a [Package],
-    name: &str,
-    source: Option<&str>,
-) -> usize {
+fn eligible_locked_versions(dependent: &Package, name: &str, source: Option<&str>) -> usize {
     dependent
         .dependencies
         .iter()
-        .filter(|d| d.name == name)
-        .filter(|d| resolve_dependency_sources(d, all_packages).contains(&source))
+        .filter(|d| d.name == name && d.source.as_deref() == source)
         .map(|d| d.version.as_str())
         .collect::<HashSet<_>>()
         .len()
 }
 
-/// An unresolved source cannot supply verified requirements.
-fn edge_source_is_ambiguous(
-    dependent: &Package,
-    all_packages: &[Package],
-    name: &str,
-    locked_version: &str,
-) -> bool {
-    dependent
-        .dependencies
-        .iter()
-        .filter(|d| d.name == name && d.version == locked_version)
-        .any(|d| resolve_dependency_sources(d, all_packages).len() > 1)
+/// A single declaration's parsed requirement plus the evidence the shared
+/// attribution policy needs: whether it is definitely active (mandatory) or
+/// merely possible (optional/target-specific/aliased). Local declarations are
+/// always mandatory, since their representation drops that distinction.
+struct NormalizedDeclaration {
+    req: VersionReq,
+    mandatory: bool,
+}
+
+/// The shared attribution policy's decision: which parsed requirements are
+/// verified enforceable, plus whether the parent must still be marked
+/// unverified. Both can hold at once (a mandatory constraint alongside an
+/// uncertain declaration).
+struct AttributionResult {
+    enforced: Vec<VersionReq>,
+    unverified: bool,
+}
+
+/// Applies the requirement-attribution policy shared by local manifests and
+/// registry index records: dedupe by parsed requirement (aliases with an
+/// equal requirement count once), decide multi-version ambiguity, and decide
+/// which requirements are verified enforceable.
+fn attribute_requirements(
+    declarations: &[NormalizedDeclaration],
+    locked_versions: usize,
+) -> AttributionResult {
+    let mut deduped: Vec<NormalizedDeclaration> = Vec::new();
+    for decl in declarations {
+        match deduped.iter_mut().find(|existing| existing.req == decl.req) {
+            Some(existing) => existing.mandatory |= decl.mandatory,
+            None => deduped.push(NormalizedDeclaration {
+                req: decl.req.clone(),
+                mandatory: decl.mandatory,
+            }),
+        }
+    }
+
+    if declarations.is_empty() || is_ambiguous(locked_versions, deduped.len()) {
+        return AttributionResult {
+            enforced: Vec::new(),
+            unverified: true,
+        };
+    }
+
+    let mut enforced = Vec::new();
+    let mut unverified = false;
+    if deduped.iter().any(|d| d.mandatory) {
+        // A mandatory declaration makes every matching mandatory requirement
+        // definite; matching uncertain declarations remain annotations.
+        for d in deduped {
+            if d.mandatory {
+                enforced.push(d.req);
+            } else {
+                unverified = true;
+            }
+        }
+    } else if let [d] = deduped.as_slice() {
+        // One uncertain declaration is the unique explanation for the edge.
+        enforced.push(d.req.clone());
+    }
+
+    if enforced.is_empty() {
+        unverified = true;
+    }
+
+    AttributionResult {
+        enforced,
+        unverified,
+    }
 }
 
 /// Gathers requirements from registry dependents and local manifests.
@@ -249,7 +274,6 @@ fn edge_source_is_ambiguous(
 fn gather_constraints<T: Transport>(
     client: &mut CratesIoClient<T>,
     dependents_index: &DependentsIndex,
-    all_packages: &[Package],
     direct_requirements: &[DirectRequirement],
     working_dir: &Path,
     name: &str,
@@ -266,18 +290,9 @@ fn gather_constraints<T: Transport>(
         .copied();
 
     for dependent in dependents {
-        let unverified = if edge_source_is_ambiguous(dependent, all_packages, name, locked_version)
-        {
-            true
-        } else if dependent.is_registry {
-            let result = registry_dependent_constraints(
-                client,
-                dependent,
-                all_packages,
-                name,
-                locked_version,
-                source,
-            );
+        let unverified = if dependent.is_registry {
+            let result =
+                registry_dependent_constraints(client, dependent, name, locked_version, source);
             let unverified = result.unverified;
             constraints.extend(result.constraints);
             unverified
@@ -295,19 +310,24 @@ fn gather_constraints<T: Transport>(
                     Version::parse(locked_version).is_ok_and(|version| r.req.matches(&version))
                 })
                 .collect();
-            // Aliases with equal parsed requirements count once.
-            let mut distinct: Vec<&VersionReq> = Vec::new();
-            for req in matching.iter().map(|r| &r.req) {
-                if !distinct.contains(&req) {
-                    distinct.push(req);
-                }
-            }
 
-            let locked_versions = eligible_locked_versions(dependent, all_packages, name, source);
+            let declarations: Vec<NormalizedDeclaration> = matching
+                .iter()
+                .map(|r| NormalizedDeclaration {
+                    req: r.req.clone(),
+                    mandatory: true,
+                })
+                .collect();
+            let locked_versions = eligible_locked_versions(dependent, name, source);
+            let result = attribute_requirements(&declarations, locked_versions);
 
-            if matching.is_empty() || is_ambiguous(locked_versions, distinct.len()) {
+            if result.unverified {
                 true
             } else {
+                // Every local declaration is mandatory, so on this
+                // non-ambiguous path `result.enforced` always contains every
+                // deduped requirement from `matching`; no filter is needed to
+                // decide which of `matching` to keep.
                 for req in &matching {
                     constraints.push(Constraint {
                         blocker_name: manifest_label(&req.manifest, working_dir),
@@ -321,7 +341,7 @@ fn gather_constraints<T: Transport>(
             // Git and alternate-registry requirements cannot be read here.
             true
         };
-        if unverified {
+        if unverified && !unverified_dependents.contains(&dependent.name) {
             unverified_dependents.push(dependent.name.clone());
         }
     }
@@ -353,7 +373,6 @@ impl RegistryConstraints {
 fn registry_dependent_constraints<T: Transport>(
     client: &mut CratesIoClient<T>,
     dependent: &Package,
-    all_packages: &[Package],
     name: &str,
     locked_version: &str,
     source: Option<&str>,
@@ -365,8 +384,7 @@ fn registry_dependent_constraints<T: Transport>(
         return RegistryConstraints::unreadable();
     };
 
-    // Deduplicate requirements, retaining whether any declaration is mandatory.
-    let mut requirements: Vec<(VersionReq, bool)> = Vec::new();
+    let mut declarations = Vec::new();
     let mut unverified = false;
     for dep in &record.deps {
         if dep.kind.as_deref() == Some("dev") {
@@ -379,48 +397,28 @@ fn registry_dependent_constraints<T: Transport>(
         match VersionReq::parse(&dep.req) {
             Ok(req) if Version::parse(locked_version).is_ok_and(|v| req.matches(&v)) => {
                 let mandatory = dep.target.is_none() && dep.optional != Some(true);
-                match requirements
-                    .iter_mut()
-                    .find(|(existing, _)| *existing == req)
-                {
-                    Some((_, existing_mandatory)) => *existing_mandatory |= mandatory,
-                    None => requirements.push((req, mandatory)),
-                }
+                declarations.push(NormalizedDeclaration { req, mandatory });
             }
             Ok(_) => {}
             Err(_) => unverified = true,
         }
     }
 
-    let locked_versions = eligible_locked_versions(dependent, all_packages, name, source);
+    let locked_versions = eligible_locked_versions(dependent, name, source);
+    let result = attribute_requirements(&declarations, locked_versions);
 
-    let mut constraints = Vec::new();
-    if is_ambiguous(locked_versions, requirements.len()) {
-        unverified = true;
-    } else if requirements.iter().any(|(_, mandatory)| *mandatory) {
-        // A mandatory declaration makes every matching mandatory requirement
-        // definite; matching uncertain declarations remain annotations.
-        for (req, mandatory) in requirements {
-            if mandatory {
-                constraints.push(Constraint {
-                    blocker_name: dependent.name.clone(),
-                    blocker_version: Some(dependent.version.clone()),
-                    req,
-                });
-            } else {
-                unverified = true;
-            }
-        }
-    } else if let [(req, _)] = requirements.as_slice() {
-        // One uncertain declaration is the unique explanation for the edge.
-        constraints.push(Constraint {
+    let constraints = result
+        .enforced
+        .into_iter()
+        .map(|req| Constraint {
             blocker_name: dependent.name.clone(),
             blocker_version: Some(dependent.version.clone()),
-            req: req.clone(),
-        });
-    }
+            req,
+        })
+        .collect();
+
     RegistryConstraints {
-        unverified: unverified || constraints.is_empty(),
+        unverified: unverified || result.unverified,
         constraints,
     }
 }
@@ -506,7 +504,6 @@ pub fn generate_suggestions<T: Transport>(
         let gathered = gather_constraints(
             client,
             &dependents_index,
-            all_packages,
             direct_requirements,
             working_dir,
             &violation.package,
@@ -577,10 +574,34 @@ pub fn generate_suggestions<T: Transport>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lockfile::PackageRef;
     use chrono::TimeZone;
 
     fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()
+    }
+
+    /// Calls production `generate_suggestions` with the fixed 30-day
+    /// minimum age, no prerelease admission, and `now()` that almost every
+    /// call site in this module shares, unwrapping the `Some` result.
+    fn suggestions<T: Transport>(
+        client: &mut CratesIoClient<T>,
+        violations: &[Violation],
+        packages: &[Package],
+        direct_requirements: &[DirectRequirement],
+        working_dir: &Path,
+    ) -> Vec<Outcome> {
+        generate_suggestions(
+            client,
+            violations,
+            packages,
+            direct_requirements,
+            working_dir,
+            30,
+            false,
+            now(),
+        )
+        .unwrap()
     }
 
     fn v(s: &str) -> Version {
@@ -906,18 +927,23 @@ mod tests {
             }
         }
 
+        const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+
+        /// A registry package. Its dependency edges default to the same
+        /// crates.io source as the loader resolves an unsourced edge to,
+        /// when — as here — the only matching name is a registry package.
         fn pkg(name: &str, version: &str, deps: &[(&str, &str)]) -> Package {
             Package {
                 name: name.to_string(),
                 version: version.to_string(),
                 is_registry: true,
-                source: Some("registry+https://github.com/rust-lang/crates.io-index".to_string()),
+                source: Some(CRATES_IO_SOURCE.to_string()),
                 dependencies: deps
                     .iter()
                     .map(|(n, v)| PackageRef {
                         name: n.to_string(),
                         version: v.to_string(),
-                        source: None,
+                        source: Some(CRATES_IO_SOURCE.to_string()),
                     })
                     .collect(),
             }
@@ -967,6 +993,31 @@ mod tests {
             }
         }
 
+        /// Builds a client and dependents index from `transport`/`packages`
+        /// and calls production `gather_constraints` with a fixed
+        /// `/work` working dir — the shared shape of most of this module's
+        /// `gather_constraints` call sites.
+        fn gather(
+            transport: FakeTransport,
+            packages: &[Package],
+            requirements: &[DirectRequirement],
+            name: &str,
+            locked_version: &str,
+            source: Option<&str>,
+        ) -> GatheredConstraints {
+            let mut client = fast_client(transport);
+            let index = build_dependents_index(packages);
+            gather_constraints(
+                &mut client,
+                &index,
+                requirements,
+                Path::new("/work"),
+                name,
+                locked_version,
+                source,
+            )
+        }
+
         #[test]
         fn aliased_registry_requirements_follow_the_locked_version() {
             let transport = FakeTransport::default();
@@ -978,12 +1029,11 @@ mod tests {
                 let gathered = gather_constraints(
                     &mut client,
                     &index,
-                    &packages,
                     &[],
                     Path::new("/work"),
                     "foo",
                     locked,
-                    None,
+                    Some(CRATES_IO_SOURCE),
                 );
                 assert_eq!(gathered.constraints.len(), 1);
                 assert!(gathered.unverified_dependents.is_empty());
@@ -1004,18 +1054,14 @@ mod tests {
                 "app",
                 r#"{"vers":"1.0.0","deps":[{"name":"foo","req":"^1.5"}]}"#,
             );
-            let mut client = fast_client(transport);
             let packages = vec![pkg("app", "1.0.0", &[("foo", "1.4.0")])];
-            let index = build_dependents_index(&packages);
-            let gathered = gather_constraints(
-                &mut client,
-                &index,
+            let gathered = gather(
+                transport,
                 &packages,
                 &[],
-                Path::new("/work"),
                 "foo",
                 "1.4.0",
-                None,
+                Some(CRATES_IO_SOURCE),
             );
             assert!(gathered.constraints.is_empty());
             assert_eq!(gathered.unverified_dependents, ["app"]);
@@ -1023,21 +1069,51 @@ mod tests {
 
         #[test]
         fn missing_non_registry_requirements_are_unverified() {
-            let mut client = fast_client(FakeTransport::default());
             let packages = vec![non_registry_pkg("git-app", "1.0.0", &[("foo", "1.5.0")])];
-            let index = build_dependents_index(&packages);
-            let gathered = gather_constraints(
-                &mut client,
-                &index,
+            let gathered = gather(
+                FakeTransport::default(),
                 &packages,
                 &[],
-                Path::new("/work"),
                 "foo",
                 "1.5.0",
-                None,
+                Some(CRATES_IO_SOURCE),
             );
             assert!(gathered.constraints.is_empty());
             assert_eq!(gathered.unverified_dependents, ["git-app"]);
+        }
+
+        #[test]
+        fn same_named_git_dependents_report_one_unverified_label() {
+            let packages = vec![
+                external_pkg("parent", "1.0.0", GIT_SOURCE, &[("foo", "1.9.0")]),
+                external_pkg("parent", "2.0.0", GIT_SOURCE, &[("foo", "1.9.0")]),
+            ];
+            let gathered = gather(
+                FakeTransport::default(),
+                &packages,
+                &[],
+                "foo",
+                "1.9.0",
+                Some(CRATES_IO_SOURCE),
+            );
+            assert_eq!(gathered.unverified_dependents, ["parent"]);
+        }
+
+        #[test]
+        fn distinct_git_dependents_are_each_reported() {
+            let packages = vec![
+                external_pkg("parent-a", "1.0.0", GIT_SOURCE, &[("foo", "1.9.0")]),
+                external_pkg("parent-b", "1.0.0", GIT_SOURCE, &[("foo", "1.9.0")]),
+            ];
+            let gathered = gather(
+                FakeTransport::default(),
+                &packages,
+                &[],
+                "foo",
+                "1.9.0",
+                Some(CRATES_IO_SOURCE),
+            );
+            assert_eq!(gathered.unverified_dependents, ["parent-a", "parent-b"]);
         }
 
         #[test]
@@ -1064,12 +1140,11 @@ mod tests {
                 let gathered = gather_constraints(
                     &mut client,
                     &index,
-                    &packages,
                     &requirements,
                     Path::new("/work"),
                     "foo",
                     locked,
-                    None,
+                    Some(CRATES_IO_SOURCE),
                 );
                 assert_eq!(gathered.constraints.len(), 1);
                 assert!(gathered.unverified_dependents.is_empty());
@@ -1089,20 +1164,16 @@ mod tests {
             // name and version, whose manifest requirement is loose enough
             // to permit the downgrade — the ordinary case this whole path
             // exists for.
-            let mut client = fast_client(FakeTransport::default());
             let packages = vec![non_registry_pkg("app", "1.0.0", &[("foo", "1.5.0")])];
             let requirements = vec![local_requirement("app", "1.0.0", "foo", "^1")];
-            let index = build_dependents_index(&packages);
 
-            let gathered = gather_constraints(
-                &mut client,
-                &index,
+            let gathered = gather(
+                FakeTransport::default(),
                 &packages,
                 &requirements,
-                Path::new("/work"),
                 "foo",
                 "1.5.0",
-                None,
+                Some(CRATES_IO_SOURCE),
             );
             assert_eq!(gathered.constraints.len(), 1);
             assert!(gathered.unverified_dependents.is_empty());
@@ -1120,20 +1191,16 @@ mod tests {
             // Positive control, the other direction: the same identity
             // match, but the requirement is restrictive enough to reject
             // the downgrade candidate.
-            let mut client = fast_client(FakeTransport::default());
             let packages = vec![non_registry_pkg("app", "1.0.0", &[("foo", "1.5.0")])];
             let requirements = vec![local_requirement("app", "1.0.0", "foo", "^1.5")];
-            let index = build_dependents_index(&packages);
 
-            let gathered = gather_constraints(
-                &mut client,
-                &index,
+            let gathered = gather(
+                FakeTransport::default(),
                 &packages,
                 &requirements,
-                Path::new("/work"),
                 "foo",
                 "1.5.0",
-                None,
+                Some(CRATES_IO_SOURCE),
             );
             assert_eq!(gathered.constraints.len(), 1);
             assert!(gathered.unverified_dependents.is_empty());
@@ -1152,23 +1219,19 @@ mod tests {
             // version. The local one's manifest permits the downgrade, but
             // that manifest was never the git dependent's own — it must not
             // be credited with verifying it.
-            let mut client = fast_client(FakeTransport::default());
             let packages = vec![
                 external_pkg("app", "1.0.0", GIT_SOURCE, &[("foo", "1.5.0")]),
                 non_registry_pkg("app", "1.0.0", &[]),
             ];
             let requirements = vec![local_requirement("app", "1.0.0", "foo", "^1")];
-            let index = build_dependents_index(&packages);
 
-            let gathered = gather_constraints(
-                &mut client,
-                &index,
+            let gathered = gather(
+                FakeTransport::default(),
                 &packages,
                 &requirements,
-                Path::new("/work"),
                 "foo",
                 "1.5.0",
-                None,
+                Some(CRATES_IO_SOURCE),
             );
             assert!(gathered.constraints.is_empty());
             assert_eq!(gathered.unverified_dependents, ["app"]);
@@ -1179,23 +1242,19 @@ mod tests {
         {
             // Same shape as the git case, but the external dependent is on
             // an alternate registry instead.
-            let mut client = fast_client(FakeTransport::default());
             let packages = vec![
                 external_pkg("app", "1.0.0", ALT_REGISTRY_SOURCE, &[("foo", "1.5.0")]),
                 non_registry_pkg("app", "1.0.0", &[]),
             ];
             let requirements = vec![local_requirement("app", "1.0.0", "foo", "^1")];
-            let index = build_dependents_index(&packages);
 
-            let gathered = gather_constraints(
-                &mut client,
-                &index,
+            let gathered = gather(
+                FakeTransport::default(),
                 &packages,
                 &requirements,
-                Path::new("/work"),
                 "foo",
                 "1.5.0",
-                None,
+                Some(CRATES_IO_SOURCE),
             );
             assert!(gathered.constraints.is_empty());
             assert_eq!(gathered.unverified_dependents, ["app"]);
@@ -1209,23 +1268,19 @@ mod tests {
             // matches the locked version but would block candidate 1.4.0;
             // even so, it must not block foo's downgrade for the git
             // dependent, whose own requirement can't be read at all.
-            let mut client = fast_client(FakeTransport::default());
             let packages = vec![
                 external_pkg("app", "1.0.0", GIT_SOURCE, &[("foo", "1.5.0")]),
                 non_registry_pkg("app", "1.0.0", &[]),
             ];
             let requirements = vec![local_requirement("app", "1.0.0", "foo", "^1.5")];
-            let index = build_dependents_index(&packages);
 
-            let gathered = gather_constraints(
-                &mut client,
-                &index,
+            let gathered = gather(
+                FakeTransport::default(),
                 &packages,
                 &requirements,
-                Path::new("/work"),
                 "foo",
                 "1.5.0",
-                None,
+                Some(CRATES_IO_SOURCE),
             );
             assert!(gathered.constraints.is_empty());
             assert_eq!(gathered.unverified_dependents, ["app"]);
@@ -1244,20 +1299,16 @@ mod tests {
             // "foo", but the actual lockfile dependent is a *different*
             // "app" — 1.0.0 — with an identical name. Declaring package
             // name alone must not be enough to apply this requirement.
-            let mut client = fast_client(FakeTransport::default());
             let packages = vec![non_registry_pkg("app", "1.0.0", &[("foo", "1.5.0")])];
             let requirements = vec![local_requirement("app", "2.0.0", "foo", "^1.5")];
-            let index = build_dependents_index(&packages);
 
-            let gathered = gather_constraints(
-                &mut client,
-                &index,
+            let gathered = gather(
+                FakeTransport::default(),
                 &packages,
                 &requirements,
-                Path::new("/work"),
                 "foo",
                 "1.5.0",
-                None,
+                Some(CRATES_IO_SOURCE),
             );
             assert!(gathered.constraints.is_empty());
             assert_eq!(gathered.unverified_dependents, ["app"]);
@@ -1273,17 +1324,8 @@ mod tests {
 
             let violations = vec![too_new("serde", "1.0.0"), too_old("syn")];
             let packages = vec![pkg("serde", "1.0.0", &[])];
-            let outcomes = generate_suggestions(
-                &mut client,
-                &violations,
-                &packages,
-                &[],
-                Path::new("/work"),
-                30,
-                false,
-                now(),
-            )
-            .unwrap();
+            let outcomes =
+                suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
 
             assert_eq!(outcomes.len(), 1);
         }
@@ -1300,17 +1342,8 @@ mod tests {
 
             let violations = vec![too_new("serde", "1.0.0"), too_new("syn", "1.1.0")];
             let packages = vec![pkg("serde", "1.0.0", &[]), pkg("syn", "1.1.0", &[])];
-            let outcomes = generate_suggestions(
-                &mut client,
-                &violations,
-                &packages,
-                &[],
-                Path::new("/work"),
-                30,
-                false,
-                now(),
-            )
-            .unwrap();
+            let outcomes =
+                suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
 
             assert_eq!(outcomes.len(), 1);
             assert!(matches!(&outcomes[0], Outcome::Suggest { package, .. } if package == "syn"));
@@ -1324,17 +1357,8 @@ mod tests {
 
             let violations = vec![too_new("serde", "1.0.0")];
             let packages = vec![pkg("serde", "1.0.0", &[])];
-            let outcomes = generate_suggestions(
-                &mut client,
-                &violations,
-                &packages,
-                &[],
-                Path::new("/work"),
-                30,
-                false,
-                now(),
-            )
-            .unwrap();
+            let outcomes =
+                suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
 
             assert!(matches!(outcomes[0], Outcome::NoCompliantVersion { .. }));
         }
@@ -1378,17 +1402,8 @@ mod tests {
                 pkg("serde", "1.5.0", &[]),
                 pkg("app", "1.0.0", &[("serde", "1.5.0")]),
             ];
-            let outcomes = generate_suggestions(
-                &mut client,
-                &violations,
-                &packages,
-                &[],
-                Path::new("/work"),
-                30,
-                false,
-                now(),
-            )
-            .unwrap();
+            let outcomes =
+                suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
 
             match &outcomes[0] {
                 Outcome::Blocked {
@@ -1457,17 +1472,8 @@ mod tests {
             ];
 
             let violations = vec![too_new("serde", "1.5.0")];
-            let outcomes = generate_suggestions(
-                &mut client,
-                &violations,
-                &packages,
-                &[],
-                Path::new("/work"),
-                30,
-                false,
-                now(),
-            )
-            .unwrap();
+            let outcomes =
+                suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
 
             assert!(
                 matches!(&outcomes[0], Outcome::Suggest { suggested_version, .. } if suggested_version == "1.4.0"),
@@ -1514,17 +1520,8 @@ mod tests {
             ];
 
             let violations = vec![too_new("serde", "1.5.0")];
-            let outcomes = generate_suggestions(
-                &mut client,
-                &violations,
-                &packages,
-                &[],
-                Path::new("/work"),
-                30,
-                false,
-                now(),
-            )
-            .unwrap();
+            let outcomes =
+                suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
 
             match &outcomes[0] {
                 Outcome::Suggest { package_spec, .. } => {
@@ -1545,17 +1542,8 @@ mod tests {
 
             let violations = vec![too_new("serde", "1.5.0")];
             let packages = vec![pkg("serde", "1.5.0", &[])];
-            let outcomes = generate_suggestions(
-                &mut client,
-                &violations,
-                &packages,
-                &[],
-                Path::new("/work"),
-                30,
-                false,
-                now(),
-            )
-            .unwrap();
+            let outcomes =
+                suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
 
             match &outcomes[0] {
                 Outcome::Suggest { package_spec, .. } => assert_eq!(package_spec, "serde"),
@@ -1618,17 +1606,8 @@ mod tests {
             ];
 
             let violations = vec![too_new("local-crate", "1.1.0")];
-            let outcomes = generate_suggestions(
-                &mut client,
-                &violations,
-                &packages,
-                &[],
-                Path::new("/work"),
-                30,
-                false,
-                now(),
-            )
-            .unwrap();
+            let outcomes =
+                suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
 
             assert!(
                 matches!(&outcomes[0], Outcome::Suggest { suggested_version, .. } if suggested_version == "1.0.0"),
@@ -1658,17 +1637,8 @@ mod tests {
                 pkg("serde", "1.5.0", &[]),
                 pkg("app", "1.0.0", &[("serde", "1.5.0")]),
             ];
-            let outcomes = generate_suggestions(
-                &mut client,
-                &violations,
-                &packages,
-                &[],
-                Path::new("/work"),
-                30,
-                false,
-                now(),
-            )
-            .unwrap();
+            let outcomes =
+                suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
 
             assert!(matches!(outcomes[0], Outcome::Suggest { .. }));
         }
@@ -1688,17 +1658,8 @@ mod tests {
                 pkg("serde", "1.5.0", &[]),
                 pkg("app", "1.0.0", &[("serde", "1.5.0")]),
             ];
-            let outcomes = generate_suggestions(
-                &mut client,
-                &violations,
-                &packages,
-                &[],
-                Path::new("/work"),
-                30,
-                false,
-                now(),
-            )
-            .unwrap();
+            let outcomes =
+                suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
 
             assert!(matches!(outcomes[0], Outcome::Blocked { .. }));
         }
@@ -1726,17 +1687,8 @@ mod tests {
                 pkg("serde", "1.5.0", &[]),
                 pkg("app", "1.0.0", &[("serde", "1.5.0")]),
             ];
-            let outcomes = generate_suggestions(
-                &mut client,
-                &violations,
-                &packages,
-                &[],
-                Path::new("/work"),
-                30,
-                false,
-                now(),
-            )
-            .unwrap();
+            let outcomes =
+                suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
 
             match &outcomes[0] {
                 Outcome::Suggest {
@@ -1772,17 +1724,8 @@ mod tests {
                 pkg("serde", "1.5.0", &[]),
                 pkg("app", "1.0.0", &[("serde", "1.5.0")]),
             ];
-            let outcomes = generate_suggestions(
-                &mut client,
-                &violations,
-                &packages,
-                &[],
-                Path::new("/work"),
-                30,
-                false,
-                now(),
-            )
-            .unwrap();
+            let outcomes =
+                suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
 
             match &outcomes[0] {
                 Outcome::Blocked {
@@ -1821,17 +1764,8 @@ mod tests {
                 pkg("serde", "1.5.0", &[]),
                 pkg("app", "1.0.0", &[("serde", "1.5.0")]),
             ];
-            let outcomes = generate_suggestions(
-                &mut client,
-                &violations,
-                &packages,
-                &[],
-                Path::new("/work"),
-                30,
-                false,
-                now(),
-            )
-            .unwrap();
+            let outcomes =
+                suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
 
             match &outcomes[0] {
                 Outcome::Blocked {
@@ -1871,17 +1805,8 @@ mod tests {
                 pkg("serde", "1.5.0", &[]),
                 pkg("app", "1.0.0", &[("serde", "1.5.0")]),
             ];
-            let outcomes = generate_suggestions(
-                &mut client,
-                &violations,
-                &packages,
-                &[],
-                Path::new("/work"),
-                30,
-                false,
-                now(),
-            )
-            .unwrap();
+            let outcomes =
+                suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
 
             match &outcomes[0] {
                 Outcome::Blocked {
@@ -1922,17 +1847,8 @@ mod tests {
                 pkg("serde", "1.5.0", &[]),
                 pkg("app", "1.0.0", &[("serde", "1.5.0")]),
             ];
-            let outcomes = generate_suggestions(
-                &mut client,
-                &violations,
-                &packages,
-                &[],
-                Path::new("/work"),
-                30,
-                false,
-                now(),
-            )
-            .unwrap();
+            let outcomes =
+                suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
 
             match &outcomes[0] {
                 Outcome::Blocked {
@@ -1971,7 +1887,6 @@ mod tests {
                 ("other source", true, &["^1", ">=1.8,<3"], false, true),
                 ("path sibling", false, &["^1", ">=1.8,<3"], false, true),
                 ("duplicate edge", false, &["^1", ">=1.8,<3"], false, true),
-                ("unknown source", false, &["^1"], true, false),
                 ("unreadable", false, &[], true, false),
             ];
             for registry in [true, false] {
@@ -2015,10 +1930,6 @@ mod tests {
                             version: "1.9.0".into(),
                             source: Some(source.clone()),
                         }),
-                        "unknown source" => {
-                            app.dependencies[0].source = None;
-                            packages.push(external_pkg("foo", "1.9.0", ALT_REGISTRY_SOURCE, &[]));
-                        }
                         "other parent" => {
                             packages.push(pkg("foo", "2.0.0", &[]));
                             packages.push(pkg("other", "1.0.0", &[("foo", "2.0.0")]));
@@ -2071,7 +1982,6 @@ mod tests {
                     let gathered = gather_constraints(
                         &mut client,
                         &index,
-                        &packages,
                         &requirements,
                         Path::new("/work"),
                         "foo",
@@ -2129,17 +2039,8 @@ mod tests {
                 pkg("serde", "1.5.0", &[]),
                 pkg("app", "1.0.0", &[("serde", "1.5.0")]),
             ];
-            let outcomes = generate_suggestions(
-                &mut client,
-                &violations,
-                &packages,
-                &[],
-                Path::new("/work"),
-                30,
-                false,
-                now(),
-            )
-            .unwrap();
+            let outcomes =
+                suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
 
             match &outcomes[0] {
                 Outcome::Suggest {
@@ -2161,17 +2062,8 @@ mod tests {
 
             let violations = vec![too_new("serde", "1.0.0"), too_new("serde", "2.0.0")];
             let packages = vec![pkg("serde", "1.0.0", &[]), pkg("serde", "2.0.0", &[])];
-            let outcomes = generate_suggestions(
-                &mut client,
-                &violations,
-                &packages,
-                &[],
-                Path::new("/work"),
-                30,
-                false,
-                now(),
-            )
-            .unwrap();
+            let outcomes =
+                suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
 
             assert_eq!(outcomes.len(), 2);
         }
@@ -2198,17 +2090,8 @@ mod tests {
                 pkg("target", "1.5.0", &[]),
                 pkg("y", "1.5.0", &[("target", "1.5.0")]),
             ];
-            let outcomes = generate_suggestions(
-                &mut client,
-                &violations,
-                &packages,
-                &[],
-                Path::new("/work"),
-                30,
-                false,
-                now(),
-            )
-            .unwrap();
+            let outcomes =
+                suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
 
             match &outcomes[0] {
                 Outcome::Blocked { blocker, .. } => {
@@ -2264,17 +2147,8 @@ mod tests {
                 pkg("foo", "1.5.0", &[]),
                 pkg("foo", "2.5.0", &[("target", "1.5.0")]),
             ];
-            let outcomes = generate_suggestions(
-                &mut client,
-                &violations,
-                &packages,
-                &[],
-                Path::new("/work"),
-                30,
-                false,
-                now(),
-            )
-            .unwrap();
+            let outcomes =
+                suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
 
             assert!(
                 matches!(&outcomes[1], Outcome::Suggest { package, locked_version, .. }
@@ -2331,17 +2205,13 @@ mod tests {
             ];
 
             let violations = vec![too_new("clap", "2.5.0")];
-            let outcomes = generate_suggestions(
+            let outcomes = suggestions(
                 &mut client,
                 &violations,
                 &packages,
                 &direct_requirements,
                 Path::new("/work"),
-                30,
-                false,
-                now(),
-            )
-            .unwrap();
+            );
 
             match &outcomes[0] {
                 Outcome::Suggest {
@@ -2457,17 +2327,13 @@ mod tests {
                 too_new("delta", "1.5.0"),
             ];
 
-            let outcomes = generate_suggestions(
+            let outcomes = suggestions(
                 &mut client,
                 &violations,
                 &packages,
                 &direct_requirements,
                 &dir,
-                30,
-                false,
-                now(),
-            )
-            .unwrap();
+            );
 
             assert_eq!(outcomes.len(), 4);
 
@@ -2846,17 +2712,13 @@ foo_priv = { package = "foo", version = "=1.9.0", registry = "priv" }
 
             let violations = vec![too_new("foo", "1.9.0")];
             let packages = packages_with_dual_source_foo();
-            let outcomes = generate_suggestions(
+            let outcomes = suggestions(
                 &mut client,
                 &violations,
                 &packages,
                 &direct_requirements,
                 dir.path(),
-                30,
-                false,
-                now(),
-            )
-            .unwrap();
+            );
 
             match &outcomes[0] {
                 Outcome::Suggest {
@@ -2915,17 +2777,13 @@ foo_priv = { package = "foo", version = "^1.0", registry = "priv" }
 
             let violations = vec![too_new("foo", "1.9.0")];
             let packages = packages_with_dual_source_foo();
-            let outcomes = generate_suggestions(
+            let outcomes = suggestions(
                 &mut client,
                 &violations,
                 &packages,
                 &direct_requirements,
                 dir.path(),
-                30,
-                false,
-                now(),
-            )
-            .unwrap();
+            );
 
             match &outcomes[0] {
                 Outcome::Blocked {
@@ -2978,17 +2836,13 @@ foo_priv = { package = "foo", version = "^1.0", registry = "priv" }
 
             let violations = vec![too_new("foo", "1.9.0")];
             let packages = packages_with_dual_source_foo();
-            let outcomes = generate_suggestions(
+            let outcomes = suggestions(
                 &mut client,
                 &violations,
                 &packages,
                 &direct_requirements,
                 dir.path(),
-                30,
-                false,
-                now(),
-            )
-            .unwrap();
+            );
 
             match &outcomes[0] {
                 Outcome::Blocked {
@@ -3067,17 +2921,13 @@ foo_pinned = { package = "foo", version = "=1.9.0" }
                     }],
                 },
             ];
-            let outcomes = generate_suggestions(
+            let outcomes = suggestions(
                 &mut client,
                 &violations,
                 &packages,
                 &direct_requirements,
                 dir.path(),
-                30,
-                false,
-                now(),
-            )
-            .unwrap();
+            );
 
             match &outcomes[0] {
                 Outcome::Blocked {
@@ -3174,17 +3024,13 @@ foo = "=1.9.0"
                     }],
                 },
             ];
-            let outcomes = generate_suggestions(
+            let outcomes = suggestions(
                 &mut client,
                 &violations,
                 &packages,
                 &direct_requirements,
                 dir.path(),
-                30,
-                false,
-                now(),
-            )
-            .unwrap();
+            );
 
             match &outcomes[0] {
                 Outcome::Suggest {
@@ -3330,17 +3176,13 @@ foo = "^1.0"
                     }],
                 },
             ];
-            let outcomes = generate_suggestions(
+            let outcomes = suggestions(
                 &mut client,
                 &violations,
                 &packages,
                 &direct_requirements,
                 dir.path(),
-                30,
-                false,
-                now(),
-            )
-            .unwrap();
+            );
 
             match &outcomes[0] {
                 Outcome::Suggest {
@@ -3423,17 +3265,13 @@ foo = "^1.0"
                     }],
                 },
             ];
-            let outcomes = generate_suggestions(
+            let outcomes = suggestions(
                 &mut client,
                 &violations,
                 &packages,
                 &direct_requirements,
                 dir.path(),
-                30,
-                false,
-                now(),
-            )
-            .unwrap();
+            );
 
             match &outcomes[0] {
                 Outcome::Suggest {
@@ -3514,17 +3352,13 @@ foo = "^1.8.5"
                     }],
                 },
             ];
-            let outcomes = generate_suggestions(
+            let outcomes = suggestions(
                 &mut client,
                 &violations,
                 &packages,
                 &direct_requirements,
                 dir.path(),
-                30,
-                false,
-                now(),
-            )
-            .unwrap();
+            );
 
             match &outcomes[0] {
                 Outcome::Suggest {
@@ -3598,17 +3432,13 @@ foo = "^1.0"
                     dependencies: vec![],
                 },
             ];
-            let outcomes = generate_suggestions(
+            let outcomes = suggestions(
                 &mut client,
                 &violations,
                 &packages,
                 &direct_requirements,
                 dir.path(),
-                30,
-                false,
-                now(),
-            )
-            .unwrap();
+            );
 
             match &outcomes[0] {
                 Outcome::Suggest {
@@ -3684,17 +3514,13 @@ foo = "^1.0"
                     dependencies: vec![],
                 },
             ];
-            let outcomes = generate_suggestions(
+            let outcomes = suggestions(
                 &mut client,
                 &violations,
                 &packages,
                 &direct_requirements,
                 dir.path(),
-                30,
-                false,
-                now(),
-            )
-            .unwrap();
+            );
 
             match &outcomes[0] {
                 Outcome::Suggest {

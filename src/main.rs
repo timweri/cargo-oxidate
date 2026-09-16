@@ -48,6 +48,10 @@ struct Cli {
     suggest_fix: bool,
 
     /// Consider prerelease versions as suggestion candidates (requires --suggest-fix)
+    ///
+    /// This only admits prerelease versions as candidates; it does not change
+    /// requirement matching. Ordinary SemVer requirements (e.g. `^1.2`) still
+    /// generally do not match prereleases, so most will still be rejected.
     #[arg(long, requires = "suggest_fix")]
     include_prerelease: bool,
 

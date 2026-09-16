@@ -28,7 +28,7 @@ cargo-oxidate Cargo.lock --min-age-days 14 --max-age-days 730
 | `--exclude-missing` | Don't flag packages with unknown publish dates |
 | `--timeout N` | HTTP timeout in seconds (default: 10) |
 | `--suggest-fix` | For "too new" violations, suggest `cargo update` commands to downgrade |
-| `--include-prerelease` | Consider prerelease versions as suggestion candidates (requires `--suggest-fix`) |
+| `--include-prerelease` | Consider prerelease versions as suggestion candidates (requires `--suggest-fix`); ordinary SemVer requirements (e.g. `^1.2`) still generally don't match prereleases, so most will still be rejected |
 | `--cache-path PATH` | Enable response caching at PATH (or set `CARGO_OXIDATE_CACHE_PATH`) |
 | `--cache-max-age-hours N` | Max age for cached version listings (default: 24) |
 

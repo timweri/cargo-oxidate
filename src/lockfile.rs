@@ -166,6 +166,17 @@ version = "{version}"
         )
     }
 
+    fn alt_registry_entry(name: &str, version: &str) -> String {
+        format!(
+            r#"
+[[package]]
+name = "{name}"
+version = "{version}"
+source = "registry+https://example.com/index"
+"#
+        )
+    }
+
     fn write_lockfile(dir: &Path, contents: &str) -> std::path::PathBuf {
         let path = dir.join("Cargo.lock");
         std::fs::write(&path, format!("{LOCKFILE_HEADER}{contents}")).unwrap();
@@ -263,6 +274,85 @@ version = "{version}"
         let a = packages.iter().find(|p| p.name == "a").unwrap();
         let b = packages.iter().find(|p| p.name == "b").unwrap();
         assert_eq!(a.dependencies[0].source, b.source);
+    }
+
+    #[test]
+    fn dependency_edges_carry_the_selected_packages_resolved_source() {
+        // Proves the invariant `resolve_dependency_sources` used to
+        // re-derive: `cargo_lock` already resolves each dependency edge to
+        // its selected package's source while parsing. A root package
+        // depends, without source qualification, on a crates.io package, a
+        // git package, an alternate-registry package, and a path package,
+        // plus one dangling versioned edge to a package absent from the
+        // lockfile.
+        let dir = tempdir().unwrap();
+        let contents = format!(
+            "{}{}{}{}{}",
+            registry_entry_with_deps(
+                "root",
+                "1.0.0",
+                &[
+                    "crates-dep 1.0.0",
+                    "git-dep 1.0.0",
+                    "alt-dep 1.0.0",
+                    "path-dep 1.0.0",
+                    "missing-dep 9.9.9",
+                ],
+            ),
+            registry_entry("crates-dep", "1.0.0"),
+            git_entry("git-dep", "1.0.0"),
+            alt_registry_entry("alt-dep", "1.0.0"),
+            path_entry("path-dep", "1.0.0"),
+        );
+        write_lockfile(dir.path(), &contents);
+
+        let packages = load(Path::new("Cargo.lock"), dir.path()).unwrap();
+        let root = packages.iter().find(|p| p.name == "root").unwrap();
+        let target = |name: &str| packages.iter().find(|p| p.name == name).unwrap();
+        let edge = |name: &str| root.dependencies.iter().find(|d| d.name == name).unwrap();
+
+        assert_eq!(edge("crates-dep").source, target("crates-dep").source);
+        // A git edge's resolved source drops the commit hash that the
+        // target package's own source keeps (`normalize_git_source_for_dependency`),
+        // so it's still `Some`, but not identical to the target's source.
+        assert!(edge("git-dep").source.is_some());
+        assert_eq!(edge("alt-dep").source, target("alt-dep").source);
+        assert_eq!(edge("path-dep").source, target("path-dep").source);
+        assert_eq!(edge("path-dep").source, None);
+        assert_eq!(edge("missing-dep").source, None);
+    }
+
+    #[test]
+    fn source_qualified_edge_keeps_its_declared_source_over_a_same_identity_path_package() {
+        // A path package and a crates.io package share a name and version.
+        // The dependent's edge to it is source-qualified, so it must keep
+        // that declared source rather than resolving to the path package.
+        let dir = tempdir().unwrap();
+        let contents = format!(
+            "{}{}{}",
+            registry_entry_with_deps(
+                "root",
+                "1.0.0",
+                &["shared 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)"],
+            ),
+            registry_entry("shared", "1.0.0"),
+            path_entry("shared", "1.0.0"),
+        );
+        write_lockfile(dir.path(), &contents);
+
+        let packages = load(Path::new("Cargo.lock"), dir.path()).unwrap();
+        let root = packages.iter().find(|p| p.name == "root").unwrap();
+        let edge = root
+            .dependencies
+            .iter()
+            .find(|d| d.name == "shared")
+            .unwrap();
+        let registry_shared = packages
+            .iter()
+            .find(|p| p.name == "shared" && p.source.is_some())
+            .unwrap();
+
+        assert_eq!(edge.source, registry_shared.source);
     }
 
     #[test]
