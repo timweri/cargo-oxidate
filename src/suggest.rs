@@ -208,10 +208,48 @@ fn resolve_dependency_sources<'a>(
     }
 }
 
+/// Multiple versions are ambiguous only when their matching requirements differ.
+fn is_ambiguous(locked_versions: usize, distinct_requirements: usize) -> bool {
+    locked_versions > 1 && distinct_requirements > 1
+}
+
+/// Count versions within the eligible source, ignoring duplicate edges.
+fn eligible_locked_versions<'a>(
+    dependent: &'a Package,
+    all_packages: &'a [Package],
+    name: &str,
+    source: Option<&str>,
+) -> usize {
+    dependent
+        .dependencies
+        .iter()
+        .filter(|d| d.name == name)
+        .filter(|d| resolve_dependency_sources(d, all_packages).contains(&source))
+        .map(|d| d.version.as_str())
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+/// An unresolved source cannot supply verified requirements.
+fn edge_source_is_ambiguous(
+    dependent: &Package,
+    all_packages: &[Package],
+    name: &str,
+    locked_version: &str,
+) -> bool {
+    dependent
+        .dependencies
+        .iter()
+        .filter(|d| d.name == name && d.version == locked_version)
+        .any(|d| resolve_dependency_sources(d, all_packages).len() > 1)
+}
+
 /// Gathers requirements from registry dependents and local manifests.
+#[allow(clippy::too_many_arguments)]
 fn gather_constraints<T: Transport>(
     client: &mut CratesIoClient<T>,
     dependents_index: &DependentsIndex,
+    all_packages: &[Package],
     direct_requirements: &[DirectRequirement],
     working_dir: &Path,
     name: &str,
@@ -228,18 +266,27 @@ fn gather_constraints<T: Transport>(
         .copied();
 
     for dependent in dependents {
-        let unverified = if dependent.is_registry {
-            let result = registry_dependent_constraints(client, dependent, name, locked_version);
+        let unverified = if edge_source_is_ambiguous(dependent, all_packages, name, locked_version)
+        {
+            true
+        } else if dependent.is_registry {
+            let result = registry_dependent_constraints(
+                client,
+                dependent,
+                all_packages,
+                name,
+                locked_version,
+                source,
+            );
             let unverified = result.unverified;
             constraints.extend(result.constraints);
             unverified
         } else if dependent.source.is_none() {
             // Only an unsourced non-registry dependent is local; other
             // sources cannot be verified through a workspace manifest.
-            let constraint_count = constraints.len();
             // Match the declaring package's name and version, and only its
             // crates.io declarations, to avoid unrelated local requirements.
-            for req in direct_requirements
+            let matching: Vec<&DirectRequirement> = direct_requirements
                 .iter()
                 .filter(|r| r.crate_name == name && r.declaring_package == dependent.name)
                 .filter(|r| r.declaring_version.as_deref() == Some(dependent.version.as_str()))
@@ -247,14 +294,29 @@ fn gather_constraints<T: Transport>(
                 .filter(|r| {
                     Version::parse(locked_version).is_ok_and(|version| r.req.matches(&version))
                 })
-            {
-                constraints.push(Constraint {
-                    blocker_name: manifest_label(&req.manifest, working_dir),
-                    blocker_version: None,
-                    req: req.req.clone(),
-                });
+                .collect();
+            // Aliases with equal parsed requirements count once.
+            let mut distinct: Vec<&VersionReq> = Vec::new();
+            for req in matching.iter().map(|r| &r.req) {
+                if !distinct.contains(&req) {
+                    distinct.push(req);
+                }
             }
-            constraints.len() == constraint_count
+
+            let locked_versions = eligible_locked_versions(dependent, all_packages, name, source);
+
+            if matching.is_empty() || is_ambiguous(locked_versions, distinct.len()) {
+                true
+            } else {
+                for req in &matching {
+                    constraints.push(Constraint {
+                        blocker_name: manifest_label(&req.manifest, working_dir),
+                        blocker_version: None,
+                        req: req.req.clone(),
+                    });
+                }
+                false
+            }
         } else {
             // Git and alternate-registry requirements cannot be read here.
             true
@@ -291,8 +353,10 @@ impl RegistryConstraints {
 fn registry_dependent_constraints<T: Transport>(
     client: &mut CratesIoClient<T>,
     dependent: &Package,
+    all_packages: &[Package],
     name: &str,
     locked_version: &str,
+    source: Option<&str>,
 ) -> RegistryConstraints {
     let Ok(records) = client.fetch_index_record(&dependent.name) else {
         return RegistryConstraints::unreadable();
@@ -301,8 +365,7 @@ fn registry_dependent_constraints<T: Transport>(
         return RegistryConstraints::unreadable();
     };
 
-    // Every matching declaration, alongside whether it alone guarantees the
-    // requirement is active: unconditional (no `target`) and non-optional.
+    // Deduplicate requirements, retaining whether any declaration is mandatory.
     let mut requirements: Vec<(VersionReq, bool)> = Vec::new();
     let mut unverified = false;
     for dep in &record.deps {
@@ -329,8 +392,12 @@ fn registry_dependent_constraints<T: Transport>(
         }
     }
 
+    let locked_versions = eligible_locked_versions(dependent, all_packages, name, source);
+
     let mut constraints = Vec::new();
-    if requirements.iter().any(|(_, mandatory)| *mandatory) {
+    if is_ambiguous(locked_versions, requirements.len()) {
+        unverified = true;
+    } else if requirements.iter().any(|(_, mandatory)| *mandatory) {
         // A mandatory declaration makes every matching mandatory requirement
         // definite; matching uncertain declarations remain annotations.
         for (req, mandatory) in requirements {
@@ -439,6 +506,7 @@ pub fn generate_suggestions<T: Transport>(
         let gathered = gather_constraints(
             client,
             &dependents_index,
+            all_packages,
             direct_requirements,
             working_dir,
             &violation.package,
@@ -910,6 +978,7 @@ mod tests {
                 let gathered = gather_constraints(
                     &mut client,
                     &index,
+                    &packages,
                     &[],
                     Path::new("/work"),
                     "foo",
@@ -941,6 +1010,7 @@ mod tests {
             let gathered = gather_constraints(
                 &mut client,
                 &index,
+                &packages,
                 &[],
                 Path::new("/work"),
                 "foo",
@@ -959,6 +1029,7 @@ mod tests {
             let gathered = gather_constraints(
                 &mut client,
                 &index,
+                &packages,
                 &[],
                 Path::new("/work"),
                 "foo",
@@ -993,6 +1064,7 @@ mod tests {
                 let gathered = gather_constraints(
                     &mut client,
                     &index,
+                    &packages,
                     &requirements,
                     Path::new("/work"),
                     "foo",
@@ -1025,6 +1097,7 @@ mod tests {
             let gathered = gather_constraints(
                 &mut client,
                 &index,
+                &packages,
                 &requirements,
                 Path::new("/work"),
                 "foo",
@@ -1055,6 +1128,7 @@ mod tests {
             let gathered = gather_constraints(
                 &mut client,
                 &index,
+                &packages,
                 &requirements,
                 Path::new("/work"),
                 "foo",
@@ -1089,6 +1163,7 @@ mod tests {
             let gathered = gather_constraints(
                 &mut client,
                 &index,
+                &packages,
                 &requirements,
                 Path::new("/work"),
                 "foo",
@@ -1115,6 +1190,7 @@ mod tests {
             let gathered = gather_constraints(
                 &mut client,
                 &index,
+                &packages,
                 &requirements,
                 Path::new("/work"),
                 "foo",
@@ -1144,6 +1220,7 @@ mod tests {
             let gathered = gather_constraints(
                 &mut client,
                 &index,
+                &packages,
                 &requirements,
                 Path::new("/work"),
                 "foo",
@@ -1175,6 +1252,7 @@ mod tests {
             let gathered = gather_constraints(
                 &mut client,
                 &index,
+                &packages,
                 &requirements,
                 Path::new("/work"),
                 "foo",
@@ -1869,6 +1947,170 @@ mod tests {
                 _ => panic!(
                     "expected serde to be Blocked by app's requirement, not merely unverified"
                 ),
+            }
+        }
+
+        #[test]
+        fn requirement_attribution_acceptance_cases() {
+            // name, second version, requirements, unverified, blocks 1.7
+            let cases: &[(&str, bool, &[&str], bool, bool)] = &[
+                ("overlap", true, &["^1", ">=1.8,<3"], true, false),
+                ("disjoint", true, &["^1", "^2"], false, false),
+                (
+                    "identical aliases",
+                    true,
+                    &[">=1.8,<3", ">=1.8, <3"],
+                    false,
+                    true,
+                ),
+                ("single version", false, &["^1", ">=1.8,<2"], false, true),
+                ("optional", true, &["^1", ">=1.8,<3"], true, false),
+                ("target", true, &["^1", ">=1.8,<3"], true, false),
+                ("other blocker", true, &["^1", ">=1.8,<3"], true, true),
+                ("other parent", false, &["^1", ">=1.8,<3"], false, true),
+                ("other source", true, &["^1", ">=1.8,<3"], false, true),
+                ("path sibling", false, &["^1", ">=1.8,<3"], false, true),
+                ("duplicate edge", false, &["^1", ">=1.8,<3"], false, true),
+                ("unknown source", false, &["^1"], true, false),
+                ("unreadable", false, &[], true, false),
+            ];
+            for registry in [true, false] {
+                for &(case, second_version, reqs, unverified, blocked) in cases {
+                    if !registry && matches!(case, "optional" | "target") {
+                        continue;
+                    }
+                    let transport = FakeTransport::default();
+                    let mut requirements = Vec::new();
+                    let mut app = if registry {
+                        pkg("app", "1.0.0", &[("foo", "1.9.0")])
+                    } else {
+                        non_registry_pkg("app", "1.0.0", &[("foo", "1.9.0")])
+                    };
+                    let source = pkg("foo", "1.9.0", &[]).source.unwrap();
+                    app.dependencies[0].source = Some(source.clone());
+                    let mut packages = vec![pkg("foo", "1.9.0", &[])];
+                    if second_version {
+                        let mut sibling = pkg("foo", "2.0.0", &[]);
+                        if case == "other source" {
+                            sibling = external_pkg("foo", "2.0.0", ALT_REGISTRY_SOURCE, &[]);
+                        }
+                        app.dependencies.push(PackageRef {
+                            name: "foo".into(),
+                            version: sibling.version.clone(),
+                            source: sibling.source.clone(),
+                        });
+                        packages.push(sibling);
+                    }
+                    match case {
+                        "path sibling" => {
+                            packages.push(non_registry_pkg("foo", "1.9.0", &[]));
+                            app.dependencies.push(PackageRef {
+                                name: "foo".into(),
+                                version: "1.9.0".into(),
+                                source: None,
+                            });
+                        }
+                        "duplicate edge" => app.dependencies.push(PackageRef {
+                            name: "foo".into(),
+                            version: "1.9.0".into(),
+                            source: Some(source.clone()),
+                        }),
+                        "unknown source" => {
+                            app.dependencies[0].source = None;
+                            packages.push(external_pkg("foo", "1.9.0", ALT_REGISTRY_SOURCE, &[]));
+                        }
+                        "other parent" => {
+                            packages.push(pkg("foo", "2.0.0", &[]));
+                            packages.push(pkg("other", "1.0.0", &[("foo", "2.0.0")]));
+                        }
+                        "other blocker" => {
+                            if registry {
+                                packages.push(pkg("other", "1.0.0", &[("foo", "1.9.0")]));
+                                transport.index_ok(
+                                    "other",
+                                    r#"{"vers":"1.0.0","deps":[{"name":"foo","req":">=1.8"}]}"#,
+                                );
+                            } else {
+                                packages.push(non_registry_pkg(
+                                    "other",
+                                    "1.0.0",
+                                    &[("foo", "1.9.0")],
+                                ));
+                                requirements
+                                    .push(local_requirement("other", "1.0.0", "foo", ">=1.8"));
+                            }
+                        }
+                        _ => {}
+                    }
+                    packages.push(app);
+                    if registry && case != "unreadable" {
+                        let deps: Vec<_> = reqs.iter().enumerate().map(|(i, req)| {
+                            serde_json::json!({
+                                "name": format!("alias_{i}"), "package": "foo", "req": req,
+                                "optional": case == "optional" && i == 0,
+                                "target": if case == "target" && i == 0 { Some("cfg(unix)") } else { None },
+                            })
+                        }).collect();
+                        transport.index_ok(
+                            "app",
+                            &serde_json::json!({
+                                "vers": "1.0.0", "deps": deps,
+                            })
+                            .to_string(),
+                        );
+                    } else if registry {
+                        transport.index_error("app");
+                    } else {
+                        requirements.extend(
+                            reqs.iter()
+                                .map(|req| local_requirement("app", "1.0.0", "foo", req)),
+                        );
+                    }
+                    let mut client = fast_client(transport);
+                    let index = build_dependents_index(&packages);
+                    let gathered = gather_constraints(
+                        &mut client,
+                        &index,
+                        &packages,
+                        &requirements,
+                        Path::new("/work"),
+                        "foo",
+                        "1.9.0",
+                        Some(&source),
+                    );
+                    let expected_unverified = if unverified { vec!["app"] } else { vec![] };
+                    assert_eq!(
+                        gathered.unverified_dependents, expected_unverified,
+                        "{case}, registry={registry}"
+                    );
+                    if case == "disjoint" {
+                        assert!(
+                            gathered
+                                .constraints
+                                .iter()
+                                .any(|c| !c.req.matches(&v("0.9.0")))
+                        );
+                    }
+                    let result = walk(vec![(v("1.7.0"), 80)], gathered.constraints);
+                    assert_eq!(
+                        matches!(result, WalkResult::Blocked { .. }),
+                        blocked,
+                        "{case}, registry={registry}"
+                    );
+                    if case == "other blocker" {
+                        let WalkResult::Blocked { blocker, .. } = result else {
+                            unreachable!()
+                        };
+                        assert_eq!(
+                            blocker.blocker_name,
+                            if registry { "other" } else { "Cargo.toml" }
+                        );
+                    } else if !blocked {
+                        assert!(
+                            matches!(result, WalkResult::Suggest(version, 80) if version == v("1.7.0"))
+                        );
+                    }
+                }
             }
         }
 
