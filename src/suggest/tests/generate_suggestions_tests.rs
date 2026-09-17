@@ -597,6 +597,72 @@ fn transitive_dependent_requirement_blocks_the_newest_candidate() {
 }
 
 #[test]
+fn suggests_the_semver_highest_compliant_version_over_a_later_backport() {
+    // 1.4.0 outranks 1.3.9 by semver even though 1.3.9 was published
+    // more recently (40 days ago vs. 100), so it must be the suggestion.
+    let transport = FakeTransport::default();
+    transport.ok(
+        "serde",
+        &versions_body(&[("1.4.0", 100, false), ("1.3.9", 40, false)], now()),
+    );
+    let mut client = fast_client(transport);
+
+    let violations = vec![too_new("serde", "1.5.0")];
+    let packages = vec![pkg("serde", "1.5.0", &[])];
+    let outcomes = suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
+
+    match &outcomes[0] {
+        Outcome::Suggest {
+            suggested_version,
+            suggested_age_days,
+            ..
+        } => {
+            assert_eq!(suggested_version, "1.4.0");
+            assert_eq!(*suggested_age_days, 100);
+        }
+        _ => panic!("expected Suggest"),
+    }
+}
+
+#[test]
+fn blocked_names_the_semver_highest_compliant_version_as_newest_compliant() {
+    // 1.4.0 and 1.3.9 both satisfy age, but the manifest's `^1.4.1`
+    // requirement rejects both. "newest_compliant" in the Blocked
+    // outcome must be the semver-highest one, 1.4.0, not the more
+    // recently published 1.3.9.
+    let transport = FakeTransport::default();
+    transport.ok(
+        "serde",
+        &versions_body(&[("1.4.0", 100, false), ("1.3.9", 40, false)], now()),
+    );
+    transport.index_ok(
+        "app",
+        r#"{"vers":"1.0.0","deps":[{"name":"serde","req":"^1.4.1"}]}"#,
+    );
+    let mut client = fast_client(transport);
+
+    let violations = vec![too_new("serde", "1.5.0")];
+    let packages = vec![
+        pkg("serde", "1.5.0", &[]),
+        pkg("app", "1.0.0", &[("serde", "1.5.0")]),
+    ];
+    let outcomes = suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
+
+    match &outcomes[0] {
+        Outcome::Blocked {
+            newest_compliant,
+            blocker,
+            ..
+        } => {
+            assert_eq!(newest_compliant, "1.4.0");
+            assert_eq!(blocker.name, "app");
+            assert_eq!(blocker.req, "^1.4.1");
+        }
+        _ => panic!("expected Blocked"),
+    }
+}
+
+#[test]
 fn same_name_version_collision_across_sources_does_not_leak_dependents() {
     // Two packages both named "serde" locked at 1.5.0: one from
     // crates.io, one from git. "consumer" depends on the git one

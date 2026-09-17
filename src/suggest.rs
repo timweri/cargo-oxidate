@@ -60,7 +60,8 @@ fn same_compatible_zone(a: &Version, b: &Version) -> bool {
 }
 
 /// Keeps old-enough, non-yanked compatible versions older than `locked`,
-/// newest first. Excludes prereleases unless allowed or `locked` is one.
+/// ordered by semver precedence descending (publish date breaks ties).
+/// Excludes prereleases unless allowed or `locked` is one.
 fn filter_candidates(
     versions: &[CrateVersionInfo],
     locked: &Version,
@@ -96,7 +97,11 @@ fn filter_candidates(
         })
         .collect();
 
-    candidates.sort_by_key(|(_, created_at, _)| std::cmp::Reverse(*created_at));
+    candidates.sort_by(|(a_ver, a_created, _), (b_ver, b_created, _)| {
+        b_ver
+            .cmp_precedence(a_ver)
+            .then_with(|| b_created.cmp(a_created))
+    });
     candidates.into_iter().map(|(v, _, age)| (v, age)).collect()
 }
 

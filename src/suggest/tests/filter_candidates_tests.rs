@@ -12,12 +12,12 @@ fn excludes_too_new_yanked_and_out_of_range() {
 
     let result = filter_candidates(&versions, &v("1.5.0"), 30, now(), false);
     let nums: Vec<String> = result.iter().map(|(ver, _)| ver.to_string()).collect();
-    // Newest-first by publish date among the two survivors.
+    // Newest-first by semver precedence among the two survivors.
     assert_eq!(nums, vec!["1.2.0".to_string(), "1.0.0".to_string()]);
 }
 
 #[test]
-fn sorted_newest_first_by_publish_date() {
+fn sorted_by_semver_precedence_descending() {
     let versions = vec![
         make_version("1.0.0", 100, false),
         make_version("1.1.0", 200, false),
@@ -26,7 +26,36 @@ fn sorted_newest_first_by_publish_date() {
 
     let result = filter_candidates(&versions, &v("1.5.0"), 30, now(), false);
     let nums: Vec<String> = result.iter().map(|(ver, _)| ver.to_string()).collect();
-    assert_eq!(nums, vec!["1.2.0", "1.0.0", "1.1.0"]);
+    assert_eq!(nums, vec!["1.2.0", "1.1.0", "1.0.0"]);
+}
+
+#[test]
+fn higher_semver_precedence_wins_over_more_recent_publish_date() {
+    // 1.4.0 outranks 1.3.9 by semver even though 1.3.9 was published
+    // more recently: ordering by precedence must win over publish date.
+    let versions = vec![
+        make_version("1.4.0", 100, false),
+        make_version("1.3.9", 40, false),
+    ];
+
+    let result = filter_candidates(&versions, &v("1.5.0"), 30, now(), false);
+    let nums: Vec<String> = result.iter().map(|(ver, _)| ver.to_string()).collect();
+    assert_eq!(nums, vec!["1.4.0", "1.3.9"]);
+}
+
+#[test]
+fn publish_date_breaks_ties_in_equal_semver_precedence() {
+    // Build metadata doesn't affect precedence, so these two versions tie
+    // under `cmp_precedence`; publish date must decide the order, with
+    // the more recently published one (build.2, 50 days ago) first.
+    let versions = vec![
+        make_version("1.3.0+build.1", 100, false),
+        make_version("1.3.0+build.2", 50, false),
+    ];
+
+    let result = filter_candidates(&versions, &v("1.5.0"), 30, now(), false);
+    let nums: Vec<String> = result.iter().map(|(ver, _)| ver.to_string()).collect();
+    assert_eq!(nums, vec!["1.3.0+build.2", "1.3.0+build.1"]);
 }
 
 #[test]
