@@ -50,7 +50,7 @@ pub fn load_direct_requirements(lockfile_dir: &Path) -> (Vec<DirectRequirement>,
     }
 
     let mut seen = HashSet::new();
-    seen.insert(canonical_or(&root_path));
+    seen.insert(canonical_or(lockfile_dir));
 
     // `bool` marks whether the manifest is a workspace member (root or a
     // `workspace.members` entry) as opposed to a followed path dependency.
@@ -682,6 +682,50 @@ foo = "=1.9.0"
         let (reqs, warnings) = load_direct_requirements(&dir.path().join("ws"));
         assert!(warnings.is_empty());
         assert!(!reqs.iter().any(|r| r.crate_name == "foo"));
+    }
+
+    #[test]
+    fn member_path_dependency_on_root_does_not_duplicate_root_requirements() {
+        // "member" declares a path dependency back to the workspace root
+        // (e.g. `app = { path = ".." }`). The root is already collected
+        // as a workspace member, so following that path dependency must not
+        // collect it a second time.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            r#"
+[workspace]
+members = ["member"]
+
+[package]
+name = "root"
+version = "0.1.0"
+
+[dependencies]
+serde = "1.0"
+"#,
+        );
+        write(
+            dir.path(),
+            "member/Cargo.toml",
+            r#"
+[package]
+name = "member"
+version = "0.1.0"
+
+[dependencies]
+app = { path = ".." }
+"#,
+        );
+
+        let (reqs, warnings) = load_direct_requirements(dir.path());
+        assert!(warnings.is_empty());
+        assert_eq!(
+            reqs.iter().filter(|r| r.crate_name == "serde").count(),
+            1,
+            "the root manifest's requirements must be collected exactly once"
+        );
     }
 
     #[test]
