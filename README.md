@@ -42,9 +42,10 @@ dependency requirement it can verify from your lockfile and workspace manifests,
 zone (same major, or same minor when major is `0`, or same patch when both are `0`) — it does not
 consider every eligible version across a major boundary.
 
-Requirement verification differs by source. For registry (crates.io) dependents, a requirement
-behind an optional dependency or target that can't be confirmed active is annotated as unverified
-rather than enforced, and Cargo may still reject that suggestion. For local/workspace manifests,
+Requirement verification differs by source. For registry (crates.io) dependents, only a
+requirement behind an optional dependency that can't be confirmed active is annotated as
+unverified rather than enforced; target-specific requirements are always enforced, and Cargo may
+still reject that suggestion. For local/workspace manifests,
 activation isn't tracked at all, so every declared requirement — including optional and
 target-specific ones — is treated as mandatory; an inactive local optional or target-specific
 requirement can therefore still block an otherwise valid downgrade, without any "unverified"

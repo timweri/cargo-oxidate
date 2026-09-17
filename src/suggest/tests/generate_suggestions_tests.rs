@@ -1512,3 +1512,56 @@ fn manifest_constraint_is_scoped_to_the_declaring_dependent() {
         _ => panic!("expected clap to be Suggest: member_b's ^3 must not apply"),
     }
 }
+
+#[test]
+fn stale_cached_index_records_missing_dependent_version_are_refetched() {
+    // The cache holds "app"'s index records as of an earlier, older
+    // release ("1.0.0"). The lockfile has since moved to "1.0.1",
+    // which the cache entry (still within its max age) doesn't list.
+    // Looking up "1.0.1" must fall back to a live fetch rather than
+    // silently treating the requirement as unreadable.
+    let dir = tempfile::tempdir().unwrap();
+    let cache_path = dir.path().join("cache.json");
+    let mut cache = crate::cache::ResponseCache::load(Some(&cache_path));
+    cache.set_index_records(
+        "app",
+        vec![crate::api::IndexRecord {
+            vers: "1.0.0".to_string(),
+            yanked: false,
+            deps: vec![],
+        }],
+    );
+    cache.save().unwrap();
+
+    let transport = FakeTransport::default();
+    transport.index_ok(
+        "app",
+        r#"{"vers":"1.0.1","deps":[{"name":"foo","req":"^1.5"}]}"#,
+    );
+    let mut client = CratesIoClient::with_transport(
+        transport,
+        Some(&cache_path),
+        24,
+        RetryPolicy {
+            retry_count: NonZeroU32::new(1).unwrap(),
+            retry_delay: Duration::from_millis(0),
+            pacing_delay: Duration::from_millis(0),
+        },
+    );
+
+    let packages = vec![pkg("app", "1.0.1", &[("foo", "1.5.0")])];
+    let index = build_indexes(&packages).0;
+    let gathered = gather_constraints(
+        &mut client,
+        &index,
+        &[],
+        Path::new("/work"),
+        "foo",
+        "1.5.0",
+        Some(CRATES_IO_SOURCE),
+    );
+
+    assert!(gathered.unverified_dependents.is_empty());
+    assert_eq!(gathered.constraints.len(), 1);
+    assert!(!gathered.constraints[0].req.matches(&v("1.4.0")));
+}

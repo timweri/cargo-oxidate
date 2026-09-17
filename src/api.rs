@@ -389,13 +389,26 @@ impl<T: Transport> CratesIoClient<T> {
     /// that version's own dependency requirements. An unknown crate yields
     /// an empty vector rather than an error.
     ///
+    /// A non-empty cached record list that doesn't include
+    /// `needed_version` (e.g. a dependent published after the cache entry
+    /// was written) is treated as a cache miss: the index is refetched so
+    /// that version isn't silently missed. An empty cached list (an
+    /// unknown crate) is still treated as a hit, since refetching it
+    /// can't produce the missing version either.
+    ///
     /// Unlike the other two fetches, this one is not subject to the
     /// crates.io API's inter-request pacing: the sparse index is a static
     /// endpoint outside that rate limit.
-    pub fn fetch_index_record(&mut self, name: &str) -> Result<Vec<IndexRecord>, FetchError> {
+    pub fn fetch_index_record(
+        &mut self,
+        name: &str,
+        needed_version: &str,
+    ) -> Result<Vec<IndexRecord>, FetchError> {
         let max_age = ChronoDuration::hours(self.cache_max_age_hours as i64);
 
-        if let Some(records) = self.cache.get_index_records(name, max_age) {
+        if let Some(records) = self.cache.get_index_records(name, max_age)
+            && (records.is_empty() || records.iter().any(|r| r.vers == needed_version))
+        {
             return Ok(records);
         }
 
@@ -725,7 +738,7 @@ mod tests {
         );
 
         let mut client = fast_client(transport);
-        let records = client.fetch_index_record("serde").unwrap();
+        let records = client.fetch_index_record("serde", "1.0.0").unwrap();
 
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].vers, "1.0.0");
@@ -748,7 +761,9 @@ mod tests {
         transport.push(&url, ScriptedResponse::Http(404, String::new()));
 
         let mut client = fast_client(transport);
-        let records = client.fetch_index_record("does-not-exist").unwrap();
+        let records = client
+            .fetch_index_record("does-not-exist", "1.0.0")
+            .unwrap();
         assert!(records.is_empty());
     }
 
@@ -758,8 +773,33 @@ mod tests {
         let mut client = fast_client(transport);
         client.cache.set_index_records("serde", vec![]);
 
-        let records = client.fetch_index_record("serde").unwrap();
+        let records = client.fetch_index_record("serde", "1.0.0").unwrap();
         assert!(records.is_empty());
         assert_eq!(client.transport.call_count(), 0);
+    }
+
+    #[test]
+    fn fetch_index_record_refetches_when_cached_records_miss_needed_version() {
+        let url = index_url("serde");
+        let transport = FakeTransport::new();
+        transport.push(
+            &url,
+            ScriptedResponse::Http(200, r#"{"vers":"1.0.1","yanked":false}"#.to_string()),
+        );
+
+        let mut client = fast_client(transport);
+        client.cache.set_index_records(
+            "serde",
+            vec![IndexRecord {
+                vers: "1.0.0".to_string(),
+                yanked: false,
+                deps: vec![],
+            }],
+        );
+
+        let records = client.fetch_index_record("serde", "1.0.1").unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].vers, "1.0.1");
+        assert_eq!(client.transport.call_count(), 1);
     }
 }

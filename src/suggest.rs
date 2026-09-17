@@ -373,7 +373,7 @@ fn registry_dependent_constraints<T: Transport>(
     locked_version: &str,
     source: Option<&str>,
 ) -> RegistryConstraints {
-    let Ok(records) = client.fetch_index_record(&dependent.name) else {
+    let Ok(records) = client.fetch_index_record(&dependent.name, &dependent.version) else {
         return RegistryConstraints::unreadable();
     };
     let Some(record) = records.iter().find(|r| r.vers == dependent.version) else {
