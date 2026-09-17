@@ -189,8 +189,10 @@ fn eligible_locked_versions(dependent: &Package, name: &str, source: Option<&str
 
 /// A single declaration's parsed requirement plus the evidence the shared
 /// attribution policy needs: whether it is definitely active (mandatory) or
-/// merely possible (optional/target-specific/aliased). Local declarations are
-/// always mandatory, since their representation drops that distinction.
+/// merely possible (optional/aliased). Target-specific declarations are
+/// always mandatory too: Cargo's resolver evaluates every target table
+/// regardless of the host platform. Local declarations are always mandatory,
+/// since their representation drops that distinction.
 struct NormalizedDeclaration {
     req: VersionReq,
     mandatory: bool,
@@ -379,13 +381,16 @@ fn registry_dependent_constraints<T: Transport>(
         if dep.kind.as_deref() == Some("dev") {
             continue;
         }
+        if dep.registry.is_some() {
+            continue;
+        }
         let real_name = dep.package.as_deref().unwrap_or(&dep.name);
         if real_name != name {
             continue;
         }
         match VersionReq::parse(&dep.req) {
             Ok(req) if Version::parse(locked_version).is_ok_and(|v| req.matches(&v)) => {
-                let mandatory = dep.target.is_none() && dep.optional != Some(true);
+                let mandatory = dep.optional != Some(true);
                 declarations.push(NormalizedDeclaration { req, mandatory });
             }
             Ok(_) => {}
@@ -457,6 +462,10 @@ pub fn generate_suggestions<T: Transport>(
         eprintln!("  [{}/{}] {}", i + 1, too_new.len(), violation.package);
 
         let Ok(locked) = Version::parse(&violation.version) else {
+            eprintln!(
+                "\n  Warning: failed to parse locked version for {}: {}",
+                violation.package, violation.version
+            );
             continue;
         };
 

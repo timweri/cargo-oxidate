@@ -95,8 +95,8 @@ pub fn print_report(violations: &[Violation]) {
 
 pub fn print_suggestions(outcomes: &[Outcome]) {
     if outcomes.is_empty() {
-        println!("\n⚠️  No compliant versions found for any \"too new\" violations.");
-        println!("    Consider adding these packages to --exempt if they are trusted.\n");
+        println!("\n⚠️  Could not check \"too new\" violations for compliant versions.");
+        println!("    The registry may have been unreachable, or their versions unparsable.\n");
         return;
     }
 

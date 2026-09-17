@@ -491,6 +491,26 @@ fn only_too_new_violations_are_fetched() {
 }
 
 #[test]
+fn an_unparsable_locked_version_does_not_abort_the_others() {
+    let transport = FakeTransport::default();
+    // "serde" has no scripted response: if its versions were fetched,
+    // the transport would panic — its unparsable locked version must
+    // be skipped before that.
+    transport.ok(
+        "syn",
+        &versions_body(&[("1.0.0", 50, false), ("1.1.0", 5, false)], now()),
+    );
+    let mut client = fast_client(transport);
+
+    let violations = vec![too_new("serde", "not-a-version"), too_new("syn", "1.1.0")];
+    let packages = vec![pkg("serde", "not-a-version", &[]), pkg("syn", "1.1.0", &[])];
+    let outcomes = suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
+
+    assert_eq!(outcomes.len(), 1);
+    assert!(matches!(&outcomes[0], Outcome::Suggest { package, .. } if package == "syn"));
+}
+
+#[test]
 fn a_failed_fetch_does_not_abort_the_others() {
     let transport = FakeTransport::default();
     transport.error("serde");
@@ -815,6 +835,39 @@ fn renamed_dependency_is_matched_by_its_real_name() {
 }
 
 #[test]
+fn alternate_registry_index_declaration_is_not_enforced() {
+    // "app" declares a normal `foo = "^1"` from crates.io and a
+    // same-crate alias `foo_alt = { package = "foo", version = "^1.3",
+    // registry = "alt" }` from an alternate registry. The alternate
+    // registry declaration cannot be resolved against the locked
+    // crates.io package, so only `^1` may be enforced.
+    let transport = FakeTransport::default();
+    transport.ok(
+        "foo",
+        &versions_body(&[("1.5.0", 5, false), ("1.2.0", 50, false)], now()),
+    );
+    transport.index_ok(
+                "app",
+                r#"{"vers":"1.0.0","deps":[{"name":"foo","req":"^1"},{"name":"foo_alt","package":"foo","req":"^1.3","registry":"alt"}]}"#,
+            );
+    let mut client = fast_client(transport);
+
+    let violations = vec![too_new("foo", "1.5.0")];
+    let packages = vec![
+        pkg("foo", "1.5.0", &[]),
+        pkg("app", "1.0.0", &[("foo", "1.5.0")]),
+    ];
+    let outcomes = suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
+
+    match &outcomes[0] {
+        Outcome::Suggest {
+            suggested_version, ..
+        } => assert_eq!(suggested_version, "1.2.0"),
+        _ => panic!("expected foo to be Suggest, with the alternate registry declaration ignored"),
+    }
+}
+
+#[test]
 fn ambiguous_optional_declaration_does_not_block_the_downgrade() {
     // "app" declares both a normal `serde = "^1"` and a disabled,
     // renamed optional `serde_new = { package = "serde", version =
@@ -965,6 +1018,45 @@ fn mandatory_requirement_still_blocks_alongside_uncertain_declaration() {
             assert_eq!(blocker.req, "^1.5");
         }
         _ => panic!("expected serde to be Blocked by app's mandatory requirement"),
+    }
+}
+
+#[test]
+fn target_specific_requirement_is_always_enforced() {
+    // "app" declares an unconditional `serde = "^1"` and a stricter
+    // `serde = "^1.4"` under a target-specific table. Cargo's resolver
+    // evaluates every target table regardless of the host platform, so
+    // the target-specific requirement is just as mandatory as the
+    // unconditional one and must be enforced alongside it.
+    let transport = FakeTransport::default();
+    transport.ok(
+        "serde",
+        &versions_body(&[("1.5.0", 5, false), ("1.3.0", 50, false)], now()),
+    );
+    transport.index_ok(
+                "app",
+                r#"{"vers":"1.0.0","deps":[{"name":"serde","req":"^1"},{"name":"serde","req":"^1.4","target":"cfg(unix)"}]}"#,
+            );
+    let mut client = fast_client(transport);
+
+    let violations = vec![too_new("serde", "1.5.0")];
+    let packages = vec![
+        pkg("serde", "1.5.0", &[]),
+        pkg("app", "1.0.0", &[("serde", "1.5.0")]),
+    ];
+    let outcomes = suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
+
+    match &outcomes[0] {
+        Outcome::Blocked {
+            newest_compliant,
+            blocker,
+            ..
+        } => {
+            assert_eq!(newest_compliant, "1.3.0");
+            assert_eq!(blocker.name, "app");
+            assert_eq!(blocker.req, "^1.4");
+        }
+        _ => panic!("expected serde to be Blocked by app's target-specific requirement"),
     }
 }
 

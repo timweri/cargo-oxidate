@@ -56,6 +56,9 @@ pub struct IndexDep {
     /// The original crate name, present when `name` is a rename alias.
     #[serde(default)]
     pub package: Option<String>,
+    /// The alternate registry this dependency is resolved from, if any.
+    #[serde(default)]
+    pub registry: Option<String>,
 }
 
 /// Computes the sparse-index path fragment for a crate name, per the rules

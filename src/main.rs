@@ -163,7 +163,12 @@ fn run(cli: Cli) -> Result<bool> {
     report::print_report(&violations);
 
     // Generate suggestions if requested
-    if let Some(min_age) = suggest_min_age {
+    let has_too_new = violations
+        .iter()
+        .any(|v| matches!(v.kind, report::ViolationKind::TooNew(_)));
+    if let Some(min_age) = suggest_min_age
+        && has_too_new
+    {
         let lockfile_dir = loaded_lockfile.path.parent().unwrap_or(&working_dir);
 
         let (direct_requirements, manifest_warnings) =

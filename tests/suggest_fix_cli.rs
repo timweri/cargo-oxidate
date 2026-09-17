@@ -352,6 +352,25 @@ fn ordinary_and_invalid_cli_runs_keep_their_exit_contract() {
     assert_eq!(invalid.status.code(), Some(2));
 }
 
+#[test]
+fn suggest_fix_with_no_too_new_violations_does_not_warn_about_a_missing_manifest() {
+    // No Cargo.toml beside the lockfile, and no registry packages to
+    // check, so there is nothing to suggest a fix for. `--suggest-fix`
+    // must not still load (and warn about) direct requirements when
+    // there are no "too new" violations to act on.
+    let project = tempdir().unwrap();
+    fs::write(
+        project.path().join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"clean\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+
+    let output = run_oxidate(project.path(), &["--suggest-fix", "--min-age-days", "30"]);
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!stderr.contains("No Cargo.toml"), "stderr was:\n{stderr}");
+}
+
 fn write_crate_source(dir: &Path, name: &str, version: &str) {
     fs::create_dir_all(dir.join("src")).unwrap();
     fs::write(
