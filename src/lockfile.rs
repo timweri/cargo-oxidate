@@ -2,9 +2,9 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 /// Resolves a possibly-relative lockfile path against `working_dir`, without
-/// touching the filesystem. Shared by `load` (which then canonicalizes and
-/// validates it) and by callers that just need the lockfile's directory.
-pub fn resolve_path(path: &Path, working_dir: &Path) -> PathBuf {
+/// touching the filesystem. Used by `load` before it canonicalizes and
+/// validates the result.
+fn resolve_path(path: &Path, working_dir: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -36,8 +36,18 @@ pub struct Package {
     pub dependencies: Vec<PackageRef>,
 }
 
+/// The validated canonical lockfile path together with its parsed packages.
+/// Callers that need the lockfile's directory (e.g. to locate the manifest
+/// beside it) should derive it from `path` rather than re-resolving the
+/// caller-supplied path themselves, since `path` has already had symlinks
+/// and `..` components resolved.
+pub struct LoadedLockfile {
+    pub path: PathBuf,
+    pub packages: Vec<Package>,
+}
+
 /// Loads every package recorded in a lockfile, registry and non-registry
-/// alike.
+/// alike, together with the validated canonical lockfile path.
 ///
 /// `path` is the lockfile path as given by the caller (relative or
 /// absolute), resolved against `working_dir` if relative. Rejects anything
@@ -47,7 +57,7 @@ pub struct Package {
 /// `cargo_lock` resolves each dependency edge to a concrete version itself
 /// (lockfiles may omit a dependency's version when only one instance of it
 /// exists), so every `PackageRef` here already carries one.
-pub fn load(path: &Path, working_dir: &Path) -> Result<Vec<Package>> {
+pub fn load(path: &Path, working_dir: &Path) -> Result<LoadedLockfile> {
     let resolved = resolve_path(path, working_dir);
 
     // Canonicalize to resolve symlinks and ".." components
@@ -101,7 +111,10 @@ pub fn load(path: &Path, working_dir: &Path) -> Result<Vec<Package>> {
         })
         .collect();
 
-    Ok(packages)
+    Ok(LoadedLockfile {
+        path: canonical,
+        packages,
+    })
 }
 
 #[cfg(test)]
@@ -194,7 +207,7 @@ source = "registry+https://example.com/index"
         );
         write_lockfile(dir.path(), &contents);
 
-        let packages = load(Path::new("Cargo.lock"), dir.path()).unwrap();
+        let packages = load(Path::new("Cargo.lock"), dir.path()).unwrap().packages;
 
         assert_eq!(packages.len(), 3);
         let serde = packages.iter().find(|p| p.name == "serde").unwrap();
@@ -215,7 +228,7 @@ source = "registry+https://example.com/index"
         );
         write_lockfile(dir.path(), &contents);
 
-        let packages = load(Path::new("Cargo.lock"), dir.path()).unwrap();
+        let packages = load(Path::new("Cargo.lock"), dir.path()).unwrap().packages;
         let a = packages.iter().find(|p| p.name == "a").unwrap();
         assert_eq!(a.dependencies.len(), 1);
         assert_eq!(a.dependencies[0].name, "b");
@@ -232,7 +245,7 @@ source = "registry+https://example.com/index"
         );
         write_lockfile(dir.path(), &contents);
 
-        let packages = load(Path::new("Cargo.lock"), dir.path()).unwrap();
+        let packages = load(Path::new("Cargo.lock"), dir.path()).unwrap().packages;
         let a = packages.iter().find(|p| p.name == "a").unwrap();
         assert_eq!(a.dependencies.len(), 1);
         assert_eq!(a.dependencies[0].name, "b");
@@ -249,7 +262,7 @@ source = "registry+https://example.com/index"
         );
         write_lockfile(dir.path(), &contents);
 
-        let packages = load(Path::new("Cargo.lock"), dir.path()).unwrap();
+        let packages = load(Path::new("Cargo.lock"), dir.path()).unwrap().packages;
 
         let registry = packages.iter().find(|p| p.name == "serde").unwrap();
         let git = packages.iter().find(|p| p.name == "serde-fork").unwrap();
@@ -270,7 +283,7 @@ source = "registry+https://example.com/index"
         );
         write_lockfile(dir.path(), &contents);
 
-        let packages = load(Path::new("Cargo.lock"), dir.path()).unwrap();
+        let packages = load(Path::new("Cargo.lock"), dir.path()).unwrap().packages;
         let a = packages.iter().find(|p| p.name == "a").unwrap();
         let b = packages.iter().find(|p| p.name == "b").unwrap();
         assert_eq!(a.dependencies[0].source, b.source);
@@ -306,7 +319,7 @@ source = "registry+https://example.com/index"
         );
         write_lockfile(dir.path(), &contents);
 
-        let packages = load(Path::new("Cargo.lock"), dir.path()).unwrap();
+        let packages = load(Path::new("Cargo.lock"), dir.path()).unwrap().packages;
         let root = packages.iter().find(|p| p.name == "root").unwrap();
         let target = |name: &str| packages.iter().find(|p| p.name == name).unwrap();
         let edge = |name: &str| root.dependencies.iter().find(|d| d.name == name).unwrap();
@@ -340,7 +353,7 @@ source = "registry+https://example.com/index"
         );
         write_lockfile(dir.path(), &contents);
 
-        let packages = load(Path::new("Cargo.lock"), dir.path()).unwrap();
+        let packages = load(Path::new("Cargo.lock"), dir.path()).unwrap().packages;
         let root = packages.iter().find(|p| p.name == "root").unwrap();
         let edge = root
             .dependencies

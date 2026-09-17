@@ -119,7 +119,9 @@ fn qualified_spec_resolves_where_the_abbreviated_spec_is_ambiguous() {
         String::from_utf8_lossy(&lock.stderr)
     );
 
-    let packages = crate::lockfile::load(Path::new("Cargo.lock"), &workspace_dir).unwrap();
+    let packages = crate::lockfile::load(Path::new("Cargo.lock"), &workspace_dir)
+        .unwrap()
+        .packages;
     let target_source = packages
         .iter()
         .find(|p| p.name == CRATE_NAME && p.is_registry)

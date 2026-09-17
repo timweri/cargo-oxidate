@@ -46,7 +46,9 @@ fn too_new(package: &str, locked_version: &str) -> Violation {
 #[test]
 fn covers_a_suggestion_two_blocked_kinds_and_no_compliant_version() {
     let dir = fixture_dir();
-    let packages = crate::lockfile::load(Path::new("Cargo.lock"), &dir).unwrap();
+    let packages = crate::lockfile::load(Path::new("Cargo.lock"), &dir)
+        .unwrap()
+        .packages;
     let (direct_requirements, warnings) = load_direct_requirements(&dir);
     assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
 

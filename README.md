@@ -38,9 +38,17 @@ At least one of `--min-age-days` or `--max-age-days` must be specified.
 
 `--suggest-fix` finds the newest older version that satisfies, on a best-effort basis, every
 dependency requirement it can verify from your lockfile and workspace manifests, and prints a
-`cargo update` command for it. Some requirements can't be verified (for example, an optional
-dependency behind a feature flag not enabled in your manifests) — such suggestions are annotated,
-and Cargo may still reject them.
+`cargo update` command for it. Candidates are limited to the locked version's existing compatible
+zone (same major, or same minor when major is `0`, or same patch when both are `0`) — it does not
+consider every eligible version across a major boundary.
+
+Requirement verification differs by source. For registry (crates.io) dependents, a requirement
+behind an optional dependency or target that can't be confirmed active is annotated as unverified
+rather than enforced, and Cargo may still reject that suggestion. For local/workspace manifests,
+activation isn't tracked at all, so every declared requirement — including optional and
+target-specific ones — is treated as mandatory; an inactive local optional or target-specific
+requirement can therefore still block an otherwise valid downgrade, without any "unverified"
+annotation.
 
 The tool does not build your project and does not guarantee Cargo will accept every suggested
 command. Run your tests after applying a suggestion. If no version fits, it reports the

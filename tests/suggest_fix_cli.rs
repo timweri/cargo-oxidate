@@ -269,6 +269,63 @@ checksum = "0000000000000000000000000000000000000000000000000000000000000000"
     assert!(!stdout.contains("parent, parent"), "stdout was:\n{stdout}");
 }
 
+#[cfg(unix)]
+#[test]
+fn suggest_fix_uses_manifest_beside_the_symlinks_real_lockfile() {
+    // `decoy/Cargo.lock` is a symlink to `real/Cargo.lock`. Manifest discovery
+    // must follow the canonical path, or the decoy's permissive manifest
+    // (which doesn't declare `alpha`) would let the downgrade through.
+    let project = tempdir().unwrap();
+    let real_dir = project.path().join("real");
+    let decoy_dir = project.path().join("decoy");
+    fs::create_dir_all(&real_dir).unwrap();
+    fs::create_dir_all(&decoy_dir).unwrap();
+
+    fs::write(
+        real_dir.join("Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nalpha = \"^1.5\"\n",
+    )
+    .unwrap();
+    fs::write(
+        real_dir.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \"alpha\",\n]\n\n[[package]]\nname = \"alpha\"\nversion = \"1.5.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"0000000000000000000000000000000000000000000000000000000000000000\"\n",
+    )
+    .unwrap();
+
+    fs::write(
+        decoy_dir.join("Cargo.toml"),
+        "[package]\nname = \"decoy\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(real_dir.join("Cargo.lock"), decoy_dir.join("Cargo.lock")).unwrap();
+
+    let cache = write_cache(
+        project.path(),
+        &[("alpha", "1.5.0", 2, vec![("1.5.0", 2), ("1.4.0", 80)])],
+    );
+    let output = run_oxidate(
+        project.path(),
+        &[
+            "decoy/Cargo.lock",
+            "--min-age-days",
+            "30",
+            "--suggest-fix",
+            "--cache-path",
+            cache.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !stdout.contains("cargo update -p alpha@1.5.0 --precise 1.4.0"),
+        "forbidden downgrade command was suggested; stdout was:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("alpha 1.5.0") && stdout.contains("Cargo.toml") && stdout.contains("^1.5"),
+        "expected the real manifest's restriction on alpha to be reported; stdout was:\n{stdout}"
+    );
+}
+
 #[test]
 fn ordinary_and_invalid_cli_runs_keep_their_exit_contract() {
     let project = tempdir().unwrap();

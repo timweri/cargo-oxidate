@@ -125,7 +125,8 @@ fn run(cli: Cli) -> Result<bool> {
     let working_dir = std::env::current_dir().context("Failed to get current directory")?;
 
     // Parse lockfile
-    let packages = lockfile::load(&cli.cargo_lock, &working_dir)?;
+    let loaded_lockfile = lockfile::load(&cli.cargo_lock, &working_dir)?;
+    let packages = loaded_lockfile.packages;
 
     // Build API client
     let mut client = api::CratesIoClient::new(
@@ -163,8 +164,7 @@ fn run(cli: Cli) -> Result<bool> {
 
     // Generate suggestions if requested
     if let Some(min_age) = suggest_min_age {
-        let cargo_lock_path = lockfile::resolve_path(&cli.cargo_lock, &working_dir);
-        let lockfile_dir = cargo_lock_path.parent().unwrap_or(&working_dir);
+        let lockfile_dir = loaded_lockfile.path.parent().unwrap_or(&working_dir);
 
         let (direct_requirements, manifest_warnings) =
             manifest::load_direct_requirements(lockfile_dir);
