@@ -45,10 +45,9 @@ fn blocked_when_no_candidate_satisfies_every_constraint() {
 }
 
 #[test]
-// Pins that the blocker is the constraint rejecting every candidate.
-// `<=1.3` comes first and rejects the newest candidate, but 1.2.0
-// satisfies it — only `>=1.4.5` makes every downgrade impossible.
 fn blocker_is_the_constraint_that_rejects_every_candidate() {
+    // `<=1.3` comes first and rejects the newest candidate, but 1.2.0
+    // satisfies it — only `>=1.4.5` makes every downgrade impossible.
     let candidates = vec![(v("1.4.0"), 5), (v("1.2.0"), 20)];
     let constraints = vec![constraint("<=1.3"), constraint(">=1.4.5")];
 
@@ -61,10 +60,10 @@ fn blocker_is_the_constraint_that_rejects_every_candidate() {
 }
 
 #[test]
-// Pins the fallback: when no single constraint rejects every
-// candidate, the block is a genuine combination, so we fall back to
-// the first constraint that rejects the newest candidate.
 fn blocker_falls_back_when_no_single_constraint_blocks_all_candidates() {
+    // When no single constraint rejects every candidate, the block is
+    // a genuine combination, so we fall back to the first constraint
+    // that rejects the newest candidate.
     let candidates = vec![(v("1.4.0"), 5), (v("1.2.0"), 20)];
     let constraints = vec![constraint("<=1.3"), constraint(">=1.4")];
 
