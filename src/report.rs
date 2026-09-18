@@ -170,7 +170,7 @@ pub fn print_suggestions(outcomes: &[Outcome]) {
                     locked_version,
                 } => {
                     println!(
-                        "    {package} {locked_version}: no version at least the minimum age old within its compatible range"
+                        "    {package} {locked_version}: no eligible downgrade at least the minimum age old within its compatible range"
                     );
                 }
                 Outcome::Suggest { .. } => unreachable!(),

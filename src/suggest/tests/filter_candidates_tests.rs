@@ -61,7 +61,7 @@ fn publish_date_breaks_ties_in_equal_semver_precedence() {
 #[test]
 fn prerelease_excluded_by_default() {
     let versions = vec![make_version("1.1.0-beta.1", 100, false)];
-    let result = filter_candidates(&versions, &v("1.0.0"), 30, now(), false);
+    let result = filter_candidates(&versions, &v("1.2.0"), 30, now(), false);
     assert!(result.is_empty());
 }
 
@@ -69,7 +69,7 @@ fn prerelease_excluded_by_default() {
 fn prerelease_included_with_flag_when_range_matches() {
     // Same compatible zone (1.0.0), prerelease allowed by the flag.
     let versions = vec![make_version("1.0.0-beta.1", 100, false)];
-    let result = filter_candidates(&versions, &v("1.0.0-beta.2"), 30, now(), true);
+    let result = filter_candidates(&versions, &v("1.0.0"), 30, now(), true);
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].0.to_string(), "1.0.0-beta.1");
 }

@@ -127,7 +127,12 @@ fn suggest_fix_cli_reports_mixed_outcomes_and_preserves_project_files() {
             && stdout.contains("consumer 2.0.0")
             && stdout.contains("^1.5")
     );
-    assert!(stdout.contains("delta 1.5.0") && stdout.contains("no version"));
+    assert!(
+        stdout.contains(
+            "delta 1.5.0: no eligible downgrade at least the minimum age old within its compatible range"
+        ),
+        "stdout was:\n{stdout}"
+    );
     assert!(stdout.contains("best-effort"));
     assert_eq!(
         fs::read(project.path().join("Cargo.toml")).unwrap(),
@@ -137,6 +142,54 @@ fn suggest_fix_cli_reports_mixed_outcomes_and_preserves_project_files() {
         fs::read(project.path().join("Cargo.lock")).unwrap(),
         lock_before
     );
+}
+
+#[test]
+fn suggest_fix_cli_reports_excluded_lower_versions_as_no_eligible_downgrade() {
+    for (candidate, yanked) in [("1.4.0", true), ("1.4.0-beta.1", false)] {
+        let project = copied_fixture();
+        let cache = write_cache(
+            project.path(),
+            &[
+                ("alpha", "1.5.0", 100, vec![]),
+                ("beta", "1.5.0", 100, vec![]),
+                ("gamma", "1.5.0", 100, vec![]),
+                ("delta", "1.5.0", 2, vec![("1.5.0", 2), (candidate, 80)]),
+                ("consumer", "2.0.0", 100, vec![]),
+            ],
+        );
+        let mut cache_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&cache).unwrap()).unwrap();
+        cache_json["all_versions"]["delta"]["versions"][1]["yanked"] = serde_json::json!(yanked);
+        fs::write(&cache, serde_json::to_vec(&cache_json).unwrap()).unwrap();
+
+        let output = run_oxidate(
+            project.path(),
+            &[
+                "--min-age-days",
+                "30",
+                "--suggest-fix",
+                "--cache-path",
+                cache.to_str().unwrap(),
+            ],
+        );
+
+        assert_eq!(output.status.code(), Some(1));
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            stdout.lines().any(|line| {
+                line
+                    == "    delta 1.5.0: no eligible downgrade at least the minimum age old within its compatible range"
+            }),
+            "stdout was:\n{stdout}"
+        );
+        assert!(
+            !stdout
+                .lines()
+                .any(|line| line.trim_start().starts_with("cargo update -p delta@")),
+            "stdout was:\n{stdout}"
+        );
+    }
 }
 
 #[test]
