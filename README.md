@@ -36,24 +36,24 @@ At least one of `--min-age-days` or `--max-age-days` must be specified.
 
 ## `--suggest-fix`
 
-`--suggest-fix` finds the newest older version that satisfies, on a best-effort basis, every
-dependency requirement it can verify from your lockfile and workspace manifests, and prints a
-`cargo update` command for it. Candidates are limited to the locked version's existing compatible
-zone (same major, or same minor when major is `0`, or same patch when both are `0`) — it does not
-consider every eligible version across a major boundary.
+`--suggest-fix` prints a `cargo update --precise` command for the newest eligible downgrade of
+each package that is too new. It checks dependency requirements it can verify from `Cargo.lock`
+and workspace manifests.
 
-Requirement verification differs by source. For registry (crates.io) dependents, only a
-requirement behind an optional dependency that can't be confirmed active is annotated as
-unverified rather than enforced; target-specific requirements are always enforced, and Cargo may
-still reject that suggestion. For local/workspace manifests,
-activation isn't tracked at all, so every declared requirement — including optional and
-target-specific ones — is treated as mandatory; an inactive local optional or target-specific
-requirement can therefore still block an otherwise valid downgrade, without any "unverified"
-annotation.
+A candidate must be old enough, not yanked, older than the locked version, and in its compatible
+version zone. The zone keeps the same major version, except that `0.x` keeps the same minor and
+`0.0.x` keeps the same patch. Prereleases are excluded unless you pass `--include-prerelease` or
+the locked version is itself a prerelease.
 
-The tool does not build your project and does not guarantee Cargo will accept every suggested
-command. Run your tests after applying a suggestion. If no version fits, it reports the
-requirement that prevents a downgrade. Apply suggestions in order, then run the command again.
+Registry requirements come from the crates.io index. An optional registry declaration that cannot
+be confirmed active is shown as unverified. Target-specific registry declarations are enforced.
+For local and workspace manifests, the tool does not determine feature or target activation, so it
+treats every declared requirement, including optional and target-specific ones, as mandatory.
+
+Suggestions are best effort. The tool does not run Cargo's resolver or build your project, so Cargo
+can still reject a suggested command. Apply suggestions in order, then run the command again and
+run your tests. If the tool cannot find an eligible downgrade, it reports the requirement that
+blocks one when it knows that requirement.
 
 ## Exit Codes
 
