@@ -392,9 +392,8 @@ impl<T: Transport> CratesIoClient<T> {
     /// A non-empty cached record list that doesn't include
     /// `needed_version` (e.g. a dependent published after the cache entry
     /// was written) is treated as a cache miss: the index is refetched so
-    /// that version isn't silently missed. An empty cached list (an
-    /// unknown crate) is still treated as a hit, since refetching it
-    /// can't produce the missing version either.
+    /// that version isn't silently missed. An empty cached list is reused
+    /// until the configured cache expiry.
     ///
     /// Unlike the other two fetches, this one is not subject to the
     /// crates.io API's inter-request pacing: the sparse index is a static
@@ -414,9 +413,7 @@ impl<T: Transport> CratesIoClient<T> {
 
         self.with_retry(|client| {
             let result = client.fetch_index_record_uncached(name)?;
-            if !result.is_empty() {
-                client.cache.set_index_records(name, result.clone());
-            }
+            client.cache.set_index_records(name, result.clone());
             Ok(result)
         })
     }
@@ -498,6 +495,7 @@ mod tests {
     use super::*;
     use std::num::NonZeroU32;
     use std::time::Instant;
+    use tempfile::tempdir;
 
     fn version_url(name: &str, version: &str) -> String {
         format!("https://crates.io/api/v1/crates/{name}/{version}")
@@ -765,6 +763,126 @@ mod tests {
             .fetch_index_record("does-not-exist", "1.0.0")
             .unwrap();
         assert!(records.is_empty());
+    }
+
+    #[test]
+    fn empty_sparse_index_result_is_cached_within_one_client() {
+        let url = index_url("does-not-exist");
+        let transport = FakeTransport::new();
+        transport.push(&url, ScriptedResponse::Http(404, String::new()));
+
+        let mut client = fast_client(transport);
+        assert!(
+            client
+                .fetch_index_record("does-not-exist", "1.0.0")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            client
+                .fetch_index_record("does-not-exist", "2.0.0")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(client.transport.call_count(), 1);
+    }
+
+    #[test]
+    fn blank_sparse_index_response_is_cached_within_one_client() {
+        let url = index_url("empty-index");
+        let transport = FakeTransport::new();
+        transport.push(&url, ScriptedResponse::Http(200, " \n\t\n ".to_string()));
+
+        let mut client = fast_client(transport);
+        assert!(
+            client
+                .fetch_index_record("empty-index", "1.0.0")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            client
+                .fetch_index_record("empty-index", "2.0.0")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(client.transport.call_count(), 1);
+    }
+
+    #[test]
+    fn empty_sparse_index_result_persists_after_client_finish() {
+        let dir = tempdir().unwrap();
+        let cache_path = dir.path().join("cache.json");
+        let url = index_url("does-not-exist");
+        let first_transport = FakeTransport::new();
+        first_transport.push(&url, ScriptedResponse::Http(404, String::new()));
+
+        let mut first_client = CratesIoClient::with_transport(
+            first_transport,
+            Some(&cache_path),
+            24,
+            RetryPolicy {
+                retry_count: NonZeroU32::new(1).unwrap(),
+                retry_delay: Duration::ZERO,
+                pacing_delay: Duration::ZERO,
+            },
+        );
+        assert!(
+            first_client
+                .fetch_index_record("does-not-exist", "1.0.0")
+                .unwrap()
+                .is_empty()
+        );
+        first_client.finish();
+
+        let second_transport = FakeTransport::new();
+        let mut second_client = CratesIoClient::with_transport(
+            second_transport,
+            Some(&cache_path),
+            24,
+            RetryPolicy {
+                retry_count: NonZeroU32::new(1).unwrap(),
+                retry_delay: Duration::ZERO,
+                pacing_delay: Duration::ZERO,
+            },
+        );
+        assert!(
+            second_client
+                .fetch_index_record("does-not-exist", "2.0.0")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(second_client.transport.call_count(), 0);
+    }
+
+    #[test]
+    fn sparse_index_transport_failure_is_not_cached() {
+        let url = index_url("retryable");
+        let transport = FakeTransport::new();
+        transport.push(&url, ScriptedResponse::Error);
+        transport.push(&url, ScriptedResponse::Http(404, String::new()));
+
+        let mut client = CratesIoClient::with_transport(
+            transport,
+            None,
+            24,
+            RetryPolicy {
+                retry_count: NonZeroU32::new(1).unwrap(),
+                retry_delay: Duration::ZERO,
+                pacing_delay: Duration::ZERO,
+            },
+        );
+        assert!(matches!(
+            client.fetch_index_record("retryable", "1.0.0"),
+            Err(FetchError::Retryable(_))
+        ));
+        assert!(
+            client
+                .fetch_index_record("retryable", "1.0.0")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(client.transport.call_count(), 2);
     }
 
     #[test]

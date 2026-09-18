@@ -229,6 +229,23 @@ mod tests {
     }
 
     #[test]
+    fn empty_index_record_cache_entry_expires() {
+        let mut cache = ResponseCache::load(None);
+        cache.set_index_records("does-not-exist", vec![]);
+
+        assert!(
+            cache
+                .get_index_records("does-not-exist", Duration::hours(1))
+                .is_some_and(|records| records.is_empty())
+        );
+        assert!(
+            cache
+                .get_index_records("does-not-exist", Duration::seconds(-1))
+                .is_none()
+        );
+    }
+
+    #[test]
     fn corrupt_file_starts_fresh() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("cache.json");
