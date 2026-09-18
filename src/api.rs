@@ -2,6 +2,7 @@ use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::Path;
 use std::time::Duration;
@@ -190,6 +191,9 @@ pub struct CratesIoClient<T: Transport = UreqTransport> {
     cache: ResponseCache,
     cache_max_age_hours: u64,
     retry_policy: RetryPolicy,
+    /// Per-run memo of successfully fetched index records, keyed by crate
+    /// name. Confined to this process; never persisted.
+    fetched_index_records: HashMap<String, Vec<IndexRecord>>,
 }
 
 impl CratesIoClient<UreqTransport> {
@@ -219,6 +223,7 @@ impl<T: Transport> CratesIoClient<T> {
             cache: ResponseCache::load(cache_path),
             cache_max_age_hours,
             retry_policy,
+            fetched_index_records: HashMap::new(),
         }
     }
 
@@ -389,11 +394,15 @@ impl<T: Transport> CratesIoClient<T> {
     /// that version's own dependency requirements. An unknown crate yields
     /// an empty vector rather than an error.
     ///
-    /// A non-empty cached record list that doesn't include
-    /// `needed_version` (e.g. a dependent published after the cache entry
-    /// was written) is treated as a cache miss: the index is refetched so
-    /// that version isn't silently missed. An empty cached list is reused
-    /// until the configured cache expiry.
+    /// A lookup first consults a per-run memo of index records already
+    /// fetched successfully in this process, keyed by crate name; a memo
+    /// hit is returned as-is, with no age check. Otherwise, a persisted
+    /// cache entry satisfies the lookup only when it is fresh and contains
+    /// a record whose `vers` equals `needed_version`; a non-empty entry
+    /// that lacks that version (e.g. a dependent published after the
+    /// cache entry was written) is treated as a miss, same as an empty
+    /// entry. A miss falls through to the network, and a successful fetch
+    /// is written to both the memo and the persisted cache.
     ///
     /// Unlike the other two fetches, this one is not subject to the
     /// crates.io API's inter-request pacing: the sparse index is a static
@@ -403,10 +412,14 @@ impl<T: Transport> CratesIoClient<T> {
         name: &str,
         needed_version: &str,
     ) -> Result<Vec<IndexRecord>, FetchError> {
+        if let Some(records) = self.fetched_index_records.get(name) {
+            return Ok(records.clone());
+        }
+
         let max_age = ChronoDuration::hours(self.cache_max_age_hours as i64);
 
         if let Some(records) = self.cache.get_index_records(name, max_age)
-            && (records.is_empty() || records.iter().any(|r| r.vers == needed_version))
+            && records.iter().any(|r| r.vers == needed_version)
         {
             return Ok(records);
         }
@@ -414,6 +427,9 @@ impl<T: Transport> CratesIoClient<T> {
         self.with_retry(|client| {
             let result = client.fetch_index_record_uncached(name)?;
             client.cache.set_index_records(name, result.clone());
+            client
+                .fetched_index_records
+                .insert(name.to_string(), result.clone());
             Ok(result)
         })
     }
@@ -810,7 +826,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_sparse_index_result_persists_after_client_finish() {
+    fn empty_sparse_index_result_is_refetched_by_a_new_client() {
+        // A new client opened against a cache file holding an empty entry
+        // must not treat that entry as a hit: it issues a request rather
+        // than reusing the stale empty result.
         let dir = tempdir().unwrap();
         let cache_path = dir.path().join("cache.json");
         let url = index_url("does-not-exist");
@@ -836,6 +855,7 @@ mod tests {
         first_client.finish();
 
         let second_transport = FakeTransport::new();
+        second_transport.push(&url, ScriptedResponse::Http(404, String::new()));
         let mut second_client = CratesIoClient::with_transport(
             second_transport,
             Some(&cache_path),
@@ -852,7 +872,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(second_client.transport.call_count(), 0);
+        assert_eq!(second_client.transport.call_count(), 1);
     }
 
     #[test]
@@ -889,10 +909,18 @@ mod tests {
     fn fetch_index_record_cache_hit_issues_no_request() {
         let transport = FakeTransport::new();
         let mut client = fast_client(transport);
-        client.cache.set_index_records("serde", vec![]);
+        client.cache.set_index_records(
+            "serde",
+            vec![IndexRecord {
+                vers: "1.0.0".to_string(),
+                yanked: false,
+                deps: vec![],
+            }],
+        );
 
         let records = client.fetch_index_record("serde", "1.0.0").unwrap();
-        assert!(records.is_empty());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].vers, "1.0.0");
         assert_eq!(client.transport.call_count(), 0);
     }
 
@@ -918,6 +946,67 @@ mod tests {
         let records = client.fetch_index_record("serde", "1.0.1").unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].vers, "1.0.1");
+        assert_eq!(client.transport.call_count(), 1);
+    }
+
+    #[test]
+    fn fetch_index_record_missing_version_is_refetched_once_per_run() {
+        // A non-empty cached entry that lacks the needed version is fetched
+        // once per run across repeated lookups, not once per lookup.
+        let url = index_url("serde");
+        let transport = FakeTransport::new();
+        transport.push(
+            &url,
+            ScriptedResponse::Http(200, r#"{"vers":"1.0.1","yanked":false}"#.to_string()),
+        );
+
+        let mut client = fast_client(transport);
+        client.cache.set_index_records(
+            "serde",
+            vec![IndexRecord {
+                vers: "1.0.0".to_string(),
+                yanked: false,
+                deps: vec![],
+            }],
+        );
+
+        for _ in 0..2 {
+            let records = client.fetch_index_record("serde", "1.0.1").unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].vers, "1.0.1");
+        }
+        assert_eq!(client.transport.call_count(), 1);
+    }
+
+    #[test]
+    fn fetch_index_record_memo_holds_records_even_with_zero_cache_age() {
+        // With `cache_max_age_hours = 0`, two lookups in one run issue one
+        // request and both return the real records. This must fail if the
+        // memo were a name set that re-reads the cache, since a
+        // just-written cache entry would then be judged expired.
+        let url = index_url("serde");
+        let transport = FakeTransport::new();
+        transport.push(
+            &url,
+            ScriptedResponse::Http(200, r#"{"vers":"1.0.0","yanked":false}"#.to_string()),
+        );
+
+        let mut client = CratesIoClient::with_transport(
+            transport,
+            None,
+            0,
+            RetryPolicy {
+                retry_count: NonZeroU32::new(3).unwrap(),
+                retry_delay: Duration::from_millis(0),
+                pacing_delay: Duration::from_millis(0),
+            },
+        );
+
+        for _ in 0..2 {
+            let records = client.fetch_index_record("serde", "1.0.0").unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].vers, "1.0.0");
+        }
         assert_eq!(client.transport.call_count(), 1);
     }
 }
