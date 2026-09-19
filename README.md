@@ -28,10 +28,32 @@ cargo-oxidate Cargo.lock --min-age-days 14 --max-age-days 730
 | `--exclude-missing` | Don't flag packages with unknown publish dates |
 | `--timeout N` | HTTP timeout in seconds (default: 10) |
 | `--suggest-fix` | For "too new" violations, suggest `cargo update` commands to downgrade |
+| `--include-prerelease` | Consider prerelease versions as suggestion candidates (requires `--suggest-fix`); ordinary SemVer requirements (e.g. `^1.2`) still generally don't match prereleases, so most will still be rejected |
 | `--cache-path PATH` | Enable response caching at PATH (or set `CARGO_OXIDATE_CACHE_PATH`) |
 | `--cache-max-age-hours N` | Max age for cached version listings (default: 24) |
 
 At least one of `--min-age-days` or `--max-age-days` must be specified.
+
+## `--suggest-fix`
+
+`--suggest-fix` prints a `cargo update --precise` command for the newest eligible downgrade of
+each package that is too new. It checks dependency requirements it can verify from `Cargo.lock`
+and workspace manifests.
+
+A candidate must be old enough, not yanked, older than the locked version, and in its compatible
+version zone. The zone keeps the same major version, except that `0.x` keeps the same minor and
+`0.0.x` keeps the same patch. Prereleases are excluded unless you pass `--include-prerelease` or
+the locked version is itself a prerelease.
+
+Registry requirements come from the crates.io index. An optional registry declaration that cannot
+be confirmed active is shown as unverified. Target-specific registry declarations are enforced.
+For local and workspace manifests, the tool does not determine feature or target activation, so it
+treats every declared requirement, including optional and target-specific ones, as mandatory.
+
+Suggestions are best effort. The tool does not run Cargo's resolver or build your project, so Cargo
+can still reject a suggested command. Apply suggestions in order, then run the command again and
+run your tests. If the tool cannot find an eligible downgrade, it reports the requirement that
+blocks one when it knows that requirement.
 
 ## Exit Codes
 

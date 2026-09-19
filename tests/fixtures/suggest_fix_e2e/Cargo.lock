@@ -1,0 +1,42 @@
+version = 4
+
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = [
+ "alpha",
+ "beta",
+]
+
+[[package]]
+name = "alpha"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[package]]
+name = "beta"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[package]]
+name = "gamma"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[package]]
+name = "delta"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[package]]
+name = "consumer"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0000000000000000000000000000000000000000000000000000000000000000"
+dependencies = [
+ "gamma",
+]

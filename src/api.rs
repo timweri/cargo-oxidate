@@ -2,6 +2,7 @@ use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::Path;
 use std::time::Duration;
@@ -28,6 +29,59 @@ pub struct CrateVersionInfo {
     pub num: String,
     pub created_at: DateTime<Utc>,
     pub yanked: bool,
+}
+
+/// One version's record from the crates.io sparse index: its own version
+/// string, whether it's yanked, and the requirements it places on its own
+/// dependencies (used to check whether a candidate downgrade would still
+/// satisfy a dependent).
+#[derive(Deserialize, Serialize, Clone)]
+pub struct IndexRecord {
+    pub vers: String,
+    #[serde(default)]
+    pub yanked: bool,
+    #[serde(default)]
+    pub deps: Vec<IndexDep>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+pub struct IndexDep {
+    pub name: String,
+    pub req: String,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub optional: Option<bool>,
+    /// The original crate name, present when `name` is a rename alias.
+    #[serde(default)]
+    pub package: Option<String>,
+    /// The alternate registry this dependency is resolved from, if any.
+    #[serde(default)]
+    pub registry: Option<String>,
+}
+
+/// Computes the sparse-index path fragment for a crate name, per the rules
+/// at <https://doc.rust-lang.org/cargo/reference/registry-index.html#index-files>:
+/// 1-char names live under `1/`, 2-char under `2/`, 3-char under
+/// `3/<first char>/`, and everything else is split into two two-character
+/// prefix directories. Matching is done on the lowercased name.
+pub fn sparse_index_path(name: &str) -> String {
+    let lower = name.to_lowercase();
+    match lower.len() {
+        1 => format!("1/{lower}"),
+        2 => format!("2/{lower}"),
+        3 => {
+            let c0 = &lower[0..1];
+            format!("3/{c0}/{lower}")
+        }
+        _ => {
+            let c01 = &lower[0..2];
+            let c23 = &lower[2..4];
+            format!("{c01}/{c23}/{lower}")
+        }
+    }
 }
 
 /// Classifies API fetch errors for retry decision-making.
@@ -137,6 +191,9 @@ pub struct CratesIoClient<T: Transport = UreqTransport> {
     cache: ResponseCache,
     cache_max_age_hours: u64,
     retry_policy: RetryPolicy,
+    /// Per-run memo of successfully fetched index records, keyed by crate
+    /// name. Confined to this process; never persisted.
+    fetched_index_records: HashMap<String, Vec<IndexRecord>>,
 }
 
 impl CratesIoClient<UreqTransport> {
@@ -166,6 +223,7 @@ impl<T: Transport> CratesIoClient<T> {
             cache: ResponseCache::load(cache_path),
             cache_max_age_hours,
             retry_policy,
+            fetched_index_records: HashMap::new(),
         }
     }
 
@@ -197,6 +255,21 @@ impl<T: Transport> CratesIoClient<T> {
         url: &str,
         subject: &str,
     ) -> Result<Option<D>, FetchError> {
+        let Some(body) = self.fetch_body(url, subject)? else {
+            return Ok(None);
+        };
+
+        serde_json::from_slice(&body)
+            .map(Some)
+            .map_err(|e| FetchError::Permanent(format!("Failed to parse response {subject}: {e}")))
+    }
+
+    /// Issues a GET and classifies HTTP errors, without interpreting the
+    /// body. Used by `fetch_json` and by the index fetch, whose body is
+    /// newline-delimited JSON rather than a single document.
+    ///
+    /// Returns `Ok(None)` on HTTP 404, same as `fetch_json`.
+    fn fetch_body(&self, url: &str, subject: &str) -> Result<Option<Vec<u8>>, FetchError> {
         let response = self
             .transport
             .get(url)
@@ -211,11 +284,7 @@ impl<T: Transport> CratesIoClient<T> {
             status if (400..500).contains(&status) => Err(FetchError::Permanent(format!(
                 "Client error {status} {subject}"
             ))),
-            _ => serde_json::from_slice(&response.body)
-                .map(Some)
-                .map_err(|e| {
-                    FetchError::Permanent(format!("Failed to parse response {subject}: {e}"))
-                }),
+            _ => Ok(Some(response.body)),
         }
     }
 
@@ -301,6 +370,69 @@ impl<T: Transport> CratesIoClient<T> {
         self.pace();
         result
     }
+
+    fn fetch_index_record_uncached(&self, name: &str) -> Result<Vec<IndexRecord>, FetchError> {
+        let url = format!("https://index.crates.io/{}", sparse_index_path(name));
+        let subject = format!("fetching index record for {name}");
+        let Some(body) = self.fetch_body(&url, &subject)? else {
+            return Ok(vec![]);
+        };
+        let text = String::from_utf8_lossy(&body);
+
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                serde_json::from_str(line).map_err(|e| {
+                    FetchError::Permanent(format!("Failed to parse index record {subject}: {e}"))
+                })
+            })
+            .collect()
+    }
+
+    /// Fetches every published version's index record for `name` from the
+    /// crates.io sparse index — one line of JSON per version, each listing
+    /// that version's own dependency requirements. An unknown crate yields
+    /// an empty vector rather than an error.
+    ///
+    /// A lookup first consults a per-run memo of index records already
+    /// fetched successfully in this process, keyed by crate name; a memo
+    /// hit is returned as-is, with no age check. Otherwise, a persisted
+    /// cache entry satisfies the lookup only when it is fresh and contains
+    /// a record whose `vers` equals `needed_version`; a non-empty entry
+    /// that lacks that version (e.g. a dependent published after the
+    /// cache entry was written) is treated as a miss, same as an empty
+    /// entry. A miss falls through to the network, and a successful fetch
+    /// is written to both the memo and the persisted cache.
+    ///
+    /// Unlike the other two fetches, this one is not subject to the
+    /// crates.io API's inter-request pacing: the sparse index is a static
+    /// endpoint outside that rate limit.
+    pub fn fetch_index_record(
+        &mut self,
+        name: &str,
+        needed_version: &str,
+    ) -> Result<Vec<IndexRecord>, FetchError> {
+        if let Some(records) = self.fetched_index_records.get(name) {
+            return Ok(records.clone());
+        }
+
+        let max_age = ChronoDuration::hours(self.cache_max_age_hours as i64);
+
+        if let Some(records) = self.cache.get_index_records(name, max_age)
+            && records.iter().any(|r| r.vers == needed_version)
+        {
+            return Ok(records);
+        }
+
+        self.with_retry(|client| {
+            let result = client.fetch_index_record_uncached(name)?;
+            client.cache.set_index_records(name, result.clone());
+            client
+                .fetched_index_records
+                .insert(name.to_string(), result.clone());
+            Ok(result)
+        })
+    }
 }
 
 /// Test-only fake `Transport` and URL helpers, shared by this module's own
@@ -367,14 +499,19 @@ pub(crate) mod test_support {
     pub(crate) fn versions_url(name: &str) -> String {
         format!("https://crates.io/api/v1/crates/{name}")
     }
+
+    pub(crate) fn index_url(name: &str) -> String {
+        format!("https://index.crates.io/{}", super::sparse_index_path(name))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{FakeTransport, ScriptedResponse, versions_url};
+    use super::test_support::{FakeTransport, ScriptedResponse, index_url, versions_url};
     use super::*;
     use std::num::NonZeroU32;
     use std::time::Instant;
+    use tempfile::tempdir;
 
     fn version_url(name: &str, version: &str) -> String {
         format!("https://crates.io/api/v1/crates/{name}/{version}")
@@ -585,5 +722,291 @@ mod tests {
         let result = client.fetch_all_versions("serde").unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].num, "1.0.0");
+    }
+
+    #[test]
+    fn sparse_index_path_prefix_rules() {
+        assert_eq!(sparse_index_path("a"), "1/a");
+        assert_eq!(sparse_index_path("io"), "2/io");
+        assert_eq!(sparse_index_path("syn"), "3/s/syn");
+        assert_eq!(sparse_index_path("serde"), "se/rd/serde");
+        assert_eq!(sparse_index_path("Serde"), "se/rd/serde");
+    }
+
+    #[test]
+    fn fetch_index_record_parses_multiple_lines_with_defaults() {
+        let url = index_url("serde");
+        let transport = FakeTransport::new();
+        transport.push(
+            &url,
+            ScriptedResponse::Http(
+                200,
+                concat!(
+                    r#"{"vers":"1.0.0","yanked":false,"deps":[{"name":"quote","req":"^1.0"}]}"#,
+                    "\n",
+                    r#"{"vers":"1.0.1","yanked":true}"#,
+                    "\n",
+                )
+                .to_string(),
+            ),
+        );
+
+        let mut client = fast_client(transport);
+        let records = client.fetch_index_record("serde", "1.0.0").unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].vers, "1.0.0");
+        assert!(!records[0].yanked);
+        assert_eq!(records[0].deps.len(), 1);
+        assert_eq!(records[0].deps[0].name, "quote");
+        assert_eq!(records[0].deps[0].req, "^1.0");
+        assert_eq!(records[0].deps[0].kind, None);
+        assert_eq!(records[0].deps[0].package, None);
+
+        assert_eq!(records[1].vers, "1.0.1");
+        assert!(records[1].yanked);
+        assert!(records[1].deps.is_empty());
+    }
+
+    #[test]
+    fn fetch_index_record_missing_crate_yields_empty_result() {
+        let url = index_url("does-not-exist");
+        let transport = FakeTransport::new();
+        transport.push(&url, ScriptedResponse::Http(404, String::new()));
+
+        let mut client = fast_client(transport);
+        let records = client
+            .fetch_index_record("does-not-exist", "1.0.0")
+            .unwrap();
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn empty_sparse_index_result_is_cached_within_one_client() {
+        let url = index_url("does-not-exist");
+        let transport = FakeTransport::new();
+        transport.push(&url, ScriptedResponse::Http(404, String::new()));
+
+        let mut client = fast_client(transport);
+        assert!(
+            client
+                .fetch_index_record("does-not-exist", "1.0.0")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            client
+                .fetch_index_record("does-not-exist", "2.0.0")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(client.transport.call_count(), 1);
+    }
+
+    #[test]
+    fn blank_sparse_index_response_is_cached_within_one_client() {
+        let url = index_url("empty-index");
+        let transport = FakeTransport::new();
+        transport.push(&url, ScriptedResponse::Http(200, " \n\t\n ".to_string()));
+
+        let mut client = fast_client(transport);
+        assert!(
+            client
+                .fetch_index_record("empty-index", "1.0.0")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            client
+                .fetch_index_record("empty-index", "2.0.0")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(client.transport.call_count(), 1);
+    }
+
+    #[test]
+    fn empty_sparse_index_result_is_refetched_by_a_new_client() {
+        // A new client opened against a cache file holding an empty entry
+        // must not treat that entry as a hit: it issues a request rather
+        // than reusing the stale empty result.
+        let dir = tempdir().unwrap();
+        let cache_path = dir.path().join("cache.json");
+        let url = index_url("does-not-exist");
+        let first_transport = FakeTransport::new();
+        first_transport.push(&url, ScriptedResponse::Http(404, String::new()));
+
+        let mut first_client = CratesIoClient::with_transport(
+            first_transport,
+            Some(&cache_path),
+            24,
+            RetryPolicy {
+                retry_count: NonZeroU32::new(1).unwrap(),
+                retry_delay: Duration::ZERO,
+                pacing_delay: Duration::ZERO,
+            },
+        );
+        assert!(
+            first_client
+                .fetch_index_record("does-not-exist", "1.0.0")
+                .unwrap()
+                .is_empty()
+        );
+        first_client.finish();
+
+        let second_transport = FakeTransport::new();
+        second_transport.push(&url, ScriptedResponse::Http(404, String::new()));
+        let mut second_client = CratesIoClient::with_transport(
+            second_transport,
+            Some(&cache_path),
+            24,
+            RetryPolicy {
+                retry_count: NonZeroU32::new(1).unwrap(),
+                retry_delay: Duration::ZERO,
+                pacing_delay: Duration::ZERO,
+            },
+        );
+        assert!(
+            second_client
+                .fetch_index_record("does-not-exist", "2.0.0")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(second_client.transport.call_count(), 1);
+    }
+
+    #[test]
+    fn sparse_index_transport_failure_is_not_cached() {
+        let url = index_url("retryable");
+        let transport = FakeTransport::new();
+        transport.push(&url, ScriptedResponse::Error);
+        transport.push(&url, ScriptedResponse::Http(404, String::new()));
+
+        let mut client = CratesIoClient::with_transport(
+            transport,
+            None,
+            24,
+            RetryPolicy {
+                retry_count: NonZeroU32::new(1).unwrap(),
+                retry_delay: Duration::ZERO,
+                pacing_delay: Duration::ZERO,
+            },
+        );
+        assert!(matches!(
+            client.fetch_index_record("retryable", "1.0.0"),
+            Err(FetchError::Retryable(_))
+        ));
+        assert!(
+            client
+                .fetch_index_record("retryable", "1.0.0")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(client.transport.call_count(), 2);
+    }
+
+    #[test]
+    fn fetch_index_record_cache_hit_issues_no_request() {
+        let transport = FakeTransport::new();
+        let mut client = fast_client(transport);
+        client.cache.set_index_records(
+            "serde",
+            vec![IndexRecord {
+                vers: "1.0.0".to_string(),
+                yanked: false,
+                deps: vec![],
+            }],
+        );
+
+        let records = client.fetch_index_record("serde", "1.0.0").unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].vers, "1.0.0");
+        assert_eq!(client.transport.call_count(), 0);
+    }
+
+    #[test]
+    fn fetch_index_record_refetches_when_cached_records_miss_needed_version() {
+        let url = index_url("serde");
+        let transport = FakeTransport::new();
+        transport.push(
+            &url,
+            ScriptedResponse::Http(200, r#"{"vers":"1.0.1","yanked":false}"#.to_string()),
+        );
+
+        let mut client = fast_client(transport);
+        client.cache.set_index_records(
+            "serde",
+            vec![IndexRecord {
+                vers: "1.0.0".to_string(),
+                yanked: false,
+                deps: vec![],
+            }],
+        );
+
+        let records = client.fetch_index_record("serde", "1.0.1").unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].vers, "1.0.1");
+        assert_eq!(client.transport.call_count(), 1);
+    }
+
+    #[test]
+    fn fetch_index_record_missing_version_is_refetched_once_per_run() {
+        // A non-empty cached entry that lacks the needed version is fetched
+        // once per run across repeated lookups, not once per lookup.
+        let url = index_url("serde");
+        let transport = FakeTransport::new();
+        transport.push(
+            &url,
+            ScriptedResponse::Http(200, r#"{"vers":"1.0.1","yanked":false}"#.to_string()),
+        );
+
+        let mut client = fast_client(transport);
+        client.cache.set_index_records(
+            "serde",
+            vec![IndexRecord {
+                vers: "1.0.0".to_string(),
+                yanked: false,
+                deps: vec![],
+            }],
+        );
+
+        for _ in 0..2 {
+            let records = client.fetch_index_record("serde", "1.0.1").unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].vers, "1.0.1");
+        }
+        assert_eq!(client.transport.call_count(), 1);
+    }
+
+    #[test]
+    fn fetch_index_record_memo_holds_records_even_with_zero_cache_age() {
+        // With `cache_max_age_hours = 0`, two lookups in one run issue one
+        // request and both return the real records. This must fail if the
+        // memo were a name set that re-reads the cache, since a
+        // just-written cache entry would then be judged expired.
+        let url = index_url("serde");
+        let transport = FakeTransport::new();
+        transport.push(
+            &url,
+            ScriptedResponse::Http(200, r#"{"vers":"1.0.0","yanked":false}"#.to_string()),
+        );
+
+        let mut client = CratesIoClient::with_transport(
+            transport,
+            None,
+            0,
+            RetryPolicy {
+                retry_count: NonZeroU32::new(3).unwrap(),
+                retry_delay: Duration::from_millis(0),
+                pacing_delay: Duration::from_millis(0),
+            },
+        );
+
+        for _ in 0..2 {
+            let records = client.fetch_index_record("serde", "1.0.0").unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].vers, "1.0.0");
+        }
+        assert_eq!(client.transport.call_count(), 1);
     }
 }

@@ -6,6 +6,7 @@ use std::process::ExitCode;
 mod api;
 mod cache;
 mod lockfile;
+mod manifest;
 mod policy;
 mod report;
 mod suggest;
@@ -45,6 +46,14 @@ struct Cli {
     /// For "too new" violations, suggest cargo update commands to downgrade to compliant versions
     #[arg(long, requires = "min_age_days")]
     suggest_fix: bool,
+
+    /// Consider prerelease versions as suggestion candidates (requires --suggest-fix)
+    ///
+    /// This only admits prerelease versions as candidates; it does not change
+    /// requirement matching. Ordinary SemVer requirements (e.g. `^1.2`) still
+    /// generally do not match prereleases, so most will still be rejected.
+    #[arg(long, requires = "suggest_fix")]
+    include_prerelease: bool,
 
     /// Path to the response cache file (enables caching)
     #[arg(long, env = "CARGO_OXIDATE_CACHE_PATH")]
@@ -116,7 +125,8 @@ fn run(cli: Cli) -> Result<bool> {
     let working_dir = std::env::current_dir().context("Failed to get current directory")?;
 
     // Parse lockfile
-    let packages = lockfile::load(&cli.cargo_lock, &working_dir)?;
+    let loaded_lockfile = lockfile::load(&cli.cargo_lock, &working_dir)?;
+    let packages = loaded_lockfile.packages;
 
     // Build API client
     let mut client = api::CratesIoClient::new(
@@ -129,8 +139,11 @@ fn run(cli: Cli) -> Result<bool> {
     let mut violations = Vec::new();
     let now = chrono::Utc::now();
 
-    let total = packages.len();
-    for (i, pkg) in packages.iter().enumerate() {
+    let registry_packages: Vec<&lockfile::Package> =
+        packages.iter().filter(|p| p.is_registry).collect();
+
+    let total = registry_packages.len();
+    for (i, pkg) in registry_packages.iter().enumerate() {
         if freshness_policy.is_exempt(&pkg.name) {
             continue;
         }
@@ -150,11 +163,32 @@ fn run(cli: Cli) -> Result<bool> {
     report::print_report(&violations);
 
     // Generate suggestions if requested
+    let has_too_new = violations
+        .iter()
+        .any(|v| matches!(v.kind, report::ViolationKind::TooNew(_)));
     if let Some(min_age) = suggest_min_age
-        && let Some(suggestions) =
-            suggest::generate_suggestions(&mut client, &violations, min_age, now)
+        && has_too_new
     {
-        report::print_suggestions(&suggestions);
+        let lockfile_dir = loaded_lockfile.path.parent().unwrap_or(&working_dir);
+
+        let (direct_requirements, manifest_warnings) =
+            manifest::load_direct_requirements(lockfile_dir);
+        for warning in &manifest_warnings {
+            eprintln!("  Warning: {warning}");
+        }
+
+        if let Some(outcomes) = suggest::generate_suggestions(
+            &mut client,
+            &violations,
+            &packages,
+            &direct_requirements,
+            lockfile_dir,
+            min_age,
+            cli.include_prerelease,
+            now,
+        ) {
+            report::print_suggestions(&outcomes);
+        }
     }
 
     client.finish();
@@ -176,6 +210,29 @@ mod tests {
     #[test]
     fn suggest_fix_with_min_age_days_parses() {
         let result = Cli::try_parse_from(["cargo-oxidate", "--suggest-fix", "--min-age-days", "7"]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn include_prerelease_without_suggest_fix_fails_to_parse() {
+        let result = Cli::try_parse_from([
+            "cargo-oxidate",
+            "--include-prerelease",
+            "--min-age-days",
+            "7",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn include_prerelease_with_suggest_fix_parses() {
+        let result = Cli::try_parse_from([
+            "cargo-oxidate",
+            "--suggest-fix",
+            "--min-age-days",
+            "7",
+            "--include-prerelease",
+        ]);
         assert!(result.is_ok());
     }
 }
