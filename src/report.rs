@@ -235,42 +235,10 @@ pub fn print_report(report: &RunReport) {
         println!("Elapsed: {} ms", report.duration.as_millis());
     }
 
-    if !report.required_errors.is_empty() {
-        for error in &report.required_errors {
-            let retryability = if error.retryable { " (retryable)" } else { "" };
-            match (&error.package, &error.version) {
-                (Some(package), Some(version)) => println!(
-                    "  error: could not check {package}@{version}{retryability}: {}",
-                    error.message,
-                ),
-                _ => println!("  error{retryability}: {}", error.message),
-            }
-        }
-    }
-
     print_violations(&report.violations, &report.policy);
 
-    print_warnings(&report.warnings);
     if let Some(outcomes) = &report.suggestions {
         print_suggestions(outcomes);
-    }
-}
-
-fn print_warnings(warnings: &[Diagnostic]) {
-    for warning in warnings {
-        // Suggestion failures are rendered with the other suggestion outcomes.
-        if warning.category == "suggestion" {
-            continue;
-        }
-        let context = match (&warning.package, &warning.version, &warning.path) {
-            (Some(package), Some(version), _) => format!(" for {package}@{version}"),
-            (_, _, Some(path)) => format!(" for {}", path.display()),
-            _ => String::new(),
-        };
-        println!(
-            "warning: {}{context}: {}",
-            warning.category, warning.message
-        );
     }
 }
 

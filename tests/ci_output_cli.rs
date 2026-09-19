@@ -107,3 +107,90 @@ fn quiet_and_verbose_cannot_be_combined() {
             .contains("cannot be used with")
     );
 }
+
+#[test]
+fn required_errors_stay_on_stderr_in_default_and_quiet_modes() {
+    let project = tempfile::tempdir().unwrap();
+    fs::write(project.path().join("Cargo.lock"), "this is not a lockfile").unwrap();
+
+    for args in [&[][..], &["--quiet"][..]] {
+        let output = Command::new(BIN)
+            .current_dir(project.path())
+            .args(args)
+            .args(["--min-age-days", "30"])
+            .output()
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(2), "args: {args:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stdout.contains("Dependency age check incomplete"));
+        assert!(stdout.contains("Coverage unavailable."));
+        assert!(!stdout.contains("error:"), "stdout was:\n{stdout}");
+        assert_eq!(
+            stderr
+                .lines()
+                .filter(|line| line.starts_with("error: "))
+                .count(),
+            1,
+            "stderr was:\n{stderr}"
+        );
+        assert!(stderr.contains("Cargo.lock"));
+        assert!(stderr.contains("parse error"));
+        assert!(!stderr.contains("Checking dependency ages in"));
+    }
+}
+
+#[test]
+fn optional_warnings_stay_on_stderr_in_default_and_quiet_modes() {
+    let project = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join("Cargo.lock"),
+        r#"version = 4
+
+[[package]]
+name = "local-widget"
+version = "1.0.0"
+"#,
+    )
+    .unwrap();
+    let cache = project.path().join("responses.json");
+    for args in [&[][..], &["--quiet"][..]] {
+        fs::write(&cache, "not JSON").unwrap();
+        let output = Command::new(BIN)
+            .current_dir(project.path())
+            .args(args)
+            .args([
+                "--min-age-days",
+                "30",
+                "--cache-path",
+                cache.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "args: {args:?}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stdout.contains("No eligible dependencies checked."));
+        assert!(stdout.contains("packages: total=1, checked=0"));
+        assert!(!stdout.contains("warning:"), "stdout was:\n{stdout}");
+        assert_eq!(
+            stderr.matches("warning:").count(),
+            1,
+            "stderr was:\n{stderr}"
+        );
+        assert!(stderr.contains("Could not read cache"));
+        assert_eq!(
+            stderr.contains("Checking dependency ages in"),
+            args.is_empty(),
+            "stderr was:\n{stderr}"
+        );
+    }
+}
