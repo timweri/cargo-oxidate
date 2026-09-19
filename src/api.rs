@@ -7,7 +7,7 @@ use std::num::NonZeroU32;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::cache::ResponseCache;
+use crate::cache::{CacheWarning, ResponseCache};
 
 #[derive(Deserialize)]
 struct CrateVersionResponse {
@@ -189,6 +189,7 @@ impl Default for RetryPolicy {
 pub struct CratesIoClient<T: Transport = UreqTransport> {
     transport: T,
     cache: ResponseCache,
+    cache_warning: Option<CacheWarning>,
     cache_max_age_hours: u64,
     retry_policy: RetryPolicy,
     /// Per-run memo of successfully fetched index records, keyed by crate
@@ -218,22 +219,29 @@ impl<T: Transport> CratesIoClient<T> {
         cache_max_age_hours: u64,
         retry_policy: RetryPolicy,
     ) -> Self {
+        let mut cache = ResponseCache::load(cache_path);
+        let cache_warning = cache.take_load_warning();
+
         Self {
             transport,
-            cache: ResponseCache::load(cache_path),
+            cache,
+            cache_warning,
             cache_max_age_hours,
             retry_policy,
             fetched_index_records: HashMap::new(),
         }
     }
 
-    /// Consumes the client, saving the cache. Cache write failures are
-    /// reported to stderr rather than propagated, since a broken cache
-    /// directory shouldn't fail the whole run.
-    pub fn finish(self) {
-        if let Err(e) = self.cache.save() {
-            eprintln!("Warning: failed to save cache: {e}");
-        }
+    pub fn take_cache_warning(&mut self) -> Option<CacheWarning> {
+        self.cache_warning.take()
+    }
+
+    /// Saves the cache and returns any save error as a warning.
+    pub fn finish(self) -> Option<CacheWarning> {
+        self.cache
+            .save()
+            .err()
+            .map(|error| self.cache.save_warning(error))
     }
 
     /// Sleeps for the inter-request rate limit window. Called only from the
@@ -534,6 +542,46 @@ mod tests {
                 pacing_delay: Duration::from_millis(0),
             },
         )
+    }
+
+    #[test]
+    fn finish_returns_cache_save_warning_without_failing_the_lookup() {
+        let dir = tempdir().unwrap();
+        let blocking_parent = dir.path().join("not-a-directory");
+        std::fs::write(&blocking_parent, "file").unwrap();
+        let cache_path = blocking_parent.join("responses.json");
+        let url = version_url("serde", "1.0.0");
+        let transport = FakeTransport::new();
+        transport.push(
+            &url,
+            ScriptedResponse::Http(200, version_body("2020-01-01T00:00:00Z")),
+        );
+        let mut client = CratesIoClient::with_transport(
+            transport,
+            Some(&cache_path),
+            24,
+            RetryPolicy {
+                retry_count: NonZeroU32::new(3).unwrap(),
+                retry_delay: Duration::ZERO,
+                pacing_delay: Duration::ZERO,
+            },
+        );
+
+        assert!(
+            client
+                .fetch_publish_date("serde", "1.0.0")
+                .unwrap()
+                .is_some()
+        );
+        let warning = client
+            .finish()
+            .expect("cache save failure should be reported");
+        assert_eq!(warning.path, cache_path);
+        assert!(
+            warning
+                .message
+                .contains("does not change the dependency check result")
+        );
     }
 
     #[test]

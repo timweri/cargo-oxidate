@@ -31,8 +31,25 @@ cargo-oxidate Cargo.lock --min-age-days 14 --max-age-days 730
 | `--include-prerelease` | Consider prerelease versions as suggestion candidates (requires `--suggest-fix`); ordinary SemVer requirements (e.g. `^1.2`) still generally don't match prereleases, so most will still be rejected |
 | `--cache-path PATH` | Enable response caching at PATH (or set `CARGO_OXIDATE_CACHE_PATH`) |
 | `--cache-max-age-hours N` | Max age for cached version listings (default: 24) |
+| `--quiet` | Suppress start and per-package progress messages |
+| `--verbose` | Show each package as it is checked |
+| `--format text\|json` | Render the final result as text (default) or JSON |
 
 At least one of `--min-age-days` or `--max-age-days` must be specified.
+
+## CI output
+
+The final report goes to standard output. Progress, warnings, and errors go to
+standard error. `--quiet` hides start and progress messages, while `--verbose`
+shows each package check. The flags cannot be combined.
+
+`--format json` writes one newline-terminated schema version 1 document. Its
+`status` is `passed`, `violations`, or `error`, matching exit codes 0, 1, and 2.
+The command also writes a document when it cannot load the lockfile. Consumers
+should ignore unknown fields because schema version 1 may add fields.
+
+Registry failures remain errors. Cache failures produce warnings and do not
+change the result.
 
 ## `--suggest-fix`
 
@@ -52,14 +69,16 @@ treats every declared requirement, including optional and target-specific ones, 
 
 Suggestions are best effort. The tool does not run Cargo's resolver or build your project, so Cargo
 can still reject a suggested command. Apply suggestions in order, then run the command again and
-run your tests. If the tool cannot find an eligible downgrade, it reports the requirement that
-blocks one when it knows that requirement.
+run your tests. For each package without a suggestion, the command explains
+which dependency blocks the downgrade or why it could not choose a version.
 
 ## Exit Codes
 
-- `0` — No violations found
-- `1` — Violations detected
-- `2` — Runtime error
+| Code | Meaning |
+|------|---------|
+| `0` | No dependency age violations |
+| `1` | Dependency age violations found |
+| `2` | Invalid input or incomplete required check |
 
 ## Caching
 

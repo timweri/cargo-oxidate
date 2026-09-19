@@ -1,5 +1,9 @@
-use crate::suggest::Outcome;
 use chrono::{DateTime, Utc};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+mod json;
+pub use json::render_json;
 
 /// A package's publish date and its resulting age, shared by both
 /// age-threshold violation kinds.
@@ -11,7 +15,7 @@ pub struct Aged {
 pub enum ViolationKind {
     TooNew(Aged),
     TooOld(Aged),
-    Unknown,
+    MissingPublishDate { reason: String },
 }
 
 pub struct Violation {
@@ -20,137 +24,292 @@ pub struct Violation {
     pub kind: ViolationKind,
 }
 
-fn print_section(header: &str, violations: &[(&Violation, &Aged)]) {
-    if violations.is_empty() {
-        return;
-    }
-    println!("  {header}");
-    let days_width = violations
-        .iter()
-        .map(|(_, aged)| aged.age_days.to_string().len())
-        .max()
-        .unwrap_or(1);
-    for (v, aged) in violations {
-        let date_str = aged.published.format("%Y-%m-%d").to_string();
-        println!(
-            "    {} | {:>width$} days old | {} {}",
-            date_str,
-            aged.age_days,
-            v.package,
-            v.version,
-            width = days_width
-        );
-    }
-    println!();
+/// The normalized age policy used for a run.
+pub struct Policy {
+    pub min_age_days: Option<u64>,
+    pub max_age_days: Option<u64>,
+    pub exclude_missing: bool,
+    pub exempt: Vec<String>,
 }
 
-pub fn print_report(violations: &[Violation]) {
-    if violations.is_empty() {
-        println!("\n✅ All dependencies pass freshness checks.");
-        return;
-    }
-
-    println!("\n❌ {} dependency violation(s) found:\n", violations.len());
-
-    // Group by kind
-    let too_new: Vec<_> = violations
-        .iter()
-        .filter_map(|v| match &v.kind {
-            ViolationKind::TooNew(aged) => Some((v, aged)),
-            _ => None,
-        })
-        .collect();
-    let too_old: Vec<_> = violations
-        .iter()
-        .filter_map(|v| match &v.kind {
-            ViolationKind::TooOld(aged) => Some((v, aged)),
-            _ => None,
-        })
-        .collect();
-    let unknown: Vec<_> = violations
-        .iter()
-        .filter(|v| matches!(v.kind, ViolationKind::Unknown))
-        .collect();
-
-    print_section(
-        "🚨 Too New (younger than threshold - possible supply chain risk):",
-        &too_new,
-    );
-    print_section(
-        "⏰ Too Old (older than threshold - consider updating):",
-        &too_old,
-    );
-
-    if !unknown.is_empty() {
-        println!("  ❓ Unknown (publish date could not be determined):");
-        for v in &unknown {
-            println!(
-                "    {:<10} | {:>15} | {} {}",
-                "unknown", "--", v.package, v.version
-            );
+impl Policy {
+    pub fn new(
+        min_age_days: Option<u64>,
+        max_age_days: Option<u64>,
+        exclude_missing: bool,
+        mut exempt: Vec<String>,
+    ) -> Self {
+        exempt
+            .iter_mut()
+            .for_each(|name| *name = name.trim().to_string());
+        exempt.retain(|name| !name.is_empty());
+        exempt.sort();
+        exempt.dedup();
+        Self {
+            min_age_days,
+            max_age_days,
+            exclude_missing,
+            exempt,
         }
-        println!();
     }
 }
 
-pub fn print_suggestions(outcomes: &[Outcome]) {
-    if outcomes.is_empty() {
-        println!("\n⚠️  Could not check \"too new\" violations for compliant versions.");
-        println!("    The registry may have been unreachable, or their versions unparsable.\n");
+/// Package counts. Each lockfile entry contributes to one field.
+#[derive(Default)]
+pub struct Summary {
+    pub total_packages: usize,
+    pub checked_packages: usize,
+    pub exempt_packages: usize,
+    pub unsupported_packages: usize,
+    pub excluded_missing_packages: usize,
+    pub failed_packages: usize,
+    pub not_checked_packages: usize,
+}
+
+pub struct Diagnostic {
+    pub category: &'static str,
+    pub package: Option<String>,
+    pub version: Option<String>,
+    pub path: Option<PathBuf>,
+    pub message: String,
+    pub retryable: bool,
+}
+
+/// The complete outcome of one invocation after argument parsing.
+pub struct RunReport {
+    /// The path supplied by the caller, retained even when resolution fails.
+    pub lockfile: PathBuf,
+    pub policy: Policy,
+    pub summary: Option<Summary>,
+    pub violations: Vec<Violation>,
+    pub required_errors: Vec<Diagnostic>,
+    pub warnings: Vec<Diagnostic>,
+    /// None when suggestions were not requested. Otherwise, this contains
+    /// every investigation outcome and may be empty.
+    pub suggestions: Option<Vec<crate::suggest::Outcome>>,
+    pub duration: Duration,
+}
+
+impl RunReport {
+    pub fn completed(lockfile: PathBuf, policy: Policy, summary: Summary) -> Self {
+        Self {
+            lockfile,
+            policy,
+            summary: Some(summary),
+            violations: Vec::new(),
+            required_errors: Vec::new(),
+            warnings: Vec::new(),
+            suggestions: None,
+            duration: Duration::ZERO,
+        }
+    }
+
+    pub fn failed(lockfile: PathBuf, policy: Policy, message: impl Into<String>) -> Self {
+        Self {
+            lockfile,
+            policy,
+            summary: None,
+            violations: Vec::new(),
+            required_errors: vec![Diagnostic {
+                category: "input",
+                package: None,
+                version: None,
+                path: None,
+                message: message.into(),
+                retryable: false,
+            }],
+            warnings: Vec::new(),
+            suggestions: None,
+            duration: Duration::ZERO,
+        }
+    }
+
+    pub fn exit_code(&self) -> u8 {
+        if !self.required_errors.is_empty() {
+            2
+        } else if !self.violations.is_empty() {
+            1
+        } else {
+            0
+        }
+    }
+}
+
+fn print_policy(policy: &Policy, lockfile: &Path) {
+    println!("Dependency age policy");
+    println!("  Lockfile: {}", lockfile.display());
+    match policy.min_age_days {
+        Some(days) => println!("  Minimum age: {days} days"),
+        None => println!("  Minimum age: not set"),
+    }
+    match policy.max_age_days {
+        Some(days) => println!("  Maximum age: {days} days"),
+        None => println!("  Maximum age: not set"),
+    }
+    if !policy.exempt.is_empty() {
+        println!("  Exempt packages: {}", policy.exempt.join(", "));
+    }
+    println!(
+        "  Missing publish dates: {}",
+        if policy.exclude_missing {
+            "excluded"
+        } else {
+            "reported as violations"
+        }
+    );
+}
+
+fn print_summary(summary: &Summary, violations: usize, duration: Duration) {
+    println!("Coverage");
+    println!(
+        "  packages: total={}, checked={}, exempt={}, unsupported={}, excluded missing={}, failed={}, not checked={}",
+        summary.total_packages,
+        summary.checked_packages,
+        summary.exempt_packages,
+        summary.unsupported_packages,
+        summary.excluded_missing_packages,
+        summary.failed_packages,
+        summary.not_checked_packages,
+    );
+    println!("  violations: {violations}");
+    println!("  elapsed: {} ms", duration.as_millis());
+}
+
+fn print_violations(violations: &[Violation], policy: &Policy) {
+    if violations.is_empty() {
         return;
     }
 
-    let has_suggestion = outcomes
+    println!("Dependency age violations");
+    for violation in violations {
+        match &violation.kind {
+            ViolationKind::TooNew(aged) => println!(
+                "  {}@{}: Below minimum age {} days (published {}, {} days old)",
+                violation.package,
+                violation.version,
+                policy
+                    .min_age_days
+                    .expect("too-new violations require a minimum age"),
+                aged.published.format("%Y-%m-%d"),
+                aged.age_days,
+            ),
+            ViolationKind::TooOld(aged) => println!(
+                "  {}@{}: Above maximum age {} days (published {}, {} days old)",
+                violation.package,
+                violation.version,
+                policy
+                    .max_age_days
+                    .expect("too-old violations require a maximum age"),
+                aged.published.format("%Y-%m-%d"),
+                aged.age_days,
+            ),
+            ViolationKind::MissingPublishDate { reason } => println!(
+                "  {}@{}: Publish date unavailable: {reason}",
+                violation.package, violation.version
+            ),
+        }
+    }
+}
+
+/// Prints the final result to standard output.
+pub fn print_report(report: &RunReport) {
+    if !report.required_errors.is_empty() {
+        println!("Dependency age check incomplete");
+    } else if !report.violations.is_empty() {
+        println!("Dependency age violations found");
+    } else if report
+        .summary
+        .as_ref()
+        .is_some_and(|summary| summary.checked_packages == 0)
+    {
+        println!("No eligible dependencies checked.");
+    } else {
+        println!("No dependency age violations found.");
+    }
+    print_policy(&report.policy, &report.lockfile);
+
+    if let Some(summary) = &report.summary {
+        print_summary(summary, report.violations.len(), report.duration);
+    } else {
+        println!("Coverage unavailable.");
+        println!("Elapsed: {} ms", report.duration.as_millis());
+    }
+
+    print_violations(&report.violations, &report.policy);
+
+    if let Some(outcomes) = &report.suggestions {
+        print_suggestions(outcomes);
+    }
+}
+
+pub fn print_suggestions(outcomes: &[crate::suggest::Outcome]) {
+    if outcomes.is_empty() {
+        return;
+    }
+
+    let suggestions: Vec<_> = outcomes
         .iter()
-        .any(|o| matches!(o, Outcome::Suggest { .. }));
-
-    if has_suggestion {
-        println!(
-            "\n💡 Suggested fixes for \"too new\" violations (apply top to bottom, then re-run):\n"
-        );
-
-        for outcome in outcomes {
-            if let Outcome::Suggest {
+        .filter_map(|outcome| match outcome {
+            crate::suggest::Outcome::Suggest {
                 package_spec,
                 locked_version,
                 suggested_version,
                 suggested_age_days,
                 unverified_dependents,
                 ..
-            } = outcome
-            {
-                let annotation = if unverified_dependents.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        "   (requirement of {} unverified)",
-                        unverified_dependents.join(", ")
-                    )
-                };
-                println!(
-                    "    cargo update -p {package_spec}@{locked_version} --precise {suggested_version}    # {suggested_age_days} days old{annotation}"
-                );
-            }
+            } => Some((
+                package_spec,
+                locked_version,
+                suggested_version,
+                suggested_age_days,
+                unverified_dependents,
+            )),
+            _ => None,
+        })
+        .collect();
+
+    if !suggestions.is_empty() {
+        println!(
+            "\nSuggested downgrades. Apply them from top to bottom, then run this check again:"
+        );
+        for (
+            package_spec,
+            locked_version,
+            suggested_version,
+            suggested_age_days,
+            unverified_dependents,
+        ) in &suggestions
+        {
+            let annotation = if unverified_dependents.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " (requirement of {} unverified)",
+                    unverified_dependents.join(", ")
+                )
+            };
+            println!(
+                "  cargo update -p {package_spec}@{locked_version} --precise {suggested_version} # {suggested_age_days} days old{annotation}"
+            );
         }
     }
 
-    let blocked: Vec<&Outcome> = outcomes
+    let blocked: Vec<_> = outcomes
         .iter()
-        .filter(|o| !matches!(o, Outcome::Suggest { .. }))
+        .filter(|outcome| !matches!(outcome, crate::suggest::Outcome::Suggest { .. }))
         .collect();
-
     if !blocked.is_empty() {
-        println!("\n⛔ No compatible compliant version:\n");
+        println!("\nOther downgrade outcomes:");
         for outcome in blocked {
             match outcome {
-                Outcome::Blocked {
+                crate::suggest::Outcome::Blocked {
                     package,
                     locked_version,
                     newest_compliant,
                     blocker,
                 } => {
                     let source = match &blocker.version {
-                        Some(v) => format!("{} {v}", blocker.name),
+                        Some(version) => format!("{} {version}", blocker.name),
                         None => blocker.name.clone(),
                     };
                     let also_suggested = if blocker.also_suggested {
@@ -161,31 +320,31 @@ pub fn print_suggestions(outcomes: &[Outcome]) {
                         String::new()
                     };
                     println!(
-                        "    {package} {locked_version}: newest compliant is {newest_compliant}, but {source} requires {}{also_suggested}",
+                        "  Downgrade blocked by dependency requirements for {package}@{locked_version}: newest eligible version is {newest_compliant}, but {source} requires {}{also_suggested}",
                         blocker.req
                     );
                 }
-                Outcome::NoCompliantVersion {
+                crate::suggest::Outcome::NoCompliantVersion {
                     package,
                     locked_version,
-                } => {
-                    println!(
-                        "    {package} {locked_version}: no eligible downgrade at least the minimum age old within its compatible range"
-                    );
-                }
-                Outcome::Suggest { .. } => unreachable!(),
+                } => println!(
+                    "  No eligible downgrade found for {package}@{locked_version} within its compatible version range"
+                ),
+                crate::suggest::Outcome::Unavailable {
+                    package,
+                    locked_version,
+                    reason,
+                } => println!(
+                    "  Could not determine a downgrade for {package}@{locked_version}: {reason}"
+                ),
+                crate::suggest::Outcome::Suggest { .. } => unreachable!(),
             }
         }
     }
 
-    if has_suggestion {
+    if !suggestions.is_empty() {
         println!(
-            r#"
-  Suggestions satisfy, on a best-effort basis, the version requirements verified from
-  Cargo.lock and your manifests. Requirements marked "unverified" above were not checked
-  and Cargo may still reject that suggestion. Source compatibility is not verified: build
-  or test after applying.
-"#
+            "\nThese suggestions check the version requirements in Cargo.lock and your manifests. They do not run Cargo's resolver, so Cargo may reject them. The check skipped requirements marked \"unverified\". Build or test after applying each suggestion."
         );
     }
 }

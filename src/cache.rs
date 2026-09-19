@@ -33,10 +33,18 @@ pub struct ResponseCache {
     path: Option<PathBuf>,
     data: CacheData,
     dirty: bool,
+    load_warning: Option<CacheWarning>,
+}
+
+/// A cache failure that does not stop the dependency check.
+pub struct CacheWarning {
+    pub path: PathBuf,
+    pub message: String,
 }
 
 impl ResponseCache {
     pub fn load(path: Option<&Path>) -> Self {
+        let mut load_warning = None;
         let path = path.map(|p| p.to_path_buf());
 
         let data = if let Some(ref p) = path {
@@ -44,31 +52,47 @@ impl ResponseCache {
                 Ok(contents) => match serde_json::from_str::<CacheData>(&contents) {
                     Ok(data) if data.version == CACHE_VERSION => data,
                     Ok(data) => {
-                        eprintln!(
-                            "Warning: unsupported cache version {} at {}, starting fresh",
-                            data.version,
-                            p.display()
-                        );
+                        load_warning = Some(CacheWarning {
+                            path: p.clone(),
+                            message: format!(
+                                "Cache version {} is unsupported. Checking without cached responses",
+                                data.version
+                            ),
+                        });
                         CacheData {
                             version: CACHE_VERSION,
                             ..Default::default()
                         }
                     }
                     Err(e) => {
-                        eprintln!(
-                            "Warning: corrupted cache file at {}, starting fresh: {e}",
-                            p.display()
-                        );
+                        load_warning = Some(CacheWarning {
+                            path: p.clone(),
+                            message: format!(
+                                "Could not read cache: {e}. Checking without cached responses"
+                            ),
+                        });
                         CacheData {
                             version: CACHE_VERSION,
                             ..Default::default()
                         }
                     }
                 },
-                Err(_) => CacheData {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => CacheData {
                     version: CACHE_VERSION,
                     ..Default::default()
                 },
+                Err(error) => {
+                    load_warning = Some(CacheWarning {
+                        path: p.clone(),
+                        message: format!(
+                            "Could not read cache: {error}. Checking without cached responses"
+                        ),
+                    });
+                    CacheData {
+                        version: CACHE_VERSION,
+                        ..Default::default()
+                    }
+                }
             }
         } else {
             CacheData {
@@ -81,6 +105,23 @@ impl ResponseCache {
             path,
             data,
             dirty: false,
+            load_warning,
+        }
+    }
+
+    pub fn take_load_warning(&mut self) -> Option<CacheWarning> {
+        self.load_warning.take()
+    }
+
+    pub fn save_warning(&self, error: anyhow::Error) -> CacheWarning {
+        CacheWarning {
+            path: self
+                .path
+                .clone()
+                .expect("cache save failures require a configured path"),
+            message: format!(
+                "Could not save cache: {error}. This does not change the dependency check result"
+            ),
         }
     }
 
@@ -251,12 +292,21 @@ mod tests {
         let path = dir.path().join("cache.json");
         std::fs::write(&path, "{ not valid json").unwrap();
 
-        let cache = ResponseCache::load(Some(&path));
+        let mut cache = ResponseCache::load(Some(&path));
         assert_eq!(cache.get_publish_date("anything", "0.0.1"), None);
         assert!(
             cache
                 .get_all_versions("anything", Duration::hours(1))
                 .is_none()
+        );
+        let warning = cache
+            .take_load_warning()
+            .expect("corrupt cache should produce a warning");
+        assert_eq!(warning.path, path);
+        assert!(
+            warning
+                .message
+                .contains("Checking without cached responses")
         );
     }
 
@@ -290,8 +340,30 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("does-not-exist.json");
 
-        let cache = ResponseCache::load(Some(&path));
+        let mut cache = ResponseCache::load(Some(&path));
         assert_eq!(cache.get_publish_date("serde", "1.0.0"), None);
+        assert!(cache.take_load_warning().is_none());
+    }
+
+    #[test]
+    fn save_failure_has_a_nonfatal_warning() {
+        let dir = tempdir().unwrap();
+        let blocking_parent = dir.path().join("not-a-directory");
+        std::fs::write(&blocking_parent, "file").unwrap();
+        let path = blocking_parent.join("cache.json");
+        let mut cache = ResponseCache::load(Some(&path));
+        cache.set_publish_date("serde", "1.0.0", sample_date());
+
+        let error = cache
+            .save()
+            .expect_err("a file cannot be a cache directory");
+        let warning = cache.save_warning(error);
+        assert_eq!(warning.path, path);
+        assert!(
+            warning
+                .message
+                .contains("does not change the dependency check result")
+        );
     }
 
     #[test]
