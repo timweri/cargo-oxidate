@@ -16,6 +16,7 @@ fn suggestions<T: Transport>(
     direct_requirements: &[DirectRequirement],
     working_dir: &Path,
 ) -> Vec<Outcome> {
+    let mut no_progress = |_| {};
     generate_suggestions(
         client,
         violations,
@@ -25,6 +26,7 @@ fn suggestions<T: Transport>(
         30,
         false,
         now(),
+        &mut no_progress,
     )
     .unwrap()
 }

@@ -119,17 +119,19 @@ fn suggest_fix_cli_reports_mixed_outcomes_and_preserves_project_files() {
         "stdout was:\n{stdout}"
     );
     assert!(
-        stdout.contains("beta 1.5.0") && stdout.contains("Cargo.toml") && stdout.contains("^1.5"),
+        stdout.contains("Downgrade blocked by dependency requirements for beta@1.5.0")
+            && stdout.contains("Cargo.toml")
+            && stdout.contains("^1.5"),
         "stdout was:\n{stdout}"
     );
     assert!(
-        stdout.contains("gamma 1.5.0")
+        stdout.contains("Downgrade blocked by dependency requirements for gamma@1.5.0")
             && stdout.contains("consumer 2.0.0")
             && stdout.contains("^1.5")
     );
     assert!(
         stdout.contains(
-            "delta 1.5.0: no eligible downgrade at least the minimum age old within its compatible range"
+            "No eligible downgrade found for delta@1.5.0 within its compatible version range"
         ),
         "stdout was:\n{stdout}"
     );
@@ -179,7 +181,7 @@ fn suggest_fix_cli_reports_excluded_lower_versions_as_no_eligible_downgrade() {
         assert!(
             stdout.lines().any(|line| {
                 line
-                    == "    delta 1.5.0: no eligible downgrade at least the minimum age old within its compatible range"
+                    == "  No eligible downgrade found for delta@1.5.0 within its compatible version range"
             }),
             "stdout was:\n{stdout}"
         );
@@ -374,7 +376,9 @@ fn suggest_fix_uses_manifest_beside_the_symlinks_real_lockfile() {
         "forbidden downgrade command was suggested; stdout was:\n{stdout}"
     );
     assert!(
-        stdout.contains("alpha 1.5.0") && stdout.contains("Cargo.toml") && stdout.contains("^1.5"),
+        stdout.contains("Downgrade blocked by dependency requirements for alpha@1.5.0")
+            && stdout.contains("Cargo.toml")
+            && stdout.contains("^1.5"),
         "expected the real manifest's restriction on alpha to be reported; stdout was:\n{stdout}"
     );
 }

@@ -14,6 +14,7 @@ pub struct FreshnessPolicy {
     max_age_days: Option<u64>,
     exclude_missing: bool,
     exempt: HashSet<String>,
+    effective_exemptions: Vec<String>,
 }
 
 impl FreshnessPolicy {
@@ -29,16 +30,33 @@ impl FreshnessPolicy {
             anyhow::bail!("At least one of --min-age-days or --max-age-days must be specified");
         }
 
+        let effective_exemptions =
+            crate::report::Policy::new(min_age_days, max_age_days, exclude_missing, exempt).exempt;
+
         Ok(Self {
             min_age_days,
             max_age_days,
             exclude_missing,
-            exempt: exempt.iter().map(|s| s.trim().to_string()).collect(),
+            exempt: effective_exemptions.iter().cloned().collect(),
+            effective_exemptions,
         })
     }
 
     pub fn is_exempt(&self, name: &str) -> bool {
         self.exempt.contains(name)
+    }
+
+    pub fn report_policy(&self) -> crate::report::Policy {
+        crate::report::Policy {
+            min_age_days: self.min_age_days,
+            max_age_days: self.max_age_days,
+            exclude_missing: self.exclude_missing,
+            exempt: self.effective_exemptions.clone(),
+        }
+    }
+
+    pub fn excludes_missing(&self) -> bool {
+        self.exclude_missing
     }
 
     /// Evaluates a package against the policy given its publish date (`None`
@@ -58,7 +76,9 @@ impl FreshnessPolicy {
                 violations.push(Violation {
                     package: pkg.name.clone(),
                     version: pkg.version.clone(),
-                    kind: ViolationKind::Unknown,
+                    kind: ViolationKind::MissingPublishDate {
+                        reason: "crates.io did not return this package version".to_string(),
+                    },
                 });
             }
             return violations;
@@ -211,7 +231,10 @@ mod tests {
 
         let violations = policy.evaluate(&pkg(), None, now);
         assert_eq!(violations.len(), 1);
-        assert!(matches!(violations[0].kind, ViolationKind::Unknown));
+        assert!(matches!(
+            violations[0].kind,
+            ViolationKind::MissingPublishDate { .. }
+        ));
     }
 
     #[test]
@@ -229,5 +252,22 @@ mod tests {
 
         assert!(policy.is_exempt("serde"));
         assert!(!policy.is_exempt(" serde "));
+    }
+
+    #[test]
+    fn effective_exemptions_are_trimmed_deduplicated_and_sorted() {
+        let policy = FreshnessPolicy::new(
+            Some(7),
+            None,
+            false,
+            vec![
+                " zeta ".to_string(),
+                "alpha".to_string(),
+                "zeta".to_string(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(policy.report_policy().exempt, ["alpha", "zeta"]);
     }
 }

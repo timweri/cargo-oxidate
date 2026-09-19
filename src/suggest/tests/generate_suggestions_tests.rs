@@ -506,8 +506,18 @@ fn an_unparsable_locked_version_does_not_abort_the_others() {
     let packages = vec![pkg("serde", "not-a-version", &[]), pkg("syn", "1.1.0", &[])];
     let outcomes = suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
 
-    assert_eq!(outcomes.len(), 1);
-    assert!(matches!(&outcomes[0], Outcome::Suggest { package, .. } if package == "syn"));
+    assert_eq!(outcomes.len(), 2);
+    assert!(matches!(
+        &outcomes[0],
+        Outcome::Unavailable {
+            package,
+            locked_version,
+            reason,
+        } if package == "serde"
+            && locked_version == "not-a-version"
+            && reason == "Locked version is not valid SemVer"
+    ));
+    assert!(matches!(&outcomes[1], Outcome::Suggest { package, .. } if package == "syn"));
 }
 
 #[test]
@@ -524,8 +534,16 @@ fn a_failed_fetch_does_not_abort_the_others() {
     let packages = vec![pkg("serde", "1.0.0", &[]), pkg("syn", "1.1.0", &[])];
     let outcomes = suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
 
-    assert_eq!(outcomes.len(), 1);
-    assert!(matches!(&outcomes[0], Outcome::Suggest { package, .. } if package == "syn"));
+    assert_eq!(outcomes.len(), 2);
+    assert!(matches!(
+        &outcomes[0],
+        Outcome::Unavailable {
+            package,
+            locked_version,
+            ..
+        } if package == "serde" && locked_version == "1.0.0"
+    ));
+    assert!(matches!(&outcomes[1], Outcome::Suggest { package, .. } if package == "syn"));
 }
 
 #[test]
@@ -547,6 +565,7 @@ fn no_too_new_violations_yields_none() {
     let mut client = fast_client(transport);
 
     let violations = vec![too_old("syn")];
+    let mut no_progress = |_| {};
     let outcomes = generate_suggestions(
         &mut client,
         &violations,
@@ -556,6 +575,7 @@ fn no_too_new_violations_yields_none() {
         30,
         false,
         now(),
+        &mut no_progress,
     );
 
     assert!(outcomes.is_none());

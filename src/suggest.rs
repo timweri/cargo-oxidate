@@ -45,6 +45,19 @@ pub enum Outcome {
         package: String,
         locked_version: String,
     },
+    Unavailable {
+        package: String,
+        locked_version: String,
+        reason: String,
+    },
+}
+
+/// Progress through requested downgrade investigations. The caller owns
+/// presentation so normal, quiet, and verbose CLI modes share one algorithm.
+pub struct SuggestionProgress {
+    pub current: usize,
+    pub total: usize,
+    pub package: String,
 }
 
 /// Whether `a` and `b` share Cargo's symmetric caret-compatible zone: major,
@@ -449,6 +462,7 @@ pub fn generate_suggestions<T: Transport>(
     min_age_days: u64,
     allow_prerelease: bool,
     now: DateTime<Utc>,
+    on_progress: &mut dyn FnMut(SuggestionProgress),
 ) -> Option<Vec<Outcome>> {
     let too_new: Vec<&Violation> = violations
         .iter()
@@ -462,25 +476,30 @@ pub fn generate_suggestions<T: Transport>(
     let (dependents_index, name_version_index) = build_indexes(all_packages);
 
     let mut outcomes = Vec::new();
-    eprintln!("\nFetching version suggestions...");
     for (i, violation) in too_new.iter().enumerate() {
-        eprintln!("  [{}/{}] {}", i + 1, too_new.len(), violation.package);
+        on_progress(SuggestionProgress {
+            current: i + 1,
+            total: too_new.len(),
+            package: violation.package.clone(),
+        });
 
         let Ok(locked) = Version::parse(&violation.version) else {
-            eprintln!(
-                "\n  Warning: failed to parse locked version for {}: {}",
-                violation.package, violation.version
-            );
+            outcomes.push(Outcome::Unavailable {
+                package: violation.package.clone(),
+                locked_version: violation.version.clone(),
+                reason: "Locked version is not valid SemVer".to_string(),
+            });
             continue;
         };
 
         let versions = match client.fetch_all_versions(&violation.package) {
             Ok(versions) => versions,
             Err(e) => {
-                eprintln!(
-                    "\n  Warning: failed to fetch versions for {}: {e}",
-                    violation.package
-                );
+                outcomes.push(Outcome::Unavailable {
+                    package: violation.package.clone(),
+                    locked_version: violation.version.clone(),
+                    reason: e.to_string(),
+                });
                 continue;
             }
         };

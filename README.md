@@ -31,8 +31,61 @@ cargo-oxidate Cargo.lock --min-age-days 14 --max-age-days 730
 | `--include-prerelease` | Consider prerelease versions as suggestion candidates (requires `--suggest-fix`); ordinary SemVer requirements (e.g. `^1.2`) still generally don't match prereleases, so most will still be rejected |
 | `--cache-path PATH` | Enable response caching at PATH (or set `CARGO_OXIDATE_CACHE_PATH`) |
 | `--cache-max-age-hours N` | Max age for cached version listings (default: 24) |
+| `--quiet` | Suppress start and per-package progress messages |
+| `--verbose` | Show each package as it is checked |
+| `--format text\|json` | Render the final result as text (default) or JSON |
 
 At least one of `--min-age-days` or `--max-age-days` must be specified.
+
+## CI output
+
+The final result is written to standard output. A concise start message and
+operational diagnostics are written to standard error. Use `--verbose` to see
+each package as it is checked, or `--quiet` to suppress start and progress
+messages while retaining warnings, errors, and the final result. The two flags
+cannot be combined.
+
+Use `--format json` for automation. It writes one newline-terminated JSON
+document to standard output; progress and operational diagnostics remain on
+standard error. Schema version 1 permits additive fields, and consumers should
+ignore fields they do not recognize.
+
+### JSON schema
+
+JSON output has these top-level fields: `schema_version`, `status`, `lockfile`,
+`policy`, `summary`, `violations`, `warnings`, `errors`, and `suggestions`.
+`status` is `passed`, `violations`, or `error`, matching exit codes 0, 1, and 2.
+The `summary` always includes the violation count and duration in milliseconds;
+its package-count fields are `null` when the lockfile could not be loaded.
+
+Each violation has `package`, `version`, and `kind`. Age violations also include
+`published_at`, `age_days`, and `threshold_days`; missing publish dates include
+`reason`. Diagnostics include `category` and `message`, plus package, version,
+or path context when available. Lookup diagnostics include `retryable`.
+
+`suggestions` is `null` unless `--suggest-fix` was requested. Once requested it
+is always an array, including when no downgrade investigation was needed. Its
+entries use `suggested`, `blocked`, `no_eligible_downgrade`, or `unavailable`
+`kind` values and carry the applicable command, blocker, uncertainty, or
+failure details. Fields may be added within schema version 1; removing a field
+or changing its type or meaning requires a new schema version.
+
+For example:
+
+```json
+{"schema_version":1,"status":"passed","lockfile":"Cargo.lock","policy":{"min_age_days":14,"max_age_days":null,"exclude_missing":false,"exempt":[]},"summary":{"total_packages":1,"checked_packages":1,"exempt_packages":0,"unsupported_packages":0,"excluded_missing_packages":0,"failed_packages":0,"not_checked_packages":0,"violations":0,"duration_ms":4},"violations":[],"warnings":[],"errors":[],"suggestions":null}
+```
+
+A lockfile that cannot be loaded still produces one document after parsing:
+
+```json
+{"schema_version":1,"status":"error","lockfile":"missing.lock","policy":{"min_age_days":14,"max_age_days":null,"exclude_missing":false,"exempt":[]},"summary":{"total_packages":null,"checked_packages":null,"exempt_packages":null,"unsupported_packages":null,"excluded_missing_packages":null,"failed_packages":null,"not_checked_packages":null,"violations":0,"duration_ms":0},"violations":[],"warnings":[],"errors":[{"category":"input","message":"Failed to parse Cargo.lock"}],"suggestions":null}
+```
+
+`--exclude-missing` excludes only confirmed missing publish dates. Registry
+lookup and response failures remain errors so CI can distinguish incomplete
+checks from age-policy violations. Cache read and write failures are warnings;
+the freshness check continues and its exit result is unchanged.
 
 ## `--suggest-fix`
 
@@ -52,14 +105,15 @@ treats every declared requirement, including optional and target-specific ones, 
 
 Suggestions are best effort. The tool does not run Cargo's resolver or build your project, so Cargo
 can still reject a suggested command. Apply suggestions in order, then run the command again and
-run your tests. If the tool cannot find an eligible downgrade, it reports the requirement that
-blocks one when it knows that requirement.
+run your tests. It reports whether a downgrade is blocked by a dependency
+requirement, no eligible downgrade exists, or a downgrade could not be
+determined because its version metadata was unavailable.
 
 ## Exit Codes
 
-- `0` — No violations found
-- `1` — Violations detected
-- `2` — Runtime error
+- `0` — No dependency age violations found
+- `1` — Dependency age violations found
+- `2` — A required check could not complete or input was invalid
 
 ## Caching
 
