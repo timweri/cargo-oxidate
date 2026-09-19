@@ -189,7 +189,7 @@ impl Default for RetryPolicy {
 pub struct CratesIoClient<T: Transport = UreqTransport> {
     transport: T,
     cache: ResponseCache,
-    cache_warnings: Vec<CacheWarning>,
+    cache_warning: Option<CacheWarning>,
     cache_max_age_hours: u64,
     retry_policy: RetryPolicy,
     /// Per-run memo of successfully fetched index records, keyed by crate
@@ -220,33 +220,28 @@ impl<T: Transport> CratesIoClient<T> {
         retry_policy: RetryPolicy,
     ) -> Self {
         let mut cache = ResponseCache::load(cache_path);
-        let mut cache_warnings = Vec::new();
-        if let Some(warning) = cache.take_load_warning() {
-            cache_warnings.push(warning);
-        }
+        let cache_warning = cache.take_load_warning();
 
         Self {
             transport,
             cache,
-            cache_warnings,
+            cache_warning,
             cache_max_age_hours,
             retry_policy,
             fetched_index_records: HashMap::new(),
         }
     }
 
-    /// Returns cache warnings gathered while setting up the client.
-    pub fn take_cache_warnings(&mut self) -> Vec<CacheWarning> {
-        std::mem::take(&mut self.cache_warnings)
+    pub fn take_cache_warning(&mut self) -> Option<CacheWarning> {
+        self.cache_warning.take()
     }
 
-    /// Consumes the client, saving its advisory cache. Save failures leave
-    /// the freshness result valid and are returned for final reporting.
+    /// Saves the cache and returns any save error as a warning.
     pub fn finish(self) -> Option<CacheWarning> {
         self.cache
             .save()
             .err()
-            .and_then(|error| self.cache.save_warning(error))
+            .map(|error| self.cache.save_warning(error))
     }
 
     /// Sleeps for the inter-request rate limit window. Called only from the
@@ -582,7 +577,11 @@ mod tests {
             .finish()
             .expect("cache save failure should be reported");
         assert_eq!(warning.path, cache_path);
-        assert!(warning.message.contains("computed results remain valid"));
+        assert!(
+            warning
+                .message
+                .contains("does not change the dependency check result")
+        );
     }
 
     #[test]

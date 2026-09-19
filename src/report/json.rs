@@ -256,8 +256,7 @@ fn suggestion_json(outcome: &Outcome) -> JsonSuggestion {
     }
 }
 
-/// Serializes one completed CLI report as schema version 1. Additive fields
-/// are permitted within this version; consumers must ignore unknown fields.
+/// Serializes a CLI report as schema version 1.
 pub fn render_json(report: &RunReport) -> serde_json::Result<String> {
     let summary = report.summary.as_ref().map_or_else(
         || JsonSummary::unavailable(report.violations.len(), report.duration.as_millis()),

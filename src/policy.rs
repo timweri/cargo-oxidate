@@ -60,9 +60,7 @@ impl FreshnessPolicy {
     }
 
     /// Evaluates a package against the policy given its publish date (`None`
-    /// if the lookup failed or found no date) and the current time,
-    /// returning the violations triggered. Warning about a failed lookup is
-    /// the caller's job.
+    /// when crates.io confirms the version is missing) and the current time.
     pub fn evaluate(
         &self,
         pkg: &Package,

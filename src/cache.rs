@@ -36,8 +36,7 @@ pub struct ResponseCache {
     load_warning: Option<CacheWarning>,
 }
 
-/// A non-fatal cache failure. Cache contents are advisory, so callers can
-/// report this and continue the freshness check with an empty cache.
+/// A cache failure that does not stop the dependency check.
 pub struct CacheWarning {
     pub path: PathBuf,
     pub message: String,
@@ -56,7 +55,7 @@ impl ResponseCache {
                         load_warning = Some(CacheWarning {
                             path: p.clone(),
                             message: format!(
-                                "Cache version {} is unsupported; checking continues without cached responses",
+                                "Cache version {} is unsupported. Checking without cached responses",
                                 data.version
                             ),
                         });
@@ -69,7 +68,7 @@ impl ResponseCache {
                         load_warning = Some(CacheWarning {
                             path: p.clone(),
                             message: format!(
-                                "Could not read cache; checking continues without cached responses: {e}"
+                                "Could not read cache: {e}. Checking without cached responses"
                             ),
                         });
                         CacheData {
@@ -86,7 +85,7 @@ impl ResponseCache {
                     load_warning = Some(CacheWarning {
                         path: p.clone(),
                         message: format!(
-                            "Could not read cache; checking continues without cached responses: {error}"
+                            "Could not read cache: {error}. Checking without cached responses"
                         ),
                     });
                     CacheData {
@@ -114,13 +113,16 @@ impl ResponseCache {
         self.load_warning.take()
     }
 
-    pub fn save_warning(&self, error: anyhow::Error) -> Option<CacheWarning> {
-        self.path.as_ref().map(|path| CacheWarning {
-            path: path.clone(),
+    pub fn save_warning(&self, error: anyhow::Error) -> CacheWarning {
+        CacheWarning {
+            path: self
+                .path
+                .clone()
+                .expect("cache save failures require a configured path"),
             message: format!(
-                "Could not save cache; computed results remain valid but could not be cached: {error}"
+                "Could not save cache: {error}. This does not change the dependency check result"
             ),
-        })
+        }
     }
 
     pub fn get_publish_date(&self, name: &str, version: &str) -> Option<DateTime<Utc>> {
@@ -301,7 +303,11 @@ mod tests {
             .take_load_warning()
             .expect("corrupt cache should produce a warning");
         assert_eq!(warning.path, path);
-        assert!(warning.message.contains("checking continues"));
+        assert!(
+            warning
+                .message
+                .contains("Checking without cached responses")
+        );
     }
 
     #[test]
@@ -351,11 +357,13 @@ mod tests {
         let error = cache
             .save()
             .expect_err("a file cannot be a cache directory");
-        let warning = cache
-            .save_warning(error)
-            .expect("configured cache path should produce a warning");
+        let warning = cache.save_warning(error);
         assert_eq!(warning.path, path);
-        assert!(warning.message.contains("computed results remain valid"));
+        assert!(
+            warning
+                .message
+                .contains("does not change the dependency check result")
+        );
     }
 
     #[test]

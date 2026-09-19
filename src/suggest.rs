@@ -52,8 +52,7 @@ pub enum Outcome {
     },
 }
 
-/// Progress through requested downgrade investigations. The caller owns
-/// presentation so normal, quiet, and verbose CLI modes share one algorithm.
+/// Sent to the progress callback before each downgrade check.
 pub struct SuggestionProgress {
     pub current: usize,
     pub total: usize,
@@ -451,7 +450,6 @@ fn build_package_spec(name: &str, target_source: Option<&str>, is_ambiguous: boo
 }
 
 /// Generates outcomes for "too new" violations, or `None` when there are none.
-/// Ignores packages whose version list cannot be fetched.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_suggestions<T: Transport>(
     client: &mut CratesIoClient<T>,

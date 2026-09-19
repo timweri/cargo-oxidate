@@ -135,7 +135,7 @@ fn suggest_fix_cli_reports_mixed_outcomes_and_preserves_project_files() {
         ),
         "stdout was:\n{stdout}"
     );
-    assert!(stdout.contains("best-effort"));
+    assert!(stdout.contains("They do not run Cargo's resolver"));
     assert_eq!(
         fs::read(project.path().join("Cargo.toml")).unwrap(),
         manifest_before
@@ -246,13 +246,16 @@ fn suggest_fix_cli_retains_best_effort_qualification() {
         stdout.contains("requirement of consumer unverified"),
         "stdout was:\n{stdout}"
     );
-    assert!(stdout.contains("best-effort"), "stdout was:\n{stdout}");
     assert!(
-        stdout.contains("apply top to bottom, then re-run"),
+        stdout.contains("They do not run Cargo's resolver"),
         "stdout was:\n{stdout}"
     );
     assert!(
-        stdout.contains("or test after applying"),
+        stdout.contains("Apply them from top to bottom, then run this check again"),
+        "stdout was:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Build or test after applying each suggestion"),
         "stdout was:\n{stdout}"
     );
 }

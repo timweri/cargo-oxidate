@@ -24,8 +24,7 @@ pub struct Violation {
     pub kind: ViolationKind,
 }
 
-/// The effective age policy used for a run. This is data rather than CLI
-/// arguments so every renderer reports the same policy after normalization.
+/// The normalized age policy used for a run.
 pub struct Policy {
     pub min_age_days: Option<u64>,
     pub max_age_days: Option<u64>,
@@ -55,7 +54,7 @@ impl Policy {
     }
 }
 
-/// Disjoint coverage counts for lockfile package entries.
+/// Package counts. Each lockfile entry contributes to one field.
 #[derive(Default)]
 pub struct Summary {
     pub total_packages: usize,
@@ -76,8 +75,7 @@ pub struct Diagnostic {
     pub retryable: bool,
 }
 
-/// The complete outcome of one invocation after argument parsing. It is the
-/// single source for the text report today and structured output later.
+/// The complete outcome of one invocation after argument parsing.
 pub struct RunReport {
     /// The path supplied by the caller, retained even when resolution fails.
     pub lockfile: PathBuf,
@@ -86,8 +84,8 @@ pub struct RunReport {
     pub violations: Vec<Violation>,
     pub required_errors: Vec<Diagnostic>,
     pub warnings: Vec<Diagnostic>,
-    /// None when suggestions were not requested; otherwise every requested
-    /// investigation outcome is present, including an empty list.
+    /// None when suggestions were not requested. Otherwise, this contains
+    /// every investigation outcome and may be empty.
     pub suggestions: Option<Vec<crate::suggest::Outcome>>,
     pub duration: Duration,
 }
@@ -189,7 +187,9 @@ fn print_violations(violations: &[Violation], policy: &Policy) {
                 "  {}@{}: Below minimum age {} days (published {}, {} days old)",
                 violation.package,
                 violation.version,
-                policy.min_age_days.unwrap_or_default(),
+                policy
+                    .min_age_days
+                    .expect("too-new violations require a minimum age"),
                 aged.published.format("%Y-%m-%d"),
                 aged.age_days,
             ),
@@ -197,7 +197,9 @@ fn print_violations(violations: &[Violation], policy: &Policy) {
                 "  {}@{}: Above maximum age {} days (published {}, {} days old)",
                 violation.package,
                 violation.version,
-                policy.max_age_days.unwrap_or_default(),
+                policy
+                    .max_age_days
+                    .expect("too-old violations require a maximum age"),
                 aged.published.format("%Y-%m-%d"),
                 aged.age_days,
             ),
@@ -209,8 +211,7 @@ fn print_violations(violations: &[Violation], policy: &Policy) {
     }
 }
 
-/// Renders a completed or initialization-failed run. Operational messages
-/// remain on stderr; this is the final result written to stdout.
+/// Prints the final result to standard output.
 pub fn print_report(report: &RunReport) {
     if !report.required_errors.is_empty() {
         println!("Dependency age check incomplete");
@@ -257,9 +258,7 @@ pub fn print_report(report: &RunReport) {
 
 fn print_warnings(warnings: &[Diagnostic]) {
     for warning in warnings {
-        // An unavailable suggestion is already rendered as its own outcome.
-        // Keep its diagnostic structured for JSON and stderr without
-        // repeating the same message in the text result.
+        // Suggestion failures are rendered with the other suggestion outcomes.
         if warning.category == "suggestion" {
             continue;
         }
@@ -302,7 +301,9 @@ pub fn print_suggestions(outcomes: &[crate::suggest::Outcome]) {
         .collect();
 
     if !suggestions.is_empty() {
-        println!("\nSuggested downgrades (apply top to bottom, then re-run):");
+        println!(
+            "\nSuggested downgrades. Apply them from top to bottom, then run this check again:"
+        );
         for (
             package_spec,
             locked_version,
@@ -375,7 +376,7 @@ pub fn print_suggestions(outcomes: &[crate::suggest::Outcome]) {
 
     if !suggestions.is_empty() {
         println!(
-            "\nSuggestions satisfy, on a best-effort basis, version requirements verified from Cargo.lock and your manifests. Requirements marked \"unverified\" above were not checked, and Cargo may still reject a suggestion. Source compatibility is not verified: build or test after applying."
+            "\nThese suggestions check the version requirements in Cargo.lock and your manifests. They do not run Cargo's resolver, so Cargo may reject them. The check skipped requirements marked \"unverified\". Build or test after applying each suggestion."
         );
     }
 }

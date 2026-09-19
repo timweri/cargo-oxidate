@@ -40,7 +40,7 @@ impl Verbosity {
     name = "cargo-oxidate",
     version,
     about = "Check Cargo dependency freshness",
-    after_help = "By default, confirmed missing publish dates are reported as violations. Use --exclude-missing to exclude them; lookup failures remain errors."
+    after_help = "By default, confirmed missing publish dates are reported as violations. Use --exclude-missing to exclude them. Lookup failures remain errors."
 )]
 struct Cli {
     /// Path to the Cargo.lock file
@@ -120,7 +120,7 @@ fn print_start(lockfile: &std::path::Path, policy: &report::Policy) {
         .max_age_days
         .map_or_else(|| "not set".to_string(), |days| format!("{days} days"));
     eprintln!(
-        "Checking dependency ages in {} (minimum age: {minimum_age}; maximum age: {maximum_age}).",
+        "Checking dependency ages in {}. Minimum age is {minimum_age}. Maximum age is {maximum_age}.",
         lockfile.display()
     );
 }
@@ -227,8 +227,6 @@ fn main() -> ExitCode {
     ExitCode::from(exit_code)
 }
 
-/// Checks all lockfile entries through a client. The generic transport keeps
-/// required-check behaviour testable without a public test-only CLI switch.
 fn check_packages<T: api::Transport>(
     client: &mut api::CratesIoClient<T>,
     freshness_policy: &policy::FreshnessPolicy,
@@ -325,7 +323,11 @@ fn run(cli: Cli, verbosity: Verbosity) -> report::RunReport {
         }
     };
 
-    let suggest_min_age = cli.suggest_fix.then_some(cli.min_age_days).flatten();
+    let suggest_min_age = if cli.suggest_fix {
+        cli.min_age_days
+    } else {
+        None
+    };
 
     let working_dir = match std::env::current_dir() {
         Ok(directory) => directory,
@@ -371,8 +373,8 @@ fn run(cli: Cli, verbosity: Verbosity) -> report::RunReport {
             );
         }
     };
-    let initial_cache_warnings = client.take_cache_warnings();
-    for warning in &initial_cache_warnings {
+    let initial_cache_warning = client.take_cache_warning();
+    if let Some(warning) = &initial_cache_warning {
         eprintln!("warning: {}: {}", warning.path.display(), warning.message);
     }
 
@@ -394,7 +396,7 @@ fn run(cli: Cli, verbosity: Verbosity) -> report::RunReport {
         now,
         Some(&mut print_check_progress),
     );
-    record_cache_warnings(&mut report, initial_cache_warnings);
+    record_cache_warnings(&mut report, initial_cache_warning);
 
     // Generate suggestions if requested
     let has_too_new = report
