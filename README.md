@@ -22,13 +22,13 @@ cargo-oxidate Cargo.lock --min-age-days 14 --max-age-days 730
 
 | Flag | Description |
 |------|-------------|
-| `--min-age-days N` | Flag packages newer than N days (supply chain security) |
-| `--max-age-days N` | Flag packages older than N days (staleness) |
-| `--exempt pkg1,pkg2` | Comma-separated packages to skip |
-| `--exclude-missing` | Don't flag packages with unknown publish dates |
+| `--min-age-days N` | Reject packages newer than N days (supply chain security) |
+| `--max-age-days N` | Reject packages older than N days (staleness) |
+| `--exempt pkg1,pkg2` | Packages to skip |
+| `--exclude-missing` | Accept packages with unknown publish dates |
 | `--timeout N` | HTTP timeout in seconds (default: 10) |
 | `--suggest-fix` | For "too new" violations, suggest `cargo update` commands to downgrade |
-| `--include-prerelease` | Consider prerelease versions as suggestion candidates (requires `--suggest-fix`); ordinary SemVer requirements (e.g. `^1.2`) still generally don't match prereleases, so most will still be rejected |
+| `--include-prerelease` | Modifier for `--suggest-fix`. Consider prerelease versions as suggestion candidates. |
 | `--cache-path PATH` | Enable response caching at PATH (or set `CARGO_OXIDATE_CACHE_PATH`) |
 | `--cache-max-age-hours N` | Max age for cached version listings (default: 24) |
 | `--quiet` | Suppress start and per-package progress messages |
@@ -37,30 +37,11 @@ cargo-oxidate Cargo.lock --min-age-days 14 --max-age-days 730
 
 At least one of `--min-age-days` or `--max-age-days` must be specified.
 
-## CI output
-
-The final report goes to standard output. Progress, warnings, and errors go to
-standard error. `--quiet` hides start and progress messages, while `--verbose`
-shows each package check. The flags cannot be combined.
-
-`--format json` writes one newline-terminated schema version 1 document. Its
-`status` is `passed`, `violations`, or `error`, matching exit codes 0, 1, and 2.
-The command also writes a document when it cannot load the lockfile. Consumers
-should ignore unknown fields because schema version 1 may add fields.
-
-Registry failures remain errors. Cache failures produce warnings and do not
-change the result.
-
 ## `--suggest-fix`
 
 `--suggest-fix` prints a `cargo update --precise` command for the newest eligible downgrade of
 each package that is too new. It checks dependency requirements it can verify from `Cargo.lock`
 and workspace manifests.
-
-A candidate must be old enough, not yanked, older than the locked version, and in its compatible
-version zone. The zone keeps the same major version, except that `0.x` keeps the same minor and
-`0.0.x` keeps the same patch. Prereleases are excluded unless you pass `--include-prerelease` or
-the locked version is itself a prerelease.
 
 Registry requirements come from the crates.io index. An optional registry declaration that cannot
 be confirmed active is shown as unverified. Target-specific registry declarations are enforced.
@@ -69,8 +50,7 @@ treats every declared requirement, including optional and target-specific ones, 
 
 Suggestions are best effort. The tool does not run Cargo's resolver or build your project, so Cargo
 can still reject a suggested command. Apply suggestions in order, then run the command again and
-run your tests. For each package without a suggestion, the command explains
-which dependency blocks the downgrade or why it could not choose a version.
+run your tests.
 
 ## Exit Codes
 
