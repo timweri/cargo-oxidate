@@ -378,12 +378,13 @@ fn run(cli: Cli, verbosity: Verbosity) -> report::RunReport {
         for outcome in &outcomes {
             if let suggest::Outcome::Unavailable {
                 package,
+                package_spec,
                 locked_version,
                 reason,
             } = outcome
             {
                 let message = format!(
-                    "Could not determine a downgrade for {package}@{locked_version}: {reason}"
+                    "Could not determine a downgrade for {package_spec}@{locked_version}: {reason}"
                 );
                 eprintln!("warning: {message}");
                 report.warnings.push(report::Diagnostic {

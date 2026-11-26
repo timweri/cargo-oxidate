@@ -37,16 +37,22 @@ pub enum Outcome {
     },
     Blocked {
         package: String,
+        /// Same as [`Outcome::Suggest::package_spec`].
+        package_spec: String,
         locked_version: String,
         newest_compliant: String,
         blocker: Blocker,
     },
     NoCompliantVersion {
         package: String,
+        /// Same as [`Outcome::Suggest::package_spec`].
+        package_spec: String,
         locked_version: String,
     },
     Unavailable {
         package: String,
+        /// Same as [`Outcome::Suggest::package_spec`].
+        package_spec: String,
         locked_version: String,
         reason: String,
     },
@@ -476,27 +482,6 @@ pub fn generate_suggestions<T: Transport>(
             package: violation.package.clone(),
         });
 
-        let Ok(locked) = Version::parse(&violation.version) else {
-            outcomes.push(Outcome::Unavailable {
-                package: violation.package.clone(),
-                locked_version: violation.version.clone(),
-                reason: "Locked version is not valid SemVer".to_string(),
-            });
-            continue;
-        };
-
-        let versions = match client.fetch_all_versions(&violation.package) {
-            Ok(versions) => versions,
-            Err(e) => {
-                outcomes.push(Outcome::Unavailable {
-                    package: violation.package.clone(),
-                    locked_version: violation.version.clone(),
-                    reason: e.to_string(),
-                });
-                continue;
-            }
-        };
-
         let same_name_version = name_version_index
             .get(&(violation.package.as_str(), violation.version.as_str()))
             .map(Vec::as_slice)
@@ -514,6 +499,29 @@ pub fn generate_suggestions<T: Transport>(
             target_source,
             same_name_version.len() > 1,
         );
+
+        let Ok(locked) = Version::parse(&violation.version) else {
+            outcomes.push(Outcome::Unavailable {
+                package: violation.package.clone(),
+                package_spec,
+                locked_version: violation.version.clone(),
+                reason: "Locked version is not valid SemVer".to_string(),
+            });
+            continue;
+        };
+
+        let versions = match client.fetch_all_versions(&violation.package) {
+            Ok(versions) => versions,
+            Err(e) => {
+                outcomes.push(Outcome::Unavailable {
+                    package: violation.package.clone(),
+                    package_spec,
+                    locked_version: violation.version.clone(),
+                    reason: e.to_string(),
+                });
+                continue;
+            }
+        };
 
         let gathered = gather_constraints(
             client,
@@ -540,6 +548,7 @@ pub fn generate_suggestions<T: Transport>(
                 blocker,
             } => Outcome::Blocked {
                 package: violation.package.clone(),
+                package_spec,
                 locked_version: violation.version.clone(),
                 newest_compliant: newest_compliant.to_string(),
                 blocker: Blocker {
@@ -554,6 +563,7 @@ pub fn generate_suggestions<T: Transport>(
             },
             WalkResult::NoCompliantVersion => Outcome::NoCompliantVersion {
                 package: violation.package.clone(),
+                package_spec,
                 locked_version: violation.version.clone(),
             },
         };

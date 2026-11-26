@@ -307,7 +307,7 @@ fn same_name_version_registries_keep_their_dependents_and_manifest_requirements_
             "control: the crates.io declaration is the pinned one",
             vec![CRATES_IO_SOURCE, ALT_REGISTRY_SOURCE],
             vec![crates_io("=1.0.102"), corp("^1.0")],
-            "anyhow: blocked at 1.0.100 by Cargo.toml =1.0.102".to_string(),
+            format!("anyhow: blocked at 1.0.100 by Cargo.toml =1.0.102 {spec}"),
         ),
     ];
     for (case, app_edge_sources, requirements, expected) in cases {
@@ -342,6 +342,29 @@ fn same_name_version_registries_keep_their_dependents_and_manifest_requirements_
         );
         assert_eq!(summaries(&outcomes), [expected], "{case}");
     }
+}
+
+#[test]
+fn unavailable_outcome_for_a_duplicated_package_carries_the_qualified_spec() {
+    // The invalid-SemVer early exit must still report the ambiguous spec.
+    let packages = [
+        pkg("anyhow", "not-semver", &[]),
+        external_pkg("anyhow", "not-semver", ALT_REGISTRY_SOURCE, &[]),
+    ];
+    let violations = [too_new("anyhow", "not-semver")];
+    let outcomes = suggestions(
+        FakeTransport::default(),
+        &violations,
+        &packages,
+        &[],
+        Path::new("/work"),
+    );
+    assert_eq!(
+        summaries(&outcomes),
+        [format!(
+            "anyhow: unavailable (Locked version is not valid SemVer) spec={CRATES_IO_SOURCE}#anyhow"
+        )]
+    );
 }
 
 #[test]

@@ -296,47 +296,33 @@ source = "registry+https://example.com/index"
             .unwrap()
             .packages;
 
+        let registry = Some("registry+https://github.com/rust-lang/crates.io-index");
         let sources: Vec<_> = packages
             .iter()
-            .filter(|p| p.name == "anyhow" && p.version == "1.0.102")
+            .filter(|p| p.name == "anyhow")
             .map(|p| p.source.as_deref())
             .collect();
         assert_eq!(sources.len(), 3);
-        assert!(
-            sources
-                .iter()
-                .any(|s| s.is_some_and(|s| s.starts_with("registry+")))
-        );
+        assert!(sources.contains(&None));
+        assert!(sources.contains(&registry));
         assert!(
             sources
                 .iter()
                 .any(|s| s.is_some_and(|s| s.starts_with("git+")))
         );
-        assert!(sources.contains(&None));
 
-        let registry_source = packages
-            .iter()
-            .find(|p| p.name == "anyhow" && p.is_registry)
-            .unwrap()
-            .source
-            .clone();
-        let app_sources: Vec<_> = find(&packages, "app")
-            .dependencies
-            .iter()
-            .map(|d| d.source.clone())
-            .collect();
-        assert_eq!(app_sources.len(), 2);
-        assert!(app_sources.contains(&registry_source));
-        assert!(
-            app_sources
+        let edge_sources = |name| {
+            find(&packages, name)
+                .dependencies
                 .iter()
-                .any(|s| s.as_deref().is_some_and(|s| s.starts_with("git+"))
-                    && *s != registry_source)
+                .map(|d| d.source.as_deref())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            edge_sources("app"),
+            [registry, Some("git+file:///fixture/gitsrc")]
         );
-
-        let other_edges = &find(&packages, "other").dependencies;
-        assert_eq!(other_edges.len(), 1);
-        assert_eq!(other_edges[0].source, None);
+        assert_eq!(edge_sources("other"), [None]);
     }
 
     #[test]
