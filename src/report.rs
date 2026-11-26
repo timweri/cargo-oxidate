@@ -309,10 +309,11 @@ fn other_outcome_line(outcome: &Outcome) -> Option<String> {
     match outcome {
         Outcome::Suggest { .. } => None,
         Outcome::Blocked {
-            package,
+            package_spec,
             locked_version,
             newest_compliant,
             blocker,
+            ..
         } => {
             let source = match &blocker.version {
                 Some(version) => format!("{} {version}", blocker.name),
@@ -326,22 +327,66 @@ fn other_outcome_line(outcome: &Outcome) -> Option<String> {
                 String::new()
             };
             Some(format!(
-                "  Downgrade blocked by dependency requirements for {package}@{locked_version}: newest eligible version is {newest_compliant}, but {source} requires {}{also_suggested}",
+                "  Downgrade blocked by dependency requirements for {package_spec}@{locked_version}: newest eligible version is {newest_compliant}, but {source} requires {}{also_suggested}",
                 blocker.req
             ))
         }
         Outcome::NoCompliantVersion {
-            package,
+            package_spec,
             locked_version,
+            ..
         } => Some(format!(
-            "  No eligible downgrade found for {package}@{locked_version} within its compatible version range and age limits"
+            "  No eligible downgrade found for {package_spec}@{locked_version} within its compatible version range and age limits"
         )),
         Outcome::Unavailable {
-            package,
+            package_spec,
             locked_version,
             reason,
+            ..
         } => Some(format!(
-            "  Could not determine a downgrade for {package}@{locked_version}: {reason}"
+            "  Could not determine a downgrade for {package_spec}@{locked_version}: {reason}"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::suggest::Blocker;
+
+    #[test]
+    fn non_suggest_outcome_lines_name_the_package_by_its_spec() {
+        let outcomes = [
+            Outcome::Blocked {
+                package: "anyhow".into(),
+                package_spec: "registry+https://example.com/index#anyhow".into(),
+                locked_version: "1.0.102".into(),
+                newest_compliant: "1.0.100".into(),
+                blocker: Blocker {
+                    name: "app".into(),
+                    version: None,
+                    req: "=1.0.102".into(),
+                    also_suggested: false,
+                },
+            },
+            Outcome::NoCompliantVersion {
+                package: "anyhow".into(),
+                package_spec: "registry+https://example.com/index#anyhow".into(),
+                locked_version: "1.0.102".into(),
+            },
+            Outcome::Unavailable {
+                package: "anyhow".into(),
+                package_spec: "registry+https://example.com/index#anyhow".into(),
+                locked_version: "1.0.102".into(),
+                reason: "offline".into(),
+            },
+        ];
+        for outcome in &outcomes {
+            let line = other_outcome_line(outcome).unwrap();
+            assert!(
+                line.contains("for registry+https://example.com/index#anyhow@1.0.102"),
+                "{line}"
+            );
+        }
     }
 }

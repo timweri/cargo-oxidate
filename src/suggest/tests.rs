@@ -107,11 +107,10 @@ fn summary(outcome: &Outcome) -> String {
             unverified_dependents,
             ..
         } => {
-            let mut line =
-                format!("{package}: suggest {suggested_version} ({suggested_age_days}d)");
-            if package_spec != package {
-                line += &format!(" spec={package_spec}");
-            }
+            let mut line = format!(
+                "{package}: suggest {suggested_version} ({suggested_age_days}d){}",
+                spec_suffix(package, package_spec)
+            );
             if !unverified_dependents.is_empty() {
                 line += &format!(" unverified: {}", unverified_dependents.join(","));
             }
@@ -119,6 +118,7 @@ fn summary(outcome: &Outcome) -> String {
         }
         Outcome::Blocked {
             package,
+            package_spec,
             newest_compliant,
             blocker,
             ..
@@ -133,14 +133,38 @@ fn summary(outcome: &Outcome) -> String {
                 ""
             };
             format!(
-                "{package}: blocked at {newest_compliant} by {}{version} {}{also}",
-                blocker.name, blocker.req
+                "{package}: blocked at {newest_compliant} by {}{version} {}{also}{}",
+                blocker.name,
+                blocker.req,
+                spec_suffix(package, package_spec)
             )
         }
-        Outcome::NoCompliantVersion { package, .. } => format!("{package}: no compliant version"),
+        Outcome::NoCompliantVersion {
+            package,
+            package_spec,
+            ..
+        } => format!(
+            "{package}: no compliant version{}",
+            spec_suffix(package, package_spec)
+        ),
         Outcome::Unavailable {
-            package, reason, ..
-        } => format!("{package}: unavailable ({reason})"),
+            package,
+            package_spec,
+            reason,
+            ..
+        } => format!(
+            "{package}: unavailable ({reason}){}",
+            spec_suffix(package, package_spec)
+        ),
+    }
+}
+
+/// ` spec=...` when the spec differs from the package name, else empty.
+fn spec_suffix(package: &str, package_spec: &str) -> String {
+    if package_spec == package {
+        String::new()
+    } else {
+        format!(" spec={package_spec}")
     }
 }
 

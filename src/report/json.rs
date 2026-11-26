@@ -183,6 +183,7 @@ fn suggestion_json(outcome: &Outcome) -> JsonSuggestion {
             locked_version,
             newest_compliant,
             blocker,
+            ..
         } => JsonSuggestion {
             kind: "blocked",
             package: package.clone(),
@@ -199,6 +200,7 @@ fn suggestion_json(outcome: &Outcome) -> JsonSuggestion {
         Outcome::NoCompliantVersion {
             package,
             locked_version,
+            ..
         } => JsonSuggestion {
             kind: "no_eligible_downgrade",
             package: package.clone(),
@@ -209,6 +211,7 @@ fn suggestion_json(outcome: &Outcome) -> JsonSuggestion {
             package,
             locked_version,
             reason,
+            ..
         } => JsonSuggestion {
             kind: "unavailable",
             package: package.clone(),
@@ -382,6 +385,7 @@ mod tests {
             },
             Outcome::Blocked {
                 package: "blocked".into(),
+                package_spec: "blocked".into(),
                 locked_version: "2.0.0".into(),
                 newest_compliant: "1.9.0".into(),
                 blocker: crate::suggest::Blocker {
@@ -393,10 +397,12 @@ mod tests {
             },
             Outcome::NoCompliantVersion {
                 package: "none".into(),
+                package_spec: "none".into(),
                 locked_version: "2.0.0".into(),
             },
             Outcome::Unavailable {
                 package: "unavailable".into(),
+                package_spec: "unavailable".into(),
                 locked_version: "2.0.0".into(),
                 reason: "registry request failed".into(),
             },
