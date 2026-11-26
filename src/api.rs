@@ -69,11 +69,16 @@ pub struct IndexDep {
 /// prefix directories. Matching is done on the lowercased name.
 pub fn sparse_index_path(name: &str) -> String {
     let lower = name.to_lowercase();
-    match lower.len() {
+    let chars: Vec<char> = lower.chars().collect();
+    match chars.len() {
         1 => format!("1/{lower}"),
         2 => format!("2/{lower}"),
-        3 => format!("3/{}/{lower}", &lower[0..1]),
-        _ => format!("{}/{}/{lower}", &lower[0..2], &lower[2..4]),
+        3 => format!("3/{}/{lower}", chars[0]),
+        _ => format!(
+            "{}/{}/{lower}",
+            chars[0..2].iter().collect::<String>(),
+            chars[2..4].iter().collect::<String>()
+        ),
     }
 }
 
@@ -680,6 +685,8 @@ mod tests {
         assert_eq!(sparse_index_path("syn"), "3/s/syn");
         assert_eq!(sparse_index_path("serde"), "se/rd/serde");
         assert_eq!(sparse_index_path("Serde"), "se/rd/serde");
+        assert_eq!(sparse_index_path("éa"), "2/éa");
+        assert_eq!(sparse_index_path("éabcd"), "éa/bc/éabcd");
     }
 
     #[test]
