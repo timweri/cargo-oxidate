@@ -286,6 +286,60 @@ source = "registry+https://example.com/index"
     }
 
     #[test]
+    fn dependency_edges_stay_separate_across_same_name_version_packages_from_different_sources() {
+        // `Cargo.lock` is Cargo-generated for a workspace with a crates.io, a
+        // git and a path `anyhow 1.0.102`. Only the directory of the git URL
+        // was edited (to `file:///fixture/`) because the original is a
+        // machine-specific path.
+        let fixture = Path::new("tests/fixtures/duplicate_sources/Cargo.lock");
+        let packages = load(fixture, Path::new(env!("CARGO_MANIFEST_DIR")))
+            .unwrap()
+            .packages;
+
+        let sources: Vec<_> = packages
+            .iter()
+            .filter(|p| p.name == "anyhow" && p.version == "1.0.102")
+            .map(|p| p.source.as_deref())
+            .collect();
+        assert_eq!(sources.len(), 3);
+        assert!(
+            sources
+                .iter()
+                .any(|s| s.is_some_and(|s| s.starts_with("registry+")))
+        );
+        assert!(
+            sources
+                .iter()
+                .any(|s| s.is_some_and(|s| s.starts_with("git+")))
+        );
+        assert!(sources.contains(&None));
+
+        let registry_source = packages
+            .iter()
+            .find(|p| p.name == "anyhow" && p.is_registry)
+            .unwrap()
+            .source
+            .clone();
+        let app_sources: Vec<_> = find(&packages, "app")
+            .dependencies
+            .iter()
+            .map(|d| d.source.clone())
+            .collect();
+        assert_eq!(app_sources.len(), 2);
+        assert!(app_sources.contains(&registry_source));
+        assert!(
+            app_sources
+                .iter()
+                .any(|s| s.as_deref().is_some_and(|s| s.starts_with("git+"))
+                    && *s != registry_source)
+        );
+
+        let other_edges = &find(&packages, "other").dependencies;
+        assert_eq!(other_edges.len(), 1);
+        assert_eq!(other_edges[0].source, None);
+    }
+
+    #[test]
     fn path_outside_working_directory_is_rejected() {
         let outside = tempdir().unwrap();
         let working_dir = tempdir().unwrap();

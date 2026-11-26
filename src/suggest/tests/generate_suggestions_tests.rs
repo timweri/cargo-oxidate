@@ -278,6 +278,73 @@ fn a_same_name_version_package_from_another_source_does_not_leak_dependents() {
 }
 
 #[test]
+fn same_name_version_registries_keep_their_dependents_and_manifest_requirements_apart() {
+    // crates.io `anyhow 1.0.102` is too new and so is a corporate-registry
+    // copy at the same version. `app` depends on the copies per row, and
+    // declares `anyhow` once for each registry. Only the crates.io
+    // declaration may constrain the crates.io copy, and `app` may only count
+    // as its dependent when it really depends on it.
+    let corp = |req| DirectRequirement {
+        source: RequirementSource::Registry("corp".to_string()),
+        ..local_requirement("app", "0.1.0", "anyhow", req)
+    };
+    let crates_io = |req| local_requirement("app", "0.1.0", "anyhow", req);
+    let spec = format!("spec={CRATES_IO_SOURCE}#anyhow");
+    let cases = [
+        (
+            "issue reproduction: app uses only the corporate copy",
+            vec![ALT_REGISTRY_SOURCE],
+            vec![corp("=1.0.102")],
+            format!("anyhow: suggest 1.0.100 (50d) {spec}"),
+        ),
+        (
+            "app uses both copies, the corporate one pinned",
+            vec![CRATES_IO_SOURCE, ALT_REGISTRY_SOURCE],
+            vec![crates_io("^1.0"), corp("=1.0.102")],
+            format!("anyhow: suggest 1.0.100 (50d) {spec}"),
+        ),
+        (
+            "control: the crates.io declaration is the pinned one",
+            vec![CRATES_IO_SOURCE, ALT_REGISTRY_SOURCE],
+            vec![crates_io("=1.0.102"), corp("^1.0")],
+            "anyhow: blocked at 1.0.100 by Cargo.toml =1.0.102".to_string(),
+        ),
+    ];
+    for (case, app_edge_sources, requirements, expected) in cases {
+        let transport = FakeTransport::default();
+        transport.versions("anyhow", &[("1.0.102", 1), ("1.0.100", 50)]);
+        transport.index_ok(
+            "reqwest",
+            r#"{"vers":"0.12.0","deps":[{"name":"anyhow","req":"^1.0"}]}"#,
+        );
+        let mut app = non_registry_pkg("app", "0.1.0", &[]);
+        app.dependencies = app_edge_sources
+            .iter()
+            .map(|source| PackageRef {
+                name: "anyhow".to_string(),
+                version: "1.0.102".to_string(),
+                source: Some(source.to_string()),
+            })
+            .collect();
+        let packages = [
+            pkg("anyhow", "1.0.102", &[]),
+            external_pkg("anyhow", "1.0.102", ALT_REGISTRY_SOURCE, &[]),
+            pkg("reqwest", "0.12.0", &[("anyhow", "1.0.102")]),
+            app,
+        ];
+        let violations = [too_new("anyhow", "1.0.102")];
+        let outcomes = suggestions(
+            transport,
+            &violations,
+            &packages,
+            &requirements,
+            Path::new("/work"),
+        );
+        assert_eq!(summaries(&outcomes), [expected], "{case}");
+    }
+}
+
+#[test]
 fn unmatched_registry_requirements_are_unverified() {
     let transport = FakeTransport::default();
     transport.index_ok(
