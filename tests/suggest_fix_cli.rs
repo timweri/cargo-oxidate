@@ -400,6 +400,33 @@ fn printed_source_qualified_command_updates_only_the_registry_package() {
         String::from_utf8_lossy(&generated.stderr)
     );
 
+    // The abbreviated spec really is ambiguous in this fixture; otherwise the
+    // printed source-qualified command below proves nothing.
+    let lock_before = fs::read_to_string(project.join("Cargo.lock")).unwrap();
+    let abbreviated = Command::new("cargo")
+        .args([
+            "update",
+            "-p",
+            "semver@1.0.28",
+            "--precise",
+            "1.0.27",
+            "--offline",
+        ])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        !abbreviated.status.success()
+            && String::from_utf8_lossy(&abbreviated.stderr).contains("ambiguous"),
+        "expected the abbreviated spec to be ambiguous in this fixture: {}",
+        String::from_utf8_lossy(&abbreviated.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("Cargo.lock")).unwrap(),
+        lock_before,
+        "the failed abbreviated update must leave Cargo.lock unchanged"
+    );
+
     let cache = write_cache(
         &project,
         &[("semver", "1.0.28", 2, vec![("1.0.28", 2), ("1.0.27", 80)])],
