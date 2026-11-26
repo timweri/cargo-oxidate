@@ -216,7 +216,7 @@ fn registry_dependent_declarations_decide_the_outcome() {
         ),
         (
             "build declaration is enforced",
-            r#"[{"name":"serde","req":"^1.5"},{"name":"serde","req":"^1","kind":"build"}]"#,
+            r#"[{"name":"serde","req":"^1"},{"name":"serde","req":"^1.5","kind":"build"}]"#,
             "serde: blocked at 1.4.0 by app@1.0.0 ^1.5",
         ),
         (
