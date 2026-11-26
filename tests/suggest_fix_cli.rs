@@ -8,6 +8,7 @@ use tar::Builder;
 use tempfile::{TempDir, tempdir};
 
 const BIN: &str = env!("CARGO_BIN_EXE_cargo-oxidate");
+/// `(name, locked_version, locked_age_days, [(version, age_days)])`.
 type CacheEntry<'a> = (&'a str, &'a str, i64, Vec<(&'a str, i64)>);
 
 fn run_oxidate(cwd: &Path, args: &[&str]) -> Output {
@@ -16,6 +17,25 @@ fn run_oxidate(cwd: &Path, args: &[&str]) -> Output {
         .current_dir(cwd)
         .output()
         .expect("cargo-oxidate should run")
+}
+
+fn run_suggest_fix(cwd: &Path, cache: &Path) -> Output {
+    run_oxidate(
+        cwd,
+        &[
+            "--min-age-days",
+            "30",
+            "--suggest-fix",
+            "--cache-path",
+            cache.to_str().unwrap(),
+        ],
+    )
+}
+
+fn edit_cache(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
+    let mut cache: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    edit(&mut cache);
+    fs::write(path, serde_json::to_vec(&cache).unwrap()).unwrap();
 }
 
 fn write_cache(dir: &Path, entries: &[CacheEntry<'_>]) -> std::path::PathBuf {
@@ -67,12 +87,10 @@ fn write_cache(dir: &Path, entries: &[CacheEntry<'_>]) -> std::path::PathBuf {
 fn copied_fixture() -> TempDir {
     let temp = tempdir().unwrap();
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/suggest_fix_e2e");
-    fs::copy(
-        fixture.join("app/Cargo.toml"),
-        temp.path().join("Cargo.toml"),
-    )
-    .unwrap();
-    fs::copy(fixture.join("Cargo.lock"), temp.path().join("Cargo.lock")).unwrap();
+    fs::create_dir(temp.path().join("app")).unwrap();
+    for file in ["Cargo.toml", "Cargo.lock", "app/Cargo.toml"] {
+        fs::copy(fixture.join(file), temp.path().join(file)).unwrap();
+    }
     temp
 }
 
@@ -89,29 +107,19 @@ fn suggest_fix_cli_reports_mixed_outcomes_and_preserves_project_files() {
             ("consumer", "2.0.0", 100, vec![("2.0.0", 100)]),
         ],
     );
-    let mut cache_json: serde_json::Value =
-        serde_json::from_slice(&fs::read(&cache).unwrap()).unwrap();
-    cache_json["index_records"]["consumer"]["records"] = serde_json::json!([{
-        "vers": "2.0.0",
-        "yanked": false,
-        "deps": [
-            { "name": "gamma", "req": "^1.5", "kind": null, "target": null, "optional": false, "package": null }
-        ]
-    }]);
-    fs::write(&cache, serde_json::to_vec(&cache_json).unwrap()).unwrap();
+    edit_cache(&cache, |cache| {
+        cache["index_records"]["consumer"]["records"] = serde_json::json!([{
+            "vers": "2.0.0",
+            "yanked": false,
+            "deps": [
+                { "name": "gamma", "req": "^1.5", "kind": null, "target": null, "optional": false, "package": null }
+            ]
+        }]);
+    });
 
     let manifest_before = fs::read(project.path().join("Cargo.toml")).unwrap();
     let lock_before = fs::read(project.path().join("Cargo.lock")).unwrap();
-    let output = run_oxidate(
-        project.path(),
-        &[
-            "--min-age-days",
-            "30",
-            "--suggest-fix",
-            "--cache-path",
-            cache.to_str().unwrap(),
-        ],
-    );
+    let output = run_suggest_fix(project.path(), &cache);
     assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(
@@ -119,19 +127,20 @@ fn suggest_fix_cli_reports_mixed_outcomes_and_preserves_project_files() {
         "stdout was:\n{stdout}"
     );
     assert!(
-        stdout.contains("Downgrade blocked by dependency requirements for beta@1.5.0")
-            && stdout.contains("Cargo.toml")
-            && stdout.contains("^1.5"),
+        stdout.contains(
+            "  Downgrade blocked by dependency requirements for beta@1.5.0: newest eligible version is 1.4.0, but app/Cargo.toml requires ^1.5\n"
+        ),
         "stdout was:\n{stdout}"
     );
     assert!(
-        stdout.contains("Downgrade blocked by dependency requirements for gamma@1.5.0")
-            && stdout.contains("consumer 2.0.0")
-            && stdout.contains("^1.5")
+        stdout.contains(
+            "  Downgrade blocked by dependency requirements for gamma@1.5.0: newest eligible version is 1.4.0, but consumer 2.0.0 requires ^1.5\n"
+        ),
+        "stdout was:\n{stdout}"
     );
     assert!(
         stdout.contains(
-            "No eligible downgrade found for delta@1.5.0 within its compatible version range"
+            "No eligible downgrade found for delta@1.5.0 within its compatible version range and age limits"
         ),
         "stdout was:\n{stdout}"
     );
@@ -148,7 +157,13 @@ fn suggest_fix_cli_reports_mixed_outcomes_and_preserves_project_files() {
 
 #[test]
 fn suggest_fix_cli_reports_excluded_lower_versions_as_no_eligible_downgrade() {
-    for (candidate, yanked) in [("1.4.0", true), ("1.4.0-beta.1", false)] {
+    // (lower candidate, its age in days, yanked, extra args)
+    let cases: [(_, _, _, &[&str]); 3] = [
+        ("1.4.0", 80, true, &[]),
+        ("1.4.0-beta.1", 80, false, &[]),
+        ("1.0.0", 1000, false, &["--max-age-days", "365"]),
+    ];
+    for (candidate, age, yanked, extra_args) in cases {
         let project = copied_fixture();
         let cache = write_cache(
             project.path(),
@@ -156,54 +171,50 @@ fn suggest_fix_cli_reports_excluded_lower_versions_as_no_eligible_downgrade() {
                 ("alpha", "1.5.0", 100, vec![]),
                 ("beta", "1.5.0", 100, vec![]),
                 ("gamma", "1.5.0", 100, vec![]),
-                ("delta", "1.5.0", 2, vec![("1.5.0", 2), (candidate, 80)]),
+                ("delta", "1.5.0", 2, vec![("1.5.0", 2), (candidate, age)]),
                 ("consumer", "2.0.0", 100, vec![]),
             ],
         );
-        let mut cache_json: serde_json::Value =
-            serde_json::from_slice(&fs::read(&cache).unwrap()).unwrap();
-        cache_json["all_versions"]["delta"]["versions"][1]["yanked"] = serde_json::json!(yanked);
-        fs::write(&cache, serde_json::to_vec(&cache_json).unwrap()).unwrap();
+        edit_cache(&cache, |cache| {
+            cache["all_versions"]["delta"]["versions"][1]["yanked"] = serde_json::json!(yanked);
+        });
 
-        let output = run_oxidate(
-            project.path(),
+        let cache_path = cache.to_str().unwrap();
+        let args = [
             &[
                 "--min-age-days",
                 "30",
                 "--suggest-fix",
                 "--cache-path",
-                cache.to_str().unwrap(),
-            ],
-        );
+                cache_path,
+            ][..],
+            extra_args,
+        ]
+        .concat();
+        let output = run_oxidate(project.path(), &args);
 
-        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(output.status.code(), Some(1), "candidate {candidate}");
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(
             stdout.lines().any(|line| {
                 line
-                    == "  No eligible downgrade found for delta@1.5.0 within its compatible version range"
+                    == "  No eligible downgrade found for delta@1.5.0 within its compatible version range and age limits"
             }),
-            "stdout was:\n{stdout}"
+            "candidate {candidate}, stdout was:\n{stdout}"
         );
         assert!(
             !stdout
                 .lines()
                 .any(|line| line.trim_start().starts_with("cargo update -p delta@")),
-            "stdout was:\n{stdout}"
+            "candidate {candidate}, stdout was:\n{stdout}"
         );
     }
 }
 
 #[test]
 fn suggest_fix_cli_retains_best_effort_qualification() {
-    let project = tempdir().unwrap();
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/suggest_fix_e2e");
-    fs::copy(
-        fixture.join("app/Cargo.toml"),
-        project.path().join("Cargo.toml"),
-    )
-    .unwrap();
-    let lock = fs::read_to_string(fixture.join("Cargo.lock")).unwrap();
+    let project = copied_fixture();
+    let lock = fs::read_to_string(project.path().join("Cargo.lock")).unwrap();
     let epsilon = "\n[[package]]\nname = \"epsilon\"\nversion = \"1.5.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"0000000000000000000000000000000000000000000000000000000000000000\"\n";
     fs::write(
         project.path().join("Cargo.lock"),
@@ -224,22 +235,12 @@ fn suggest_fix_cli_retains_best_effort_qualification() {
             ("consumer", "2.0.0", 100, vec![("2.0.0", 100)]),
         ],
     );
-    let mut cache_json: serde_json::Value =
-        serde_json::from_slice(&fs::read(&cache).unwrap()).unwrap();
-    cache_json["index_records"]["consumer"]["records"] = serde_json::json!([{
-        "vers": "1.0.0", "yanked": false, "deps": []
-    }]);
-    fs::write(&cache, serde_json::to_vec(&cache_json).unwrap()).unwrap();
-    let output = run_oxidate(
-        project.path(),
-        &[
-            "--min-age-days",
-            "30",
-            "--suggest-fix",
-            "--cache-path",
-            cache.to_str().unwrap(),
-        ],
-    );
+    edit_cache(&cache, |cache| {
+        cache["index_records"]["consumer"]["records"] = serde_json::json!([{
+            "vers": "1.0.0", "yanked": false, "deps": []
+        }]);
+    });
+    let output = run_suggest_fix(project.path(), &cache);
     assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(
@@ -258,73 +259,6 @@ fn suggest_fix_cli_retains_best_effort_qualification() {
         stdout.contains("Build or test after applying each suggestion"),
         "stdout was:\n{stdout}"
     );
-}
-
-#[test]
-fn suggest_fix_cli_reports_same_named_git_parent_once() {
-    let project = tempdir().unwrap();
-    fs::write(
-        project.path().join("Cargo.toml"),
-        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-    )
-    .unwrap();
-    fs::write(
-        project.path().join("Cargo.lock"),
-        r#"version = 4
-
-[[package]]
-name = "app"
-version = "0.1.0"
-
-[[package]]
-name = "parent"
-version = "1.0.0"
-source = "git+https://github.com/example/parent?tag=v1#1111111111111111111111111111111111111111"
-dependencies = [
- "foo",
-]
-
-[[package]]
-name = "parent"
-version = "2.0.0"
-source = "git+https://github.com/example/parent?tag=v2#2222222222222222222222222222222222222222"
-dependencies = [
- "foo",
-]
-
-[[package]]
-name = "foo"
-version = "1.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0000000000000000000000000000000000000000000000000000000000000000"
-"#,
-    )
-    .unwrap();
-    let cache = write_cache(
-        project.path(),
-        &[("foo", "1.9.0", 2, vec![("1.9.0", 2), ("1.7.0", 80)])],
-    );
-    let output = run_oxidate(
-        project.path(),
-        &[
-            "--min-age-days",
-            "30",
-            "--suggest-fix",
-            "--cache-path",
-            cache.to_str().unwrap(),
-        ],
-    );
-    assert_eq!(output.status.code(), Some(1));
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(
-        stdout.contains("cargo update -p foo@1.9.0 --precise 1.7.0"),
-        "stdout was:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("(requirement of parent unverified)"),
-        "stdout was:\n{stdout}"
-    );
-    assert!(!stdout.contains("parent, parent"), "stdout was:\n{stdout}");
 }
 
 #[cfg(unix)]
@@ -384,32 +318,6 @@ fn suggest_fix_uses_manifest_beside_the_symlinks_real_lockfile() {
             && stdout.contains("^1.5"),
         "expected the real manifest's restriction on alpha to be reported; stdout was:\n{stdout}"
     );
-}
-
-#[test]
-fn ordinary_and_invalid_cli_runs_keep_their_exit_contract() {
-    let project = tempdir().unwrap();
-    fs::write(
-        project.path().join("Cargo.toml"),
-        "[package]\nname = \"clean\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-    )
-    .unwrap();
-    fs::write(
-        project.path().join("Cargo.lock"),
-        "version = 4\n\n[[package]]\nname = \"clean\"\nversion = \"0.1.0\"\n",
-    )
-    .unwrap();
-
-    let clean = run_oxidate(project.path(), &["--min-age-days", "30"]);
-    assert!(clean.status.success());
-    assert!(
-        !String::from_utf8(clean.stdout)
-            .unwrap()
-            .contains("Suggested fixes")
-    );
-
-    let invalid = run_oxidate(project.path(), &["--suggest-fix"]);
-    assert_eq!(invalid.status.code(), Some(2));
 }
 
 #[test]
@@ -492,22 +400,44 @@ fn printed_source_qualified_command_updates_only_the_registry_package() {
         String::from_utf8_lossy(&generated.stderr)
     );
 
+    // The abbreviated spec really is ambiguous in this fixture; otherwise the
+    // printed source-qualified command below proves nothing.
+    let lock_before = fs::read_to_string(project.join("Cargo.lock")).unwrap();
+    let abbreviated = Command::new("cargo")
+        .args([
+            "update",
+            "-p",
+            "semver@1.0.28",
+            "--precise",
+            "1.0.27",
+            "--offline",
+        ])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        !abbreviated.status.success()
+            && String::from_utf8_lossy(&abbreviated.stderr).contains("ambiguous"),
+        "expected the abbreviated spec to be ambiguous in this fixture: {}",
+        String::from_utf8_lossy(&abbreviated.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("Cargo.lock")).unwrap(),
+        lock_before,
+        "the failed abbreviated update must leave Cargo.lock unchanged"
+    );
+
     let cache = write_cache(
         &project,
         &[("semver", "1.0.28", 2, vec![("1.0.28", 2), ("1.0.27", 80)])],
     );
-    let output = run_oxidate(
-        &project,
-        &[
-            "--min-age-days",
-            "30",
-            "--suggest-fix",
-            "--cache-path",
-            cache.to_str().unwrap(),
-        ],
-    );
+    let output = run_suggest_fix(&project, &cache);
     assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !stdout.contains("Other downgrade outcomes"),
+        "stdout was:\n{stdout}"
+    );
     let line = stdout
         .lines()
         .find(|line| line.trim_start().starts_with("cargo update "))

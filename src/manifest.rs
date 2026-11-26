@@ -17,9 +17,10 @@ const CRATES_IO_GIT_INDEX: &str = "https://github.com/rust-lang/crates.io-index"
 const CRATES_IO_SPARSE_INDEX: &str = "sparse+https://index.crates.io/";
 
 fn is_crates_io_identity(registry: &str) -> bool {
-    registry == CRATES_IO_REGISTRY_NAME
-        || registry == CRATES_IO_GIT_INDEX
-        || registry == CRATES_IO_SPARSE_INDEX
+    matches!(
+        registry,
+        CRATES_IO_REGISTRY_NAME | CRATES_IO_GIT_INDEX | CRATES_IO_SPARSE_INDEX
+    )
 }
 
 /// A registry requirement scoped to its declaring package and registry.
@@ -49,19 +50,17 @@ pub fn load_direct_requirements(lockfile_dir: &Path) -> (Vec<DirectRequirement>,
         return (vec![], warnings);
     }
 
-    let mut seen = HashSet::new();
-    seen.insert(canonical_or(lockfile_dir));
+    let canonical_root_dir = canonical_or(lockfile_dir);
+    let mut seen = HashSet::from([canonical_root_dir.clone()]);
 
     // `bool` marks whether the manifest is a workspace member (root or a
     // `workspace.members` entry) as opposed to a followed path dependency.
     let mut manifests: Vec<(PathBuf, Manifest, bool)> = Vec::new();
-    let mut has_workspace = false;
-    let mut workspace_exclude: Vec<String> = Vec::new();
+    let mut workspace: Option<cargo_toml::Workspace> = None;
     match load_manifest(&root_path) {
         Ok(root) => {
             if let Some(ws) = &root.workspace {
-                has_workspace = true;
-                workspace_exclude = ws.exclude.clone();
+                workspace = Some(ws.clone());
                 for member_dir in expand_members(lockfile_dir, ws) {
                     if !seen.insert(canonical_or(&member_dir)) {
                         continue;
@@ -79,19 +78,19 @@ pub fn load_direct_requirements(lockfile_dir: &Path) -> (Vec<DirectRequirement>,
     }
 
     // Follow one level; only in-tree, non-excluded dependencies are members.
-    let canonical_root_dir = canonical_or(lockfile_dir);
     let mut followed = Vec::new();
     for (path, manifest, _) in &manifests {
         let base_dir = path.parent().unwrap_or(lockfile_dir);
         for dep_dir in path_dependency_dirs(base_dir, manifest) {
-            if !seen.insert(canonical_or(&dep_dir)) {
+            let canonical_dep_dir = canonical_or(&dep_dir);
+            if !seen.insert(canonical_dep_dir.clone()) {
                 continue;
             }
             let dep_path = dep_dir.join("Cargo.toml");
-            let canonical_dep_dir = canonical_or(&dep_dir);
-            let is_member = has_workspace
-                && canonical_dep_dir.starts_with(&canonical_root_dir)
-                && !is_excluded(&canonical_root_dir, &canonical_dep_dir, &workspace_exclude);
+            let is_member = workspace.as_ref().is_some_and(|ws| {
+                canonical_dep_dir.starts_with(&canonical_root_dir)
+                    && !is_excluded(&canonical_root_dir, &canonical_dep_dir, ws)
+            });
             match load_manifest(&dep_path) {
                 Ok(m) => followed.push((dep_path, m, is_member)),
                 Err(e) => warnings.push(e),
@@ -114,54 +113,59 @@ fn canonical_or(path: &Path) -> PathBuf {
 
 fn load_manifest(path: &Path) -> Result<Manifest, String> {
     Manifest::from_path(path)
-        .map_err(|e| format!("Failed to parse manifest {}: {e}", path.display()))
+        .map_err(|e| format!("Failed to load manifest {}: {e}", path.display()))
 }
 
 /// Expands `workspace.members` glob patterns against `root_dir`, dropping
-/// anything matching `workspace.exclude`.
+/// anything matching `workspace.exclude`. Like cargo, a pattern that yields no
+/// glob results (or isn't a usable glob) is taken as a literal path; glob
+/// results that aren't directories are dropped.
 fn expand_members(root_dir: &Path, workspace: &cargo_toml::Workspace) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
 
     for pattern in &workspace.members {
         let full_pattern = root_dir.join(pattern);
-        let Some(pattern_str) = full_pattern.to_str() else {
-            continue;
+        let matches = glob_matches(&full_pattern);
+        let candidates = if matches.is_empty() {
+            vec![full_pattern]
+        } else {
+            matches.into_iter().filter(|p| p.is_dir()).collect()
         };
-        let Ok(paths) = glob::glob(pattern_str) else {
-            continue;
-        };
-        for entry in paths.flatten() {
-            if is_excluded(root_dir, &entry, &workspace.exclude) {
-                continue;
-            }
-            dirs.push(entry);
-        }
+        dirs.extend(
+            candidates
+                .into_iter()
+                .filter(|entry| !is_excluded(root_dir, entry, workspace)),
+        );
     }
 
     dirs
 }
 
-fn is_excluded(root_dir: &Path, member_dir: &Path, exclude: &[String]) -> bool {
-    let Ok(relative) = member_dir.strip_prefix(root_dir) else {
-        return false;
-    };
-    exclude.iter().any(|pattern| relative.starts_with(pattern))
+/// Paths matching `pattern`; empty if it is not valid UTF-8 or not a valid glob.
+fn glob_matches(pattern: &Path) -> Vec<PathBuf> {
+    pattern
+        .to_str()
+        .and_then(|s| glob::glob(s).ok())
+        .map(|paths| paths.flatten().collect())
+        .unwrap_or_default()
+}
+
+/// Mirrors cargo: a path is excluded when under an `exclude` entry, unless it is
+/// also under a `members` entry (explicit members win over exclude).
+fn is_excluded(root_dir: &Path, dir: &Path, workspace: &cargo_toml::Workspace) -> bool {
+    let under = |paths: &[String]| paths.iter().any(|p| dir.starts_with(root_dir.join(p)));
+    under(&workspace.exclude) && !under(&workspace.members)
 }
 
 /// Directories of every path dependency declared in `manifest`'s normal,
 /// dev, build, or target-specific dependency tables.
 fn path_dependency_dirs(base_dir: &Path, manifest: &Manifest) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    for deps in all_dep_sets(manifest, true) {
-        for dep in deps.values() {
-            if let Some(detail) = dep.detail()
-                && let Some(rel_path) = &detail.path
-            {
-                dirs.push(base_dir.join(rel_path));
-            }
-        }
-    }
-    dirs
+    all_dep_sets(manifest, true)
+        .into_iter()
+        .flat_map(|deps| deps.values())
+        .filter_map(|dep| dep.detail()?.path.as_ref())
+        .map(|rel_path| base_dir.join(rel_path))
+        .collect()
 }
 
 fn all_dep_sets(manifest: &Manifest, include_dev: bool) -> Vec<&DepsSet> {
@@ -224,10 +228,8 @@ fn collect_requirements(
     }
 }
 
-/// The registry a dependency declaration names. `dep` has already passed
-/// through workspace inheritance by the time it reaches here (`from_path`
-/// resolves it), so a `{ workspace = true }` dependency backed by a
-/// workspace-level `registry` is read the same way as one declared directly.
+/// The registry a dependency names. `from_path` has already applied workspace
+/// inheritance, so `{ workspace = true }` dependencies are read like direct ones.
 fn requirement_source(dep: &Dependency) -> RequirementSource {
     match dep
         .detail()
@@ -244,13 +246,32 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    fn write(dir: &Path, rel: &str, contents: &str) -> PathBuf {
+    fn write(dir: &Path, rel: &str, contents: &str) {
         let path = dir.join(rel);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    /// A manifest for package `name` whose `[dependencies]` table is `deps`.
+    fn package(name: &str, deps: &str) -> String {
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n\n[dependencies]\n{deps}\n")
+    }
+
+    /// Writes `files` (relative path, contents) into a fresh directory, then
+    /// loads that directory.
+    fn load(files: &[(&str, &str)]) -> (Vec<DirectRequirement>, Vec<String>) {
+        let dir = tempdir().unwrap();
+        for (rel, contents) in files {
+            write(dir.path(), rel, contents);
         }
-        std::fs::write(&path, contents).unwrap();
-        path
+        load_direct_requirements(dir.path())
+    }
+
+    /// Like `load`, but asserts that no warnings were produced.
+    fn load_ok(files: &[(&str, &str)]) -> Vec<DirectRequirement> {
+        let (reqs, warnings) = load(files);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        reqs
     }
 
     fn find<'a>(reqs: &'a [DirectRequirement], name: &str) -> &'a DirectRequirement {
@@ -259,67 +280,40 @@ mod tests {
             .unwrap_or_else(|| panic!("no requirement collected for {name}"))
     }
 
+    fn crate_names(reqs: &[DirectRequirement]) -> Vec<&str> {
+        let mut names: Vec<_> = reqs.iter().map(|r| r.crate_name.as_str()).collect();
+        names.sort();
+        names
+    }
+
     #[test]
     fn plain_string_requirement() {
-        let dir = tempdir().unwrap();
-        write(
-            dir.path(),
-            "Cargo.toml",
-            r#"
-[package]
-name = "root"
-version = "0.1.0"
+        let reqs = load_ok(&[("Cargo.toml", &package("root", r#"serde = "1.0""#))]);
 
-[dependencies]
-serde = "1.0"
-"#,
-        );
-
-        let (reqs, warnings) = load_direct_requirements(dir.path());
-        assert!(warnings.is_empty());
-        assert_eq!(
-            find(&reqs, "serde").req,
-            semver::VersionReq::parse("1.0").unwrap()
-        );
-        assert_eq!(find(&reqs, "serde").declaring_package, "root");
-        assert_eq!(
-            find(&reqs, "serde").declaring_version.as_deref(),
-            Some("0.1.0")
-        );
+        let serde = find(&reqs, "serde");
+        assert_eq!(serde.req, semver::VersionReq::parse("1.0").unwrap());
+        assert_eq!(serde.declaring_package, "root");
+        assert_eq!(serde.declaring_version.as_deref(), Some("0.1.0"));
     }
 
     #[test]
     fn workspace_inherited_declaring_version_is_resolved() {
-        // "member"'s own `version` is inherited from the workspace root, not
-        // written directly — the requirement's declaring identity must
-        // still resolve to the workspace-supplied version, not go missing.
-        let dir = tempdir().unwrap();
-        write(
-            dir.path(),
-            "Cargo.toml",
-            r#"
-[workspace]
-members = ["member"]
-
-[workspace.package]
-version = "2.3.4"
-"#,
-        );
-        write(
-            dir.path(),
-            "member/Cargo.toml",
-            r#"
+        let member = r#"
 [package]
 name = "member"
 version.workspace = true
 
 [dependencies]
 serde = "1.0"
-"#,
-        );
+"#;
+        let reqs = load_ok(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"member\"]\n\n[workspace.package]\nversion = \"2.3.4\"\n",
+            ),
+            ("member/Cargo.toml", member),
+        ]);
 
-        let (reqs, warnings) = load_direct_requirements(dir.path());
-        assert!(warnings.is_empty());
         assert_eq!(
             find(&reqs, "serde").declaring_version.as_deref(),
             Some("2.3.4")
@@ -327,210 +321,227 @@ serde = "1.0"
     }
 
     #[test]
-    fn unresolvable_declaring_version_is_reported_as_unavailable() {
-        // "member" inherits its version from the workspace, but the
-        // workspace root supplies no `[workspace.package]` value for it —
-        // the version genuinely can't be determined, and must come back as
-        // `None` rather than some guessed-at value.
-        let dir = tempdir().unwrap();
-        write(
-            dir.path(),
-            "Cargo.toml",
-            r#"
-[workspace]
-members = ["member"]
-"#,
-        );
-        write(
-            dir.path(),
-            "member/Cargo.toml",
-            r#"
+    fn unresolvable_inherited_version_warns_and_skips_the_member() {
+        // The workspace root supplies no `[workspace.package] version`.
+        let member = r#"
 [package]
 name = "member"
 version.workspace = true
 
 [dependencies]
 serde = "1.0"
-"#,
-        );
+"#;
+        let (reqs, warnings) = load(&[
+            ("Cargo.toml", "[workspace]\nmembers = [\"member\"]\n"),
+            ("member/Cargo.toml", member),
+        ]);
 
-        let (reqs, warnings) = load_direct_requirements(dir.path());
-        assert!(
-            !warnings.is_empty(),
-            "expected a warning about the unresolved workspace field"
-        );
-        assert!(
-            reqs.is_empty(),
-            "the member's manifest failed to load, so it collects no requirements"
-        );
+        assert!(!warnings.is_empty(), "expected a warning for the member");
+        assert!(reqs.is_empty());
     }
 
     #[test]
-    fn detailed_dependency_with_rename() {
-        let dir = tempdir().unwrap();
-        write(
-            dir.path(),
-            "Cargo.toml",
-            r#"
-[package]
-name = "root"
-version = "0.1.0"
-
-[dependencies]
-my_serde = { package = "serde", version = "1.0" }
-"#,
-        );
-
-        let (reqs, warnings) = load_direct_requirements(dir.path());
-        assert!(warnings.is_empty());
-        assert_eq!(reqs.len(), 1);
-        assert_eq!(reqs[0].crate_name, "serde");
-    }
-
-    #[test]
-    fn workspace_inherited_requirement() {
-        let dir = tempdir().unwrap();
-        write(
-            dir.path(),
-            "Cargo.toml",
-            r#"
+    fn workspace_inherited_dependency_keeps_version_and_registry() {
+        let reqs = load_ok(&[
+            (
+                "Cargo.toml",
+                r#"
 [workspace]
 members = ["member"]
 
 [workspace.dependencies]
-serde = "1.0"
+serde = { version = "1.0", registry = "priv" }
 "#,
-        );
-        write(
-            dir.path(),
-            "member/Cargo.toml",
-            r#"
-[package]
-name = "member"
-version = "0.1.0"
+            ),
+            (
+                "member/Cargo.toml",
+                &package("member", "serde = { workspace = true }"),
+            ),
+        ]);
 
-[dependencies]
-serde = { workspace = true }
-"#,
-        );
-
-        let (reqs, warnings) = load_direct_requirements(dir.path());
-        assert!(warnings.is_empty());
+        let serde = find(&reqs, "serde");
+        assert_eq!(serde.req, semver::VersionReq::parse("1.0").unwrap());
         assert_eq!(
-            find(&reqs, "serde").req,
-            semver::VersionReq::parse("1.0").unwrap()
+            serde.source,
+            RequirementSource::Registry("priv".to_string())
         );
     }
 
     #[test]
-    fn target_specific_table() {
-        let dir = tempdir().unwrap();
-        write(
-            dir.path(),
+    fn dependency_table_records_registry_identity() {
+        let reqs = load_ok(&[(
             "Cargo.toml",
             r#"
 [package]
 name = "root"
 version = "0.1.0"
+
+[dependencies]
+serde = "1.0"
+priv_serde = { package = "serde", version = "1.0", registry = "priv" }
+by_index = { version = "1.0", registry-index = "sparse+https://alt.example/index/" }
+
+[dev-dependencies]
+rand = { version = "0.8", registry = "priv" }
+
+[build-dependencies]
+libc = { version = "0.2", registry = "priv" }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+nix = { version = "0.2", registry = "priv" }
 "#,
-        );
+        )]);
 
-        let (reqs, warnings) = load_direct_requirements(dir.path());
-        assert!(warnings.is_empty());
+        let crates_io_serde = reqs
+            .iter()
+            .find(|r| r.crate_name == "serde" && r.source == RequirementSource::CratesIo)
+            .expect("plain serde dependency should resolve to crates.io");
         assert_eq!(
-            find(&reqs, "libc").req,
-            semver::VersionReq::parse("0.2").unwrap()
+            crates_io_serde.req,
+            semver::VersionReq::parse("1.0").unwrap()
+        );
+
+        let priv_serde = reqs
+            .iter()
+            .find(|r| r.crate_name == "serde" && r.source != RequirementSource::CratesIo)
+            .expect("renamed serde dependency should record its alternate registry");
+        assert_eq!(
+            priv_serde.source,
+            RequirementSource::Registry("priv".to_string())
+        );
+
+        for name in ["rand", "libc", "nix"] {
+            assert_eq!(
+                find(&reqs, name).source,
+                RequirementSource::Registry("priv".to_string()),
+                "{name} should record its alternate registry"
+            );
+        }
+        assert_eq!(
+            find(&reqs, "by_index").source,
+            RequirementSource::Registry("sparse+https://alt.example/index/".to_string())
         );
     }
 
     #[test]
-    fn workspace_members_glob_with_exclude() {
-        let dir = tempdir().unwrap();
-        write(
-            dir.path(),
+    fn explicit_crates_io_registry_identity_is_recognized() {
+        // `registry = "crates-io"` is Cargo's reserved name for the default
+        // registry, and a `registry-index` naming crates.io's own index URL
+        // is the same registry under its literal address.
+        let reqs = load_ok(&[(
             "Cargo.toml",
-            r#"
-[workspace]
-members = ["crates/*"]
-exclude = ["crates/skip-me"]
-"#,
+            &package(
+                "root",
+                r#"
+by_name = { package = "serde", version = "1.0", registry = "crates-io" }
+by_git_index = { package = "rand", version = "0.8", registry-index = "https://github.com/rust-lang/crates.io-index" }
+by_sparse_index = { package = "libc", version = "0.2", registry-index = "sparse+https://index.crates.io/" }"#,
+            ),
+        )]);
+
+        for name in ["serde", "rand", "libc"] {
+            assert_eq!(
+                find(&reqs, name).source,
+                RequirementSource::CratesIo,
+                "{name} should resolve to crates.io"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_exclude_drops_matching_glob_members() {
+        // The `./` form must exclude exactly like the plain one.
+        for exclude in ["crates/legacy", "./crates/legacy"] {
+            let root =
+                format!("[workspace]\nmembers = [\"crates/*\"]\nexclude = [\"{exclude}\"]\n");
+            let reqs = load_ok(&[
+                ("Cargo.toml", &root),
+                ("crates/a/Cargo.toml", &package("a", r#"serde = "1.0""#)),
+                (
+                    "crates/legacy/Cargo.toml",
+                    &package("legacy", r#"rand = "0.8""#),
+                ),
+            ]);
+
+            assert_eq!(crate_names(&reqs), ["serde"], "exclude = {exclude}");
+        }
+    }
+
+    #[test]
+    fn explicit_member_inside_excluded_dir_is_kept() {
+        let reqs = load_ok(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"crates/*\", \"crates/legacy/core\"]\nexclude = [\"crates/legacy\"]\n",
+            ),
+            (
+                "crates/legacy/Cargo.toml",
+                &package("legacy", r#"rand = "0.8""#),
+            ),
+            (
+                "crates/legacy/core/Cargo.toml",
+                &package("core", r#"serde = "1.0""#),
+            ),
+        ]);
+
+        assert_eq!(crate_names(&reqs), ["serde"]);
+    }
+
+    #[test]
+    fn stray_file_in_members_glob_is_not_a_member() {
+        let reqs = load_ok(&[
+            ("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n"),
+            ("crates/a/Cargo.toml", &package("a", r#"serde = "1.0""#)),
+            ("crates/.DS_Store", ""),
+        ]);
+
+        assert_eq!(crate_names(&reqs), ["serde"]);
+    }
+
+    #[test]
+    fn member_under_root_with_glob_metacharacters_is_found() {
+        // `[1]` in the root path makes the joined member pattern match nothing;
+        // cargo then uses the literal path, so we must too.
+        let parent = tempdir().unwrap();
+        let root = parent.path().join("proj[1]");
+        write(
+            &root,
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/a\"]\n",
         );
         write(
-            dir.path(),
+            &root,
             "crates/a/Cargo.toml",
-            r#"
-[package]
-name = "a"
-version = "0.1.0"
-
-[dependencies]
-serde = "1.0"
-"#,
-        );
-        write(
-            dir.path(),
-            "crates/skip-me/Cargo.toml",
-            r#"
-[package]
-name = "skip-me"
-version = "0.1.0"
-
-[dependencies]
-rand = "0.8"
-"#,
+            &package("a", r#"serde = "1.0""#),
         );
 
-        let (reqs, warnings) = load_direct_requirements(dir.path());
-        assert!(warnings.is_empty());
-        assert!(reqs.iter().any(|r| r.crate_name == "serde"));
-        assert!(!reqs.iter().any(|r| r.crate_name == "rand"));
+        let (reqs, warnings) = load_direct_requirements(&root);
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(crate_names(&reqs), ["serde"]);
     }
 
     #[test]
-    fn path_dependency_followed_one_level() {
-        let dir = tempdir().unwrap();
-        write(
-            dir.path(),
+    fn literal_member_with_missing_directory_warns() {
+        let (_, warnings) = load(&[(
             "Cargo.toml",
-            r#"
-[package]
-name = "root"
-version = "0.1.0"
+            "[workspace]\nmembers = [\"crates/missing\"]\n",
+        )]);
 
-[dependencies]
-helper = { path = "helper" }
-"#,
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("Failed to load manifest") && w.contains("missing")),
+            "{warnings:?}"
         );
-        write(
-            dir.path(),
-            "helper/Cargo.toml",
-            r#"
-[package]
-name = "helper"
-version = "0.1.0"
-
-[dependencies]
-serde = "1.0"
-"#,
-        );
-
-        let (reqs, warnings) = load_direct_requirements(dir.path());
-        assert!(warnings.is_empty());
-        assert!(reqs.iter().any(|r| r.crate_name == "serde"));
-        // The path dependency itself is skipped: it's not registry-versioned.
-        assert!(!reqs.iter().any(|r| r.crate_name == "helper"));
     }
 
     #[test]
-    fn followed_path_dependency_dev_dependencies_are_skipped() {
-        let dir = tempdir().unwrap();
-        write(
-            dir.path(),
-            "Cargo.toml",
-            r#"
+    fn path_dependency_is_followed_one_level_without_its_dev_dependencies() {
+        let reqs = load_ok(&[
+            (
+                "Cargo.toml",
+                r#"
 [package]
 name = "root"
 version = "0.1.0"
@@ -541,11 +552,10 @@ helper = { path = "helper" }
 [dev-dependencies]
 baz = "3"
 "#,
-        );
-        write(
-            dir.path(),
-            "helper/Cargo.toml",
-            r#"
+            ),
+            (
+                "helper/Cargo.toml",
+                r#"
 [package]
 name = "helper"
 version = "0.1.0"
@@ -556,26 +566,21 @@ foo = "1"
 [dev-dependencies]
 bar = "2"
 "#,
-        );
+            ),
+        ]);
 
-        let (reqs, warnings) = load_direct_requirements(dir.path());
-        assert!(warnings.is_empty());
         // helper is not a workspace member, so Cargo ignores its
-        // dev-dependencies.
-        assert!(reqs.iter().any(|r| r.crate_name == "foo"));
-        assert!(!reqs.iter().any(|r| r.crate_name == "bar"));
-        // The root is a workspace member, so its dev-dependencies are
-        // still collected.
-        assert!(reqs.iter().any(|r| r.crate_name == "baz"));
+        // dev-dependencies; the root's are collected. The path dependency
+        // itself is not registry-versioned.
+        assert_eq!(crate_names(&reqs), ["baz", "foo"]);
     }
 
     #[test]
     fn in_tree_path_dependency_of_workspace_is_a_member() {
-        let dir = tempdir().unwrap();
-        write(
-            dir.path(),
-            "Cargo.toml",
-            r#"
+        let reqs = load_ok(&[
+            (
+                "Cargo.toml",
+                r#"
 [workspace]
 members = []
 
@@ -586,11 +591,10 @@ version = "0.1.0"
 [dependencies]
 helper = { path = "helper" }
 "#,
-        );
-        write(
-            dir.path(),
-            "helper/Cargo.toml",
-            r#"
+            ),
+            (
+                "helper/Cargo.toml",
+                r#"
 [package]
 name = "helper"
 version = "0.1.0"
@@ -598,10 +602,9 @@ version = "0.1.0"
 [dev-dependencies]
 foo = "=1.9.0"
 "#,
-        );
+            ),
+        ]);
 
-        let (reqs, warnings) = load_direct_requirements(dir.path());
-        assert!(warnings.is_empty());
         let foo = find(&reqs, "foo");
         assert_eq!(foo.req, semver::VersionReq::parse("=1.9.0").unwrap());
         assert_eq!(foo.declaring_package, "helper");
@@ -609,11 +612,10 @@ foo = "=1.9.0"
 
     #[test]
     fn excluded_in_tree_path_dependency_is_not_a_member() {
-        let dir = tempdir().unwrap();
-        write(
-            dir.path(),
-            "Cargo.toml",
-            r#"
+        let reqs = load_ok(&[
+            (
+                "Cargo.toml",
+                r#"
 [workspace]
 members = []
 exclude = ["helper"]
@@ -625,11 +627,10 @@ version = "0.1.0"
 [dependencies]
 helper = { path = "helper" }
 "#,
-        );
-        write(
-            dir.path(),
-            "helper/Cargo.toml",
-            r#"
+            ),
+            (
+                "helper/Cargo.toml",
+                r#"
 [package]
 name = "helper"
 version = "0.1.0"
@@ -640,12 +641,10 @@ bar = "1"
 [dev-dependencies]
 foo = "=1.9.0"
 "#,
-        );
+            ),
+        ]);
 
-        let (reqs, warnings) = load_direct_requirements(dir.path());
-        assert!(warnings.is_empty());
-        assert!(!reqs.iter().any(|r| r.crate_name == "foo"));
-        assert!(reqs.iter().any(|r| r.crate_name == "bar"));
+        assert_eq!(crate_names(&reqs), ["bar"]);
     }
 
     #[test]
@@ -680,21 +679,20 @@ foo = "=1.9.0"
         );
 
         let (reqs, warnings) = load_direct_requirements(&dir.path().join("ws"));
+
         assert!(warnings.is_empty());
-        assert!(!reqs.iter().any(|r| r.crate_name == "foo"));
+        assert!(reqs.is_empty());
     }
 
     #[test]
     fn member_path_dependency_on_root_does_not_duplicate_root_requirements() {
-        // "member" declares a path dependency back to the workspace root
-        // (e.g. `app = { path = ".." }`). The root is already collected
-        // as a workspace member, so following that path dependency must not
-        // collect it a second time.
-        let dir = tempdir().unwrap();
-        write(
-            dir.path(),
-            "Cargo.toml",
-            r#"
+        // "member" depends back on the workspace root (`app = { path = ".." }`).
+        // The root is already collected as a member, so following that path
+        // dependency must not collect it a second time.
+        let reqs = load_ok(&[
+            (
+                "Cargo.toml",
+                r#"
 [workspace]
 members = ["member"]
 
@@ -705,158 +703,20 @@ version = "0.1.0"
 [dependencies]
 serde = "1.0"
 "#,
-        );
-        write(
-            dir.path(),
-            "member/Cargo.toml",
-            r#"
-[package]
-name = "member"
-version = "0.1.0"
+            ),
+            (
+                "member/Cargo.toml",
+                &package("member", r#"app = { path = ".." }"#),
+            ),
+        ]);
 
-[dependencies]
-app = { path = ".." }
-"#,
-        );
-
-        let (reqs, warnings) = load_direct_requirements(dir.path());
-        assert!(warnings.is_empty());
-        assert_eq!(
-            reqs.iter().filter(|r| r.crate_name == "serde").count(),
-            1,
-            "the root manifest's requirements must be collected exactly once"
-        );
-    }
-
-    #[test]
-    fn dependency_table_records_registry_identity() {
-        let dir = tempdir().unwrap();
-        write(
-            dir.path(),
-            "Cargo.toml",
-            r#"
-[package]
-name = "root"
-version = "0.1.0"
-
-[dependencies]
-serde = "1.0"
-priv_serde = { package = "serde", version = "1.0", registry = "priv" }
-
-[dev-dependencies]
-rand = { version = "0.8", registry = "priv" }
-
-[build-dependencies]
-libc = { version = "0.2", registry = "priv" }
-
-[target.'cfg(unix)'.dependencies]
-nix = { version = "0.2", registry = "priv" }
-"#,
-        );
-
-        let (reqs, warnings) = load_direct_requirements(dir.path());
-        assert!(warnings.is_empty());
-
-        let crates_io_serde = reqs
-            .iter()
-            .find(|r| r.crate_name == "serde" && r.source == RequirementSource::CratesIo)
-            .expect("plain serde dependency should resolve to crates.io");
-        assert_eq!(
-            crates_io_serde.req,
-            semver::VersionReq::parse("1.0").unwrap()
-        );
-
-        let priv_serde = reqs
-            .iter()
-            .find(|r| r.crate_name == "serde" && r.source != RequirementSource::CratesIo)
-            .expect("renamed serde dependency should record its alternate registry");
-        assert_eq!(
-            priv_serde.source,
-            RequirementSource::Registry("priv".to_string())
-        );
-
-        for name in ["rand", "libc", "nix"] {
-            assert_eq!(
-                find(&reqs, name).source,
-                RequirementSource::Registry("priv".to_string()),
-                "{name} should record its alternate registry"
-            );
-        }
-    }
-
-    #[test]
-    fn workspace_inherited_registry_metadata_is_preserved() {
-        let dir = tempdir().unwrap();
-        write(
-            dir.path(),
-            "Cargo.toml",
-            r#"
-[workspace]
-members = ["member"]
-
-[workspace.dependencies]
-serde = { version = "1.0", registry = "priv" }
-"#,
-        );
-        write(
-            dir.path(),
-            "member/Cargo.toml",
-            r#"
-[package]
-name = "member"
-version = "0.1.0"
-
-[dependencies]
-serde = { workspace = true }
-"#,
-        );
-
-        let (reqs, warnings) = load_direct_requirements(dir.path());
-        assert!(warnings.is_empty());
-        assert_eq!(
-            find(&reqs, "serde").source,
-            RequirementSource::Registry("priv".to_string())
-        );
-    }
-
-    #[test]
-    fn explicit_crates_io_registry_identity_is_recognized() {
-        // `registry = "crates-io"` is Cargo's reserved name for the default
-        // registry, and a `registry-index` naming crates.io's own index URL
-        // directly is the same registry under its literal address. Neither
-        // is an alternate registry, so both must be `CratesIo`.
-        let dir = tempdir().unwrap();
-        write(
-            dir.path(),
-            "Cargo.toml",
-            r#"
-[package]
-name = "root"
-version = "0.1.0"
-
-[dependencies]
-by_name = { package = "serde", version = "1.0", registry = "crates-io" }
-by_git_index = { package = "rand", version = "0.8", registry-index = "https://github.com/rust-lang/crates.io-index" }
-by_sparse_index = { package = "libc", version = "0.2", registry-index = "sparse+https://index.crates.io/" }
-"#,
-        );
-
-        let (reqs, warnings) = load_direct_requirements(dir.path());
-        assert!(warnings.is_empty());
-        for name in ["serde", "rand", "libc"] {
-            assert_eq!(
-                find(&reqs, name).source,
-                RequirementSource::CratesIo,
-                "{name} should resolve to crates.io"
-            );
-        }
+        assert_eq!(crate_names(&reqs), ["serde"]);
     }
 
     #[test]
     fn missing_manifest_degrades_to_a_warning() {
-        let dir = tempdir().unwrap();
+        let (reqs, warnings) = load(&[]);
 
-        let (reqs, warnings) = load_direct_requirements(dir.path());
         assert!(reqs.is_empty());
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("No Cargo.toml"));

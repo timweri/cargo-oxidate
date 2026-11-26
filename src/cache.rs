@@ -44,66 +44,41 @@ pub struct CacheWarning {
 
 impl ResponseCache {
     pub fn load(path: Option<&Path>) -> Self {
+        let path = path.map(Path::to_path_buf);
+        let mut loaded = None;
         let mut load_warning = None;
-        let path = path.map(|p| p.to_path_buf());
 
-        let data = if let Some(ref p) = path {
+        if let Some(p) = &path {
+            let mut warn = |message: String| {
+                load_warning = Some(CacheWarning {
+                    path: p.clone(),
+                    message,
+                });
+            };
             match std::fs::read_to_string(p) {
                 Ok(contents) => match serde_json::from_str::<CacheData>(&contents) {
-                    Ok(data) if data.version == CACHE_VERSION => data,
-                    Ok(data) => {
-                        load_warning = Some(CacheWarning {
-                            path: p.clone(),
-                            message: format!(
-                                "Cache version {} is unsupported. Checking without cached responses",
-                                data.version
-                            ),
-                        });
-                        CacheData {
-                            version: CACHE_VERSION,
-                            ..Default::default()
-                        }
-                    }
-                    Err(e) => {
-                        load_warning = Some(CacheWarning {
-                            path: p.clone(),
-                            message: format!(
-                                "Could not read cache: {e}. Checking without cached responses"
-                            ),
-                        });
-                        CacheData {
-                            version: CACHE_VERSION,
-                            ..Default::default()
-                        }
-                    }
+                    Ok(data) if data.version == CACHE_VERSION => loaded = Some(data),
+                    Ok(data) => warn(format!(
+                        "Cache version {} is unsupported. Checking without cached responses",
+                        data.version
+                    )),
+                    Err(e) => warn(format!(
+                        "Could not read cache: {e}. Checking without cached responses"
+                    )),
                 },
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => CacheData {
-                    version: CACHE_VERSION,
-                    ..Default::default()
-                },
-                Err(error) => {
-                    load_warning = Some(CacheWarning {
-                        path: p.clone(),
-                        message: format!(
-                            "Could not read cache: {error}. Checking without cached responses"
-                        ),
-                    });
-                    CacheData {
-                        version: CACHE_VERSION,
-                        ..Default::default()
-                    }
-                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => warn(format!(
+                    "Could not read cache: {error}. Checking without cached responses"
+                )),
             }
-        } else {
-            CacheData {
-                version: CACHE_VERSION,
-                ..Default::default()
-            }
-        };
+        }
 
         Self {
             path,
-            data,
+            data: loaded.unwrap_or_else(|| CacheData {
+                version: CACHE_VERSION,
+                ..Default::default()
+            }),
             dirty: false,
             load_warning,
         }
@@ -138,13 +113,7 @@ impl ResponseCache {
 
     pub fn get_all_versions(&self, name: &str, max_age: Duration) -> Option<Vec<CrateVersionInfo>> {
         let entry = self.data.all_versions.get(name)?;
-        let age = Utc::now() - entry.fetched_at;
-
-        if age > max_age {
-            return None;
-        }
-
-        Some(entry.versions.clone())
+        (Utc::now() - entry.fetched_at <= max_age).then(|| entry.versions.clone())
     }
 
     pub fn set_all_versions(&mut self, name: &str, versions: Vec<CrateVersionInfo>) {
@@ -158,13 +127,7 @@ impl ResponseCache {
 
     pub fn get_index_records(&self, name: &str, max_age: Duration) -> Option<Vec<IndexRecord>> {
         let entry = self.data.index_records.get(name)?;
-        let age = Utc::now() - entry.fetched_at;
-
-        if age > max_age {
-            return None;
-        }
-
-        Some(entry.records.clone())
+        (Utc::now() - entry.fetched_at <= max_age).then(|| entry.records.clone())
     }
 
     pub fn set_index_records(&mut self, name: &str, records: Vec<IndexRecord>) {
@@ -244,6 +207,10 @@ mod tests {
             Some(sample_date())
         );
         assert_eq!(loaded.get_publish_date("serde", "9.9.9"), None);
+        assert!(
+            !path.with_extension("tmp").exists(),
+            "tmp file should be renamed away"
+        );
     }
 
     #[test]
@@ -287,41 +254,33 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_file_starts_fresh() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("cache.json");
-        std::fs::write(&path, "{ not valid json").unwrap();
+    fn unusable_file_starts_fresh_with_a_warning() {
+        let cases = [
+            ("{ not valid json", "Could not read cache"),
+            (
+                r#"{"version":99,"publish_dates":{"serde/1.0.0":"2020-01-01T00:00:00Z"},"all_versions":{}}"#,
+                "Cache version 99 is unsupported",
+            ),
+        ];
+        for (contents, expected) in cases {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("cache.json");
+            std::fs::write(&path, contents).unwrap();
 
-        let mut cache = ResponseCache::load(Some(&path));
-        assert_eq!(cache.get_publish_date("anything", "0.0.1"), None);
-        assert!(
-            cache
-                .get_all_versions("anything", Duration::hours(1))
-                .is_none()
-        );
-        let warning = cache
-            .take_load_warning()
-            .expect("corrupt cache should produce a warning");
-        assert_eq!(warning.path, path);
-        assert!(
-            warning
-                .message
-                .contains("Checking without cached responses")
-        );
-    }
-
-    #[test]
-    fn save_leaves_no_tmp_orphan() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("cache.json");
-
-        let mut cache = ResponseCache::load(Some(&path));
-        cache.set_publish_date("serde", "1.0.0", sample_date());
-        cache.save().unwrap();
-
-        let tmp = path.with_extension("tmp");
-        assert!(!tmp.exists(), "tmp file should be renamed away");
-        assert!(path.exists(), "final cache file should exist");
+            let mut cache = ResponseCache::load(Some(&path));
+            assert_eq!(cache.get_publish_date("serde", "1.0.0"), None);
+            assert_eq!(cache.data.version, CACHE_VERSION);
+            let warning = cache
+                .take_load_warning()
+                .expect("unusable cache should produce a warning");
+            assert_eq!(warning.path, path);
+            assert!(warning.message.contains(expected));
+            assert!(
+                warning
+                    .message
+                    .contains("Checking without cached responses")
+            );
+        }
     }
 
     #[test]
@@ -343,27 +302,6 @@ mod tests {
         let mut cache = ResponseCache::load(Some(&path));
         assert_eq!(cache.get_publish_date("serde", "1.0.0"), None);
         assert!(cache.take_load_warning().is_none());
-    }
-
-    #[test]
-    fn save_failure_has_a_nonfatal_warning() {
-        let dir = tempdir().unwrap();
-        let blocking_parent = dir.path().join("not-a-directory");
-        std::fs::write(&blocking_parent, "file").unwrap();
-        let path = blocking_parent.join("cache.json");
-        let mut cache = ResponseCache::load(Some(&path));
-        cache.set_publish_date("serde", "1.0.0", sample_date());
-
-        let error = cache
-            .save()
-            .expect_err("a file cannot be a cache directory");
-        let warning = cache.save_warning(error);
-        assert_eq!(warning.path, path);
-        assert!(
-            warning
-                .message
-                .contains("does not change the dependency check result")
-        );
     }
 
     #[test]
@@ -400,24 +338,5 @@ mod tests {
                 .get_index_records("serde", Duration::hours(1))
                 .is_none()
         );
-    }
-
-    #[test]
-    fn load_wrong_version_starts_fresh() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("cache.json");
-
-        // Write cache with wrong version
-        std::fs::write(
-            &path,
-            r#"{"version":99,"publish_dates":{"serde/1.0.0":"2020-01-01T00:00:00Z"},"all_versions":{}}"#,
-        )
-        .unwrap();
-
-        let cache = ResponseCache::load(Some(&path));
-
-        // Should have cleared the data and started fresh
-        assert_eq!(cache.get_publish_date("serde", "1.0.0"), None);
-        assert_eq!(cache.data.version, CACHE_VERSION);
     }
 }

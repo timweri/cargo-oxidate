@@ -1,95 +1,9 @@
 use super::*;
-use crate::api::RetryPolicy;
-use crate::api::test_support::{FakeTransport, ScriptedResponse, index_url, versions_url};
-use crate::lockfile::PackageRef;
-use crate::report::Aged;
-use std::num::NonZeroU32;
-use std::path::PathBuf;
-use std::time::Duration;
-
-trait FakeTransportExt {
-    fn ok(&self, name: &str, versions_json: &str);
-    fn error(&self, name: &str);
-    fn index_ok(&self, name: &str, records_ndjson: &str);
-    fn index_error(&self, name: &str);
-}
-
-impl FakeTransportExt for FakeTransport {
-    fn ok(&self, name: &str, versions_json: &str) {
-        self.push(
-            &versions_url(name),
-            ScriptedResponse::Http(200, versions_json.to_string()),
-        );
-    }
-
-    fn error(&self, name: &str) {
-        self.push(&versions_url(name), ScriptedResponse::Error);
-    }
-
-    fn index_ok(&self, name: &str, records_ndjson: &str) {
-        self.push(
-            &index_url(name),
-            ScriptedResponse::Http(200, records_ndjson.to_string()),
-        );
-    }
-
-    fn index_error(&self, name: &str) {
-        self.push(&index_url(name), ScriptedResponse::Error);
-    }
-}
-
-fn versions_body(entries: &[(&str, i64, bool)], now: DateTime<Utc>) -> String {
-    let versions: Vec<String> = entries
-        .iter()
-        .map(|(num, days_ago, yanked)| {
-            let created_at = now - chrono::Duration::days(*days_ago);
-            format!(
-                r#"{{"num":"{num}","created_at":"{}","yanked":{yanked}}}"#,
-                created_at.to_rfc3339()
-            )
-        })
-        .collect();
-    format!(r#"{{"versions":[{}]}}"#, versions.join(","))
-}
-
-/// Builds a client with retry/pacing delays zeroed out, so the test
-/// suite doesn't sleep.
-fn fast_client(transport: FakeTransport) -> CratesIoClient<FakeTransport> {
-    CratesIoClient::with_transport(
-        transport,
-        None,
-        24,
-        RetryPolicy {
-            retry_count: NonZeroU32::new(1).unwrap(),
-            retry_delay: Duration::from_millis(0),
-            pacing_delay: Duration::from_millis(0),
-        },
-    )
-}
-
-fn too_new(package: &str, locked_version: &str) -> Violation {
-    Violation {
-        package: package.to_string(),
-        version: locked_version.to_string(),
-        kind: ViolationKind::TooNew(Aged {
-            published: now(),
-            age_days: 1,
-        }),
-    }
-}
-
-fn too_old(package: &str) -> Violation {
-    Violation {
-        package: package.to_string(),
-        version: "1.0.0".to_string(),
-        kind: ViolationKind::TooOld(Aged {
-            published: now(),
-            age_days: 1000,
-        }),
-    }
-}
 
 const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+const GIT_SOURCE: &str =
+    "git+https://github.com/example/app#0000000000000000000000000000000000000000";
+const ALT_REGISTRY_SOURCE: &str = "registry+https://example.com/priv-index";
 
 /// A registry package. Its dependency edges default to the same
 /// crates.io source as the loader resolves an unsourced edge to,
@@ -111,6 +25,7 @@ fn pkg(name: &str, version: &str, deps: &[(&str, &str)]) -> Package {
     }
 }
 
+/// A local/path package (`source: None`).
 fn non_registry_pkg(name: &str, version: &str, deps: &[(&str, &str)]) -> Package {
     Package {
         is_registry: false,
@@ -119,11 +34,8 @@ fn non_registry_pkg(name: &str, version: &str, deps: &[(&str, &str)]) -> Package
     }
 }
 
-/// A dependent whose lockfile source is present but isn't crates.io
-/// — a git or alternate-registry package. Unlike `non_registry_pkg`
-/// (a local/path package, `source: None`), nothing here can read its
-/// requirements: not the crates.io index (it's not on crates.io),
-/// and not a local manifest (it has no manifest this crate can find).
+/// A git or alternate-registry package: nothing here can read its
+/// requirements, neither the crates.io index nor a local manifest.
 fn external_pkg(name: &str, version: &str, source: &str, deps: &[(&str, &str)]) -> Package {
     Package {
         is_registry: false,
@@ -132,13 +44,8 @@ fn external_pkg(name: &str, version: &str, source: &str, deps: &[(&str, &str)]) 
     }
 }
 
-const GIT_SOURCE: &str =
-    "git+https://github.com/example/app#0000000000000000000000000000000000000000";
-const ALT_REGISTRY_SOURCE: &str = "registry+https://example.com/priv-index";
-
 /// A `DirectRequirement` naming `declaring_package`/`declaring_version`
-/// as the identity of the manifest that placed it — the shape
-/// `load_direct_requirements` produces for a real local manifest.
+/// as the identity of the manifest that placed it.
 fn local_requirement(
     declaring_package: &str,
     declaring_version: &str,
@@ -155,57 +62,218 @@ fn local_requirement(
     }
 }
 
-/// Builds a client and dependents index from `transport`/`packages`
-/// and calls production `gather_constraints` with a fixed
-/// `/work` working dir — the shared shape of most of this module's
-/// `gather_constraints` call sites.
+/// Calls production `gather_constraints` for crates.io `foo` at
+/// `locked_version`, with a fixed `/work` working dir.
 fn gather(
     transport: FakeTransport,
     packages: &[Package],
     requirements: &[DirectRequirement],
-    name: &str,
     locked_version: &str,
-    source: Option<&str>,
 ) -> GatheredConstraints {
-    let mut client = fast_client(transport);
-    let index = build_indexes(packages).0;
     gather_constraints(
-        &mut client,
-        &index,
+        &mut fast_client(transport, None),
+        &build_indexes(packages).0,
         requirements,
         Path::new("/work"),
-        name,
+        "foo",
         locked_version,
-        source,
+        Some(CRATES_IO_SOURCE),
     )
 }
 
+fn reqs(gathered: &GatheredConstraints) -> Vec<String> {
+    gathered
+        .constraints
+        .iter()
+        .map(|c| c.req.to_string())
+        .collect()
+}
+
 #[test]
-fn aliased_registry_requirements_follow_the_locked_version() {
+fn ignores_violations_that_are_not_too_new() {
+    let too_old = Violation {
+        package: "syn".to_string(),
+        version: "1.0.0".to_string(),
+        kind: ViolationKind::TooOld(Aged {
+            published: now(),
+            age_days: 1000,
+        }),
+    };
+    let mut no_progress = |_| {};
+    let outcomes = generate_suggestions(
+        &mut fast_client(FakeTransport::default(), None),
+        std::slice::from_ref(&too_old),
+        &[],
+        &[],
+        Path::new("/work"),
+        MIN_AGE_30,
+        false,
+        now(),
+        &mut no_progress,
+    );
+    assert!(outcomes.is_empty());
+
+    // "syn" has no scripted response: fetching it would panic.
     let transport = FakeTransport::default();
-    transport.index_ok("app", r#"{"vers":"1.0.0","deps":[{"name":"foo_old","package":"foo","req":"^1"},{"name":"foo_new","package":"foo","req":"^2"}]}"#);
-    let mut client = fast_client(transport);
-    let packages = vec![pkg("app", "1.0.0", &[("foo", "1.5.0"), ("foo", "2.5.0")])];
-    let index = build_indexes(&packages).0;
-    for (locked, candidate) in [("1.5.0", "1.4.0"), ("2.5.0", "2.4.0")] {
-        let gathered = gather_constraints(
-            &mut client,
-            &index,
-            &[],
-            Path::new("/work"),
-            "foo",
-            locked,
-            Some(CRATES_IO_SOURCE),
+    transport.versions("serde", &[("1.0.0", 50)]);
+    let violations = [too_new("serde", "1.0.0"), too_old];
+    let packages = [pkg("serde", "1.0.0", &[])];
+    let outcomes = suggestions(transport, &violations, &packages, &[], Path::new("/work"));
+    assert_eq!(summaries(&outcomes), ["serde: no compliant version"]);
+}
+
+#[test]
+fn a_bad_violation_does_not_abort_the_others() {
+    let transport = FakeTransport::default();
+    // "serde" has no scripted response: its unparsable locked version
+    // must be skipped before its versions are fetched.
+    transport.versions_error("down");
+    transport.versions("syn", &[("1.0.0", 50), ("1.1.0", 5)]);
+    let violations = [
+        too_new("serde", "not-a-version"),
+        too_new("down", "1.0.0"),
+        too_new("syn", "1.1.0"),
+    ];
+    let packages = [
+        pkg("serde", "not-a-version", &[]),
+        pkg("down", "1.0.0", &[]),
+        pkg("syn", "1.1.0", &[]),
+    ];
+    let mut progress = Vec::new();
+    let outcomes = generate_suggestions(
+        &mut fast_client(transport, None),
+        &violations,
+        &packages,
+        &[],
+        Path::new("/work"),
+        MIN_AGE_30,
+        false,
+        now(),
+        &mut |p: SuggestionProgress| {
+            progress.push(format!("{}/{} {}", p.current, p.total, p.package))
+        },
+    );
+    let outcomes = summaries(&outcomes);
+
+    assert_eq!(progress, ["1/3 serde", "2/3 down", "3/3 syn"]);
+    assert_eq!(
+        outcomes[0],
+        "serde: unavailable (Locked version is not valid SemVer)"
+    );
+    assert!(outcomes[1].starts_with("down: unavailable"), "{outcomes:?}");
+    assert_eq!(outcomes[2], "syn: suggest 1.0.0 (50d)");
+}
+
+#[test]
+fn registry_dependent_declarations_decide_the_outcome() {
+    // "app" 1.0.0 locks serde 1.5.0 and declares `deps` in its index
+    // record; serde 1.4.0 is the only downgrade on offer.
+    let cases = [
+        (
+            "plain requirement above the downgrade blocks it",
+            r#"[{"name":"serde","req":"^1.5"}]"#,
+            "serde: blocked at 1.4.0 by app@1.0.0 ^1.5",
+        ),
+        (
+            "dev declaration is ignored",
+            r#"[{"name":"serde","req":"^1.5","kind":"dev"}]"#,
+            "serde: suggest 1.4.0 (50d) unverified: app",
+        ),
+        (
+            "renamed dependency is matched by its real name",
+            r#"[{"name":"my_serde","package":"serde","req":"^1.5"}]"#,
+            "serde: blocked at 1.4.0 by app@1.0.0 ^1.5",
+        ),
+        (
+            "alternate-registry declaration is not enforced",
+            r#"[{"name":"serde","req":"^1"},{"name":"serde_alt","package":"serde","req":"^1.5","registry":"alt"}]"#,
+            "serde: suggest 1.4.0 (50d)",
+        ),
+        (
+            "optional declaration beside a mandatory one is unverified",
+            r#"[{"name":"serde","req":"^1"},{"name":"serde_new","package":"serde","req":"^1.5","optional":true}]"#,
+            "serde: suggest 1.4.0 (50d) unverified: app",
+        ),
+        (
+            "unique optional declaration still blocks",
+            r#"[{"name":"serde_new","package":"serde","req":"^1.5","optional":true}]"#,
+            "serde: blocked at 1.4.0 by app@1.0.0 ^1.5",
+        ),
+        (
+            "mandatory requirement still blocks beside an optional one",
+            r#"[{"name":"serde","req":"^1.5"},{"name":"serde_new","package":"serde","req":"^1","optional":true}]"#,
+            "serde: blocked at 1.4.0 by app@1.0.0 ^1.5",
+        ),
+        (
+            "requirement declared optional and mandatory counts as mandatory",
+            r#"[{"name":"serde_new","package":"serde","req":"^1.5","optional":true},{"name":"serde","req":"^1.5"},{"name":"serde_any","package":"serde","req":"^1"}]"#,
+            "serde: blocked at 1.4.0 by app@1.0.0 ^1.5",
+        ),
+        (
+            "unparsable requirement beside an enforced one is unverified",
+            r#"[{"name":"serde","req":"^1"},{"name":"serde_bad","package":"serde","req":"not a requirement"}]"#,
+            "serde: suggest 1.4.0 (50d) unverified: app",
+        ),
+        (
+            "build declaration is enforced",
+            r#"[{"name":"serde","req":"^1"},{"name":"serde","req":"^1.5","kind":"build"}]"#,
+            "serde: blocked at 1.4.0 by app@1.0.0 ^1.5",
+        ),
+        (
+            "target-specific declaration is enforced",
+            r#"[{"name":"serde","req":"^1"},{"name":"serde","req":"^1.5","target":"cfg(unix)"}]"#,
+            "serde: blocked at 1.4.0 by app@1.0.0 ^1.5",
+        ),
+        (
+            "identical requirement across targets still blocks",
+            r#"[{"name":"serde","req":"^1.5","target":"cfg(unix)"},{"name":"serde","req":"^1.5","target":"cfg(windows)"}]"#,
+            "serde: blocked at 1.4.0 by app@1.0.0 ^1.5",
+        ),
+    ];
+    for (case, deps, expected) in cases {
+        let transport = FakeTransport::default();
+        transport.versions("serde", &[("1.5.0", 5), ("1.4.0", 50)]);
+        transport.index_ok("app", &format!(r#"{{"vers":"1.0.0","deps":{deps}}}"#));
+        let packages = [
+            pkg("serde", "1.5.0", &[]),
+            pkg("app", "1.0.0", &[("serde", "1.5.0")]),
+        ];
+        let violations = [too_new("serde", "1.5.0")];
+        let outcomes = suggestions(transport, &violations, &packages, &[], Path::new("/work"));
+        assert_eq!(summary(&outcomes[0]), expected, "{case}");
+    }
+}
+
+#[test]
+fn a_same_name_version_package_from_another_source_does_not_leak_dependents() {
+    // A crates.io serde and a twin at the same version (git, or a path
+    // package with no source). "consumer" depends on the twin only; its
+    // scripted ^1.5 requirement would block the crates.io serde if it
+    // leaked. Cargo rejects the abbreviated `serde@1.5.0` here, so the
+    // spec must be source-qualified.
+    for twin_source in [Some(GIT_SOURCE), None] {
+        let transport = FakeTransport::default();
+        transport.versions("serde", &[("1.5.0", 5), ("1.4.0", 50)]);
+        transport.index_ok(
+            "consumer",
+            r#"{"vers":"1.0.0","deps":[{"name":"serde","req":"^1.5"}]}"#,
         );
-        assert_eq!(gathered.constraints.len(), 1);
-        assert!(gathered.unverified_dependents.is_empty());
-        assert!(matches!(
-            walk(
-                vec![(Version::parse(candidate).unwrap(), 50)],
-                gathered.constraints
-            ),
-            WalkResult::Suggest(_, _)
-        ));
+        let twin = Package {
+            is_registry: false,
+            source: twin_source.map(str::to_string),
+            ..pkg("serde", "1.5.0", &[])
+        };
+        let mut consumer = pkg("consumer", "1.0.0", &[("serde", "1.5.0")]);
+        consumer.dependencies[0].source = twin_source.map(str::to_string);
+        let packages = [pkg("serde", "1.5.0", &[]), twin, consumer];
+        let violations = [too_new("serde", "1.5.0")];
+        let outcomes = suggestions(transport, &violations, &packages, &[], Path::new("/work"));
+
+        assert_eq!(
+            summary(&outcomes[0]),
+            format!("serde: suggest 1.4.0 (50d) spec={CRATES_IO_SOURCE}#serde"),
+            "twin source {twin_source:?}"
+        );
     }
 }
 
@@ -216,1330 +284,178 @@ fn unmatched_registry_requirements_are_unverified() {
         "app",
         r#"{"vers":"1.0.0","deps":[{"name":"foo","req":"^1.5"}]}"#,
     );
-    let packages = vec![pkg("app", "1.0.0", &[("foo", "1.4.0")])];
-    let gathered = gather(
-        transport,
-        &packages,
-        &[],
-        "foo",
-        "1.4.0",
-        Some(CRATES_IO_SOURCE),
-    );
+    let packages = [pkg("app", "1.0.0", &[("foo", "1.4.0")])];
+    let gathered = gather(transport, &packages, &[], "1.4.0");
     assert!(gathered.constraints.is_empty());
     assert_eq!(gathered.unverified_dependents, ["app"]);
 }
 
 #[test]
-fn missing_non_registry_requirements_are_unverified() {
-    let packages = vec![non_registry_pkg("git-app", "1.0.0", &[("foo", "1.5.0")])];
-    let gathered = gather(
-        FakeTransport::default(),
-        &packages,
-        &[],
-        "foo",
-        "1.5.0",
-        Some(CRATES_IO_SOURCE),
-    );
-    assert!(gathered.constraints.is_empty());
-    assert_eq!(gathered.unverified_dependents, ["git-app"]);
-}
-
-#[test]
-fn same_named_git_dependents_report_one_unverified_label() {
-    let packages = vec![
+fn git_dependents_are_reported_once_per_name() {
+    let packages = [
         external_pkg("parent", "1.0.0", GIT_SOURCE, &[("foo", "1.9.0")]),
         external_pkg("parent", "2.0.0", GIT_SOURCE, &[("foo", "1.9.0")]),
-    ];
-    let gathered = gather(
-        FakeTransport::default(),
-        &packages,
-        &[],
-        "foo",
-        "1.9.0",
-        Some(CRATES_IO_SOURCE),
-    );
-    assert_eq!(gathered.unverified_dependents, ["parent"]);
-}
-
-#[test]
-fn distinct_git_dependents_are_each_reported() {
-    let packages = vec![
-        external_pkg("parent-a", "1.0.0", GIT_SOURCE, &[("foo", "1.9.0")]),
         external_pkg("parent-b", "1.0.0", GIT_SOURCE, &[("foo", "1.9.0")]),
     ];
-    let gathered = gather(
-        FakeTransport::default(),
-        &packages,
-        &[],
-        "foo",
-        "1.9.0",
-        Some(CRATES_IO_SOURCE),
-    );
-    assert_eq!(gathered.unverified_dependents, ["parent-a", "parent-b"]);
+    let gathered = gather(FakeTransport::default(), &packages, &[], "1.9.0");
+    assert_eq!(gathered.unverified_dependents, ["parent", "parent-b"]);
 }
 
 #[test]
-fn aliased_manifest_requirements_follow_the_locked_version() {
-    let mut client = fast_client(FakeTransport::default());
-    let packages = vec![non_registry_pkg(
-        "app",
-        "1.0.0",
-        &[("foo", "1.5.0"), ("foo", "2.5.0")],
-    )];
-    let requirements: Vec<_> = ["^1", "^2"]
-        .into_iter()
-        .map(|req| DirectRequirement {
-            manifest: "/work/Cargo.toml".into(),
-            declaring_package: "app".to_string(),
-            declaring_version: Some("1.0.0".to_string()),
-            crate_name: "foo".to_string(),
-            req: VersionReq::parse(req).unwrap(),
-            source: RequirementSource::CratesIo,
-        })
-        .collect();
-    let index = build_indexes(&packages).0;
-    for (locked, candidate) in [("1.5.0", "1.4.0"), ("2.5.0", "2.4.0")] {
-        let gathered = gather_constraints(
-            &mut client,
-            &index,
-            &requirements,
-            Path::new("/work"),
-            "foo",
-            locked,
-            Some(CRATES_IO_SOURCE),
-        );
-        assert_eq!(gathered.constraints.len(), 1);
-        assert!(gathered.unverified_dependents.is_empty());
-        assert!(matches!(
-            walk(
-                vec![(Version::parse(candidate).unwrap(), 50)],
-                gathered.constraints
-            ),
-            WalkResult::Suggest(_, _)
-        ));
+fn external_dependent_sharing_a_local_packages_identity_stays_unverified() {
+    // The local "app" manifest's requirement was never the external
+    // "app" dependent's own, so it neither verifies nor constrains it.
+    for source in [GIT_SOURCE, ALT_REGISTRY_SOURCE] {
+        let packages = [
+            external_pkg("app", "1.0.0", source, &[("foo", "1.5.0")]),
+            non_registry_pkg("app", "1.0.0", &[]),
+        ];
+        let requirements = [local_requirement("app", "1.0.0", "foo", "^1.5")];
+        let gathered = gather(FakeTransport::default(), &packages, &requirements, "1.5.0");
+        assert!(gathered.constraints.is_empty(), "{source}");
+        assert_eq!(gathered.unverified_dependents, ["app"], "{source}");
     }
 }
 
 #[test]
-fn matching_local_identity_with_a_permissive_requirement_allows_the_downgrade() {
-    // Positive control: a genuine local dependent, matched by both
-    // name and version, whose manifest requirement is loose enough
-    // to permit the downgrade — the ordinary case this whole path
-    // exists for.
-    let packages = vec![non_registry_pkg("app", "1.0.0", &[("foo", "1.5.0")])];
-    let requirements = vec![local_requirement("app", "1.0.0", "foo", "^1")];
-
-    let gathered = gather(
-        FakeTransport::default(),
-        &packages,
-        &requirements,
-        "foo",
-        "1.5.0",
-        Some(CRATES_IO_SOURCE),
-    );
-    assert_eq!(gathered.constraints.len(), 1);
-    assert!(gathered.unverified_dependents.is_empty());
-    assert!(matches!(
-        walk(
-            vec![(Version::parse("1.4.0").unwrap(), 50)],
-            gathered.constraints
-        ),
-        WalkResult::Suggest(_, _)
-    ));
-}
-
-#[test]
-fn matching_local_identity_with_a_restrictive_requirement_blocks_the_downgrade() {
-    // Positive control, the other direction: the same identity
-    // match, but the requirement is restrictive enough to reject
-    // the downgrade candidate.
-    let packages = vec![non_registry_pkg("app", "1.0.0", &[("foo", "1.5.0")])];
-    let requirements = vec![local_requirement("app", "1.0.0", "foo", "^1.5")];
-
-    let gathered = gather(
-        FakeTransport::default(),
-        &packages,
-        &requirements,
-        "foo",
-        "1.5.0",
-        Some(CRATES_IO_SOURCE),
-    );
-    assert_eq!(gathered.constraints.len(), 1);
-    assert!(gathered.unverified_dependents.is_empty());
-    assert!(matches!(
-        walk(
-            vec![(Version::parse("1.4.0").unwrap(), 50)],
-            gathered.constraints
-        ),
-        WalkResult::Blocked { .. }
-    ));
-}
-
-#[test]
-fn git_dependent_sharing_a_local_packages_name_and_version_stays_unverified() {
-    // A git "app" and a local "app" happen to share a name and
-    // version. The local one's manifest permits the downgrade, but
-    // that manifest was never the git dependent's own — it must not
-    // be credited with verifying it.
-    let packages = vec![
-        external_pkg("app", "1.0.0", GIT_SOURCE, &[("foo", "1.5.0")]),
-        non_registry_pkg("app", "1.0.0", &[]),
+fn local_requirements_are_enforced_while_an_external_dependent_stays_unverified() {
+    let packages = [
+        non_registry_pkg("app", "0.1.0", &[("foo", "1.9.0")]),
+        external_pkg("vendor", "1.0.0", GIT_SOURCE, &[("foo", "1.9.0")]),
     ];
-    let requirements = vec![local_requirement("app", "1.0.0", "foo", "^1")];
-
-    let gathered = gather(
-        FakeTransport::default(),
-        &packages,
-        &requirements,
-        "foo",
-        "1.5.0",
-        Some(CRATES_IO_SOURCE),
-    );
-    assert!(gathered.constraints.is_empty());
-    assert_eq!(gathered.unverified_dependents, ["app"]);
-}
-
-#[test]
-fn alternate_registry_dependent_sharing_a_local_packages_name_and_version_stays_unverified() {
-    // Same shape as the git case, but the external dependent is on
-    // an alternate registry instead.
-    let packages = vec![
-        external_pkg("app", "1.0.0", ALT_REGISTRY_SOURCE, &[("foo", "1.5.0")]),
-        non_registry_pkg("app", "1.0.0", &[]),
-    ];
-    let requirements = vec![local_requirement("app", "1.0.0", "foo", "^1")];
-
-    let gathered = gather(
-        FakeTransport::default(),
-        &packages,
-        &requirements,
-        "foo",
-        "1.5.0",
-        Some(CRATES_IO_SOURCE),
-    );
-    assert!(gathered.constraints.is_empty());
-    assert_eq!(gathered.unverified_dependents, ["app"]);
-}
-
-#[test]
-fn restrictive_unrelated_local_requirement_does_not_block_the_external_dependents_target() {
-    // The local "app" shares the git dependent's name and version,
-    // but has no dependency edge of its own onto "foo" at all — its
-    // manifest requirement is unrelated noise. The requirement
-    // matches the locked version but would block candidate 1.4.0;
-    // even so, it must not block foo's downgrade for the git
-    // dependent, whose own requirement can't be read at all.
-    let packages = vec![
-        external_pkg("app", "1.0.0", GIT_SOURCE, &[("foo", "1.5.0")]),
-        non_registry_pkg("app", "1.0.0", &[]),
-    ];
-    let requirements = vec![local_requirement("app", "1.0.0", "foo", "^1.5")];
-
-    let gathered = gather(
-        FakeTransport::default(),
-        &packages,
-        &requirements,
-        "foo",
-        "1.5.0",
-        Some(CRATES_IO_SOURCE),
-    );
-    assert!(gathered.constraints.is_empty());
-    assert_eq!(gathered.unverified_dependents, ["app"]);
-    assert!(matches!(
-        walk(
-            vec![(Version::parse("1.4.0").unwrap(), 50)],
-            gathered.constraints
-        ),
-        WalkResult::Suggest(_, _)
-    ));
+    let requirements = [local_requirement("app", "0.1.0", "foo", "^1.8.5")];
+    let gathered = gather(FakeTransport::default(), &packages, &requirements, "1.9.0");
+    assert_eq!(reqs(&gathered), ["^1.8.5"]);
+    assert_eq!(gathered.unverified_dependents, ["vendor"]);
 }
 
 #[test]
 fn local_declaring_version_mismatch_neither_verifies_nor_constrains() {
-    // A local "app" 2.0.0 declares a restrictive requirement on
-    // "foo", but the actual lockfile dependent is a *different*
-    // "app" — 1.0.0 — with an identical name. Declaring package
-    // name alone must not be enough to apply this requirement.
-    let packages = vec![non_registry_pkg("app", "1.0.0", &[("foo", "1.5.0")])];
-    let requirements = vec![local_requirement("app", "2.0.0", "foo", "^1.5")];
-
-    let gathered = gather(
-        FakeTransport::default(),
-        &packages,
-        &requirements,
-        "foo",
-        "1.5.0",
-        Some(CRATES_IO_SOURCE),
-    );
+    // A local "app" 2.0.0 declares a restrictive requirement on "foo",
+    // but the actual lockfile dependent is a *different* "app" — 1.0.0.
+    // Declaring package name alone must not be enough to apply it.
+    let packages = [non_registry_pkg("app", "1.0.0", &[("foo", "1.5.0")])];
+    let requirements = [local_requirement("app", "2.0.0", "foo", "^1.5")];
+    let gathered = gather(FakeTransport::default(), &packages, &requirements, "1.5.0");
     assert!(gathered.constraints.is_empty());
     assert_eq!(gathered.unverified_dependents, ["app"]);
 }
 
 #[test]
-fn only_too_new_violations_are_fetched() {
-    let transport = FakeTransport::default();
-    transport.ok("serde", &versions_body(&[("1.0.0", 50, false)], now()));
-    // "syn" has no scripted response: if it were fetched, the
-    // transport would panic.
-    let mut client = fast_client(transport);
-
-    let violations = vec![too_new("serde", "1.0.0"), too_old("syn")];
-    let packages = vec![pkg("serde", "1.0.0", &[])];
-    let outcomes = suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
-
-    assert_eq!(outcomes.len(), 1);
-}
-
-#[test]
-fn an_unparsable_locked_version_does_not_abort_the_others() {
-    let transport = FakeTransport::default();
-    // "serde" has no scripted response: if its versions were fetched,
-    // the transport would panic — its unparsable locked version must
-    // be skipped before that.
-    transport.ok(
-        "syn",
-        &versions_body(&[("1.0.0", 50, false), ("1.1.0", 5, false)], now()),
-    );
-    let mut client = fast_client(transport);
-
-    let violations = vec![too_new("serde", "not-a-version"), too_new("syn", "1.1.0")];
-    let packages = vec![pkg("serde", "not-a-version", &[]), pkg("syn", "1.1.0", &[])];
-    let outcomes = suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
-
-    assert_eq!(outcomes.len(), 2);
-    assert!(matches!(
-        &outcomes[0],
-        Outcome::Unavailable {
-            package,
-            locked_version,
-            reason,
-        } if package == "serde"
-            && locked_version == "not-a-version"
-            && reason == "Locked version is not valid SemVer"
-    ));
-    assert!(matches!(&outcomes[1], Outcome::Suggest { package, .. } if package == "syn"));
-}
-
-#[test]
-fn a_failed_fetch_does_not_abort_the_others() {
-    let transport = FakeTransport::default();
-    transport.error("serde");
-    transport.ok(
-        "syn",
-        &versions_body(&[("1.0.0", 50, false), ("1.1.0", 5, false)], now()),
-    );
-    let mut client = fast_client(transport);
-
-    let violations = vec![too_new("serde", "1.0.0"), too_new("syn", "1.1.0")];
-    let packages = vec![pkg("serde", "1.0.0", &[]), pkg("syn", "1.1.0", &[])];
-    let outcomes = suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
-
-    assert_eq!(outcomes.len(), 2);
-    assert!(matches!(
-        &outcomes[0],
-        Outcome::Unavailable {
-            package,
-            locked_version,
-            ..
-        } if package == "serde" && locked_version == "1.0.0"
-    ));
-    assert!(matches!(&outcomes[1], Outcome::Suggest { package, .. } if package == "syn"));
-}
-
-#[test]
-fn no_compliant_version_reports_the_no_candidate_outcome() {
-    let transport = FakeTransport::default();
-    transport.ok("serde", &versions_body(&[("1.0.0", 5, false)], now()));
-    let mut client = fast_client(transport);
-
-    let violations = vec![too_new("serde", "1.0.0")];
-    let packages = vec![pkg("serde", "1.0.0", &[])];
-    let outcomes = suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
-
-    assert!(matches!(outcomes[0], Outcome::NoCompliantVersion { .. }));
-}
-
-#[test]
-fn no_too_new_violations_yields_none() {
-    let transport = FakeTransport::default();
-    let mut client = fast_client(transport);
-
-    let violations = vec![too_old("syn")];
-    let mut no_progress = |_| {};
-    let outcomes = generate_suggestions(
-        &mut client,
-        &violations,
-        &[],
-        &[],
-        Path::new("/work"),
-        30,
-        false,
-        now(),
-        &mut no_progress,
-    );
-
-    assert!(outcomes.is_none());
-}
-
-#[test]
-fn transitive_dependent_requirement_blocks_the_newest_candidate() {
-    // "app" depends on serde 1.5.0; serde's index says app requires ^1.5.
-    let transport = FakeTransport::default();
-    transport.ok(
-        "serde",
-        &versions_body(&[("1.5.0", 5, false), ("1.4.0", 50, false)], now()),
-    );
-    transport.index_ok(
-        "app",
-        r#"{"vers":"1.0.0","deps":[{"name":"serde","req":"^1.5"}]}"#,
-    );
-    let mut client = fast_client(transport);
-
-    let violations = vec![too_new("serde", "1.5.0")];
-    let packages = vec![
-        pkg("serde", "1.5.0", &[]),
-        pkg("app", "1.0.0", &[("serde", "1.5.0")]),
-    ];
-    let outcomes = suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
-
-    match &outcomes[0] {
-        Outcome::Blocked {
-            newest_compliant,
-            blocker,
-            ..
-        } => {
-            assert_eq!(newest_compliant, "1.4.0");
-            assert_eq!(blocker.name, "app");
-            assert_eq!(blocker.req, "^1.5");
-        }
-        _ => panic!("expected Blocked"),
-    }
-}
-
-#[test]
-fn suggests_the_semver_highest_compliant_version_over_a_later_backport() {
-    // 1.4.0 outranks 1.3.9 by semver even though 1.3.9 was published
-    // more recently (40 days ago vs. 100), so it must be the suggestion.
-    let transport = FakeTransport::default();
-    transport.ok(
-        "serde",
-        &versions_body(&[("1.4.0", 100, false), ("1.3.9", 40, false)], now()),
-    );
-    let mut client = fast_client(transport);
-
-    let violations = vec![too_new("serde", "1.5.0")];
-    let packages = vec![pkg("serde", "1.5.0", &[])];
-    let outcomes = suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
-
-    match &outcomes[0] {
-        Outcome::Suggest {
-            suggested_version,
-            suggested_age_days,
-            ..
-        } => {
-            assert_eq!(suggested_version, "1.4.0");
-            assert_eq!(*suggested_age_days, 100);
-        }
-        _ => panic!("expected Suggest"),
-    }
-}
-
-#[test]
-fn blocked_names_the_semver_highest_compliant_version_as_newest_compliant() {
-    // 1.4.0 and 1.3.9 both satisfy age, but the manifest's `^1.4.1`
-    // requirement rejects both. "newest_compliant" in the Blocked
-    // outcome must be the semver-highest one, 1.4.0, not the more
-    // recently published 1.3.9.
-    let transport = FakeTransport::default();
-    transport.ok(
-        "serde",
-        &versions_body(&[("1.4.0", 100, false), ("1.3.9", 40, false)], now()),
-    );
-    transport.index_ok(
-        "app",
-        r#"{"vers":"1.0.0","deps":[{"name":"serde","req":"^1.4.1"}]}"#,
-    );
-    let mut client = fast_client(transport);
-
-    let violations = vec![too_new("serde", "1.5.0")];
-    let packages = vec![
-        pkg("serde", "1.5.0", &[]),
-        pkg("app", "1.0.0", &[("serde", "1.5.0")]),
-    ];
-    let outcomes = suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
-
-    match &outcomes[0] {
-        Outcome::Blocked {
-            newest_compliant,
-            blocker,
-            ..
-        } => {
-            assert_eq!(newest_compliant, "1.4.0");
-            assert_eq!(blocker.name, "app");
-            assert_eq!(blocker.req, "^1.4.1");
-        }
-        _ => panic!("expected Blocked"),
-    }
-}
-
-#[test]
-fn same_name_version_collision_across_sources_does_not_leak_dependents() {
-    // Two packages both named "serde" locked at 1.5.0: one from
-    // crates.io, one from git. "consumer" depends on the git one
-    // specifically. The crates.io serde must not inherit consumer's
-    // requirement just because the name and version happen to match.
-    let transport = FakeTransport::default();
-    transport.ok(
-        "serde",
-        &versions_body(&[("1.5.0", 5, false), ("1.4.0", 50, false)], now()),
-    );
-    // If "consumer" were (wrongly) treated as a dependent of the
-    // crates.io serde, this scripted index response would be
-    // fetched and its ^1.5 requirement would block the downgrade.
-    transport.index_ok(
-        "consumer",
-        r#"{"vers":"1.0.0","deps":[{"name":"serde","req":"^1.5"}]}"#,
-    );
-    let mut client = fast_client(transport);
-
-    let registry_source = "registry+https://github.com/rust-lang/crates.io-index";
-    let git_source =
-        "git+https://github.com/example/serde#0000000000000000000000000000000000000000";
-
-    let packages = vec![
-        Package {
-            name: "serde".to_string(),
-            version: "1.5.0".to_string(),
-            is_registry: true,
-            source: Some(registry_source.to_string()),
-            dependencies: vec![],
-        },
-        Package {
-            name: "serde".to_string(),
-            version: "1.5.0".to_string(),
-            is_registry: false,
-            source: Some(git_source.to_string()),
-            dependencies: vec![],
-        },
-        Package {
-            name: "consumer".to_string(),
-            version: "1.0.0".to_string(),
-            is_registry: true,
-            source: Some(registry_source.to_string()),
-            dependencies: vec![PackageRef {
-                name: "serde".to_string(),
-                version: "1.5.0".to_string(),
-                source: Some(git_source.to_string()),
-            }],
-        },
-    ];
-
-    let violations = vec![too_new("serde", "1.5.0")];
-    let outcomes = suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
-
-    assert!(
-        matches!(&outcomes[0], Outcome::Suggest { suggested_version, .. } if suggested_version == "1.4.0"),
-        "the crates.io serde must not be blocked by consumer's requirement on the git serde: {:?}",
-        match &outcomes[0] {
-            Outcome::Blocked { blocker, .. } => format!("Blocked by {}", blocker.name),
-            _ => "other".to_string(),
-        }
-    );
-}
-
-#[test]
-fn source_collision_yields_a_source_qualified_package_spec() {
-    // Same fixture as above: a crates.io "serde" and a git "serde"
-    // both locked at 1.5.0. Cargo would reject the abbreviated
-    // `serde@1.5.0` spec as ambiguous, so the suggestion for the
-    // registry package must qualify it with the registry source.
-    let transport = FakeTransport::default();
-    transport.ok(
-        "serde",
-        &versions_body(&[("1.5.0", 5, false), ("1.4.0", 50, false)], now()),
-    );
-    let mut client = fast_client(transport);
-
-    let registry_source = "registry+https://github.com/rust-lang/crates.io-index";
-    let git_source =
-        "git+https://github.com/example/serde#0000000000000000000000000000000000000000";
-
-    let packages = vec![
-        Package {
-            name: "serde".to_string(),
-            version: "1.5.0".to_string(),
-            is_registry: true,
-            source: Some(registry_source.to_string()),
-            dependencies: vec![],
-        },
-        Package {
-            name: "serde".to_string(),
-            version: "1.5.0".to_string(),
-            is_registry: false,
-            source: Some(git_source.to_string()),
-            dependencies: vec![],
-        },
-    ];
-
-    let violations = vec![too_new("serde", "1.5.0")];
-    let outcomes = suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
-
-    match &outcomes[0] {
-        Outcome::Suggest { package_spec, .. } => {
-            assert_eq!(package_spec, &format!("{registry_source}#serde"));
-        }
-        _ => panic!("expected serde to be Suggest"),
-    }
-}
-
-#[test]
-fn no_collision_keeps_the_abbreviated_package_spec() {
-    let transport = FakeTransport::default();
-    transport.ok(
-        "serde",
-        &versions_body(&[("1.5.0", 5, false), ("1.4.0", 50, false)], now()),
-    );
-    let mut client = fast_client(transport);
-
-    let violations = vec![too_new("serde", "1.5.0")];
-    let packages = vec![pkg("serde", "1.5.0", &[])];
-    let outcomes = suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
-
-    match &outcomes[0] {
-        Outcome::Suggest { package_spec, .. } => assert_eq!(package_spec, "serde"),
-        _ => panic!("expected serde to be Suggest"),
-    }
-}
-
-#[test]
-fn path_package_sharing_a_name_and_version_does_not_leak_dependents_to_the_registry_package() {
-    // A path package "local-crate" 0.1.0 and a crates.io package of
-    // the same name and version both exist. "consumer" depends on
-    // the path one via an edge that omits the source, as cargo does
-    // for any edge whose true target has none. Since a path
-    // package's own source is always omitted too, the crates.io
-    // package must not inherit consumer's requirement just because
-    // the name and version happen to collide.
-    let transport = FakeTransport::default();
-    transport.ok(
-        "local-crate",
-        &versions_body(&[("1.1.0", 5, false), ("1.0.0", 50, false)], now()),
-    );
-    // If "consumer" were (wrongly) treated as a dependent of the
-    // crates.io local-crate, this scripted index response would be
-    // fetched and its ^1.1 requirement would block the downgrade.
-    transport.index_ok(
-        "consumer",
-        r#"{"vers":"1.0.0","deps":[{"name":"local-crate","req":"^1.1"}]}"#,
-    );
-    let mut client = fast_client(transport);
-
-    let registry_source = "registry+https://github.com/rust-lang/crates.io-index";
-
-    let packages = vec![
-        Package {
-            name: "local-crate".to_string(),
-            version: "1.1.0".to_string(),
-            is_registry: true,
-            source: Some(registry_source.to_string()),
-            dependencies: vec![],
-        },
-        Package {
-            name: "local-crate".to_string(),
-            version: "1.1.0".to_string(),
-            is_registry: false,
-            source: None,
-            dependencies: vec![],
-        },
-        Package {
-            name: "consumer".to_string(),
-            version: "1.0.0".to_string(),
-            is_registry: true,
-            source: Some(registry_source.to_string()),
-            dependencies: vec![PackageRef {
-                name: "local-crate".to_string(),
-                version: "1.1.0".to_string(),
-                source: None,
-            }],
-        },
-    ];
-
-    let violations = vec![too_new("local-crate", "1.1.0")];
-    let outcomes = suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
-
-    assert!(
-        matches!(&outcomes[0], Outcome::Suggest { suggested_version, .. } if suggested_version == "1.0.0"),
-        "the crates.io local-crate must not be blocked by consumer's requirement on the path local-crate: {:?}",
-        match &outcomes[0] {
-            Outcome::Blocked { blocker, .. } => format!("Blocked by {}", blocker.name),
-            _ => "other".to_string(),
-        }
-    );
-}
-
-#[test]
-fn dev_kind_edge_from_a_transitive_dependent_is_ignored() {
-    let transport = FakeTransport::default();
-    transport.ok(
-        "serde",
-        &versions_body(&[("1.5.0", 5, false), ("1.4.0", 50, false)], now()),
-    );
-    transport.index_ok(
-        "app",
-        r#"{"vers":"1.0.0","deps":[{"name":"serde","req":"^1.5","kind":"dev"}]}"#,
-    );
-    let mut client = fast_client(transport);
-
-    let violations = vec![too_new("serde", "1.5.0")];
-    let packages = vec![
-        pkg("serde", "1.5.0", &[]),
-        pkg("app", "1.0.0", &[("serde", "1.5.0")]),
-    ];
-    let outcomes = suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
-
-    assert!(matches!(outcomes[0], Outcome::Suggest { .. }));
-}
-
-#[test]
-fn renamed_dependency_is_matched_by_its_real_name() {
-    let transport = FakeTransport::default();
-    transport.ok("serde", &versions_body(&[("1.4.0", 50, false)], now()));
-    transport.index_ok(
-        "app",
-        r#"{"vers":"1.0.0","deps":[{"name":"my_serde","package":"serde","req":"^1.5"}]}"#,
-    );
-    let mut client = fast_client(transport);
-
-    let violations = vec![too_new("serde", "1.5.0")];
-    let packages = vec![
-        pkg("serde", "1.5.0", &[]),
-        pkg("app", "1.0.0", &[("serde", "1.5.0")]),
-    ];
-    let outcomes = suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
-
-    assert!(matches!(outcomes[0], Outcome::Blocked { .. }));
-}
-
-#[test]
-fn alternate_registry_index_declaration_is_not_enforced() {
-    // "app" declares a normal `foo = "^1"` from crates.io and a
-    // same-crate alias `foo_alt = { package = "foo", version = "^1.3",
-    // registry = "alt" }` from an alternate registry. The alternate
-    // registry declaration cannot be resolved against the locked
-    // crates.io package, so only `^1` may be enforced.
-    let transport = FakeTransport::default();
-    transport.ok(
-        "foo",
-        &versions_body(&[("1.5.0", 5, false), ("1.2.0", 50, false)], now()),
-    );
-    transport.index_ok(
-                "app",
-                r#"{"vers":"1.0.0","deps":[{"name":"foo","req":"^1"},{"name":"foo_alt","package":"foo","req":"^1.3","registry":"alt"}]}"#,
-            );
-    let mut client = fast_client(transport);
-
-    let violations = vec![too_new("foo", "1.5.0")];
-    let packages = vec![
-        pkg("foo", "1.5.0", &[]),
-        pkg("app", "1.0.0", &[("foo", "1.5.0")]),
-    ];
-    let outcomes = suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
-
-    match &outcomes[0] {
-        Outcome::Suggest {
-            suggested_version, ..
-        } => assert_eq!(suggested_version, "1.2.0"),
-        _ => panic!("expected foo to be Suggest, with the alternate registry declaration ignored"),
-    }
-}
-
-#[test]
-fn ambiguous_optional_declaration_does_not_block_the_downgrade() {
-    // "app" declares both a normal `serde = "^1"` and a disabled,
-    // renamed optional `serde_new = { package = "serde", version =
-    // "^1.5", optional = true }`. Both match locked serde@1.5.0, but
-    // since the optional one may not even be activated, neither can
-    // be enforced as a definite blocker.
-    let transport = FakeTransport::default();
-    transport.ok(
-        "serde",
-        &versions_body(&[("1.5.0", 5, false), ("1.4.0", 50, false)], now()),
-    );
-    transport.index_ok(
-                "app",
-                r#"{"vers":"1.0.0","deps":[{"name":"serde","req":"^1"},{"name":"serde_new","package":"serde","req":"^1.5","optional":true}]}"#,
-            );
-    let mut client = fast_client(transport);
-
-    let violations = vec![too_new("serde", "1.5.0")];
-    let packages = vec![
-        pkg("serde", "1.5.0", &[]),
-        pkg("app", "1.0.0", &[("serde", "1.5.0")]),
-    ];
-    let outcomes = suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
-
-    match &outcomes[0] {
-        Outcome::Suggest {
-            suggested_version,
-            unverified_dependents,
-            ..
-        } => {
-            assert_eq!(suggested_version, "1.4.0");
-            assert_eq!(unverified_dependents, &["app".to_string()]);
-        }
-        _ => panic!("expected serde to be Suggest, with app marked unverified"),
-    }
-}
-
-#[test]
-fn unique_optional_declaration_still_blocks() {
-    // Only the optional, renamed declaration matches — no ambiguity,
-    // so it's the unique explanation for the lockfile edge and must
-    // still be enforced.
-    let transport = FakeTransport::default();
-    transport.ok(
-        "serde",
-        &versions_body(&[("1.5.0", 5, false), ("1.4.0", 50, false)], now()),
-    );
-    transport.index_ok(
-                "app",
-                r#"{"vers":"1.0.0","deps":[{"name":"serde_new","package":"serde","req":"^1.5","optional":true}]}"#,
-            );
-    let mut client = fast_client(transport);
-
-    let violations = vec![too_new("serde", "1.5.0")];
-    let packages = vec![
-        pkg("serde", "1.5.0", &[]),
-        pkg("app", "1.0.0", &[("serde", "1.5.0")]),
-    ];
-    let outcomes = suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
-
-    match &outcomes[0] {
-        Outcome::Blocked {
-            newest_compliant,
-            blocker,
-            ..
-        } => {
-            assert_eq!(newest_compliant, "1.4.0");
-            assert_eq!(blocker.name, "app");
-            assert_eq!(blocker.req, "^1.5");
-        }
-        _ => panic!("expected serde to be Blocked by app's unique optional declaration"),
-    }
-}
-
-#[test]
-fn mandatory_requirements_from_different_kinds_both_block() {
-    // "app" declares an unconditional, nonoptional normal
-    // requirement of `^1.5` and an unconditional, nonoptional build
-    // requirement of `^1` on serde. Both are always active, so both
-    // are enforced — the more restrictive one (`^1.5`) rejects the
-    // downgrade to 1.4.0.
-    let transport = FakeTransport::default();
-    transport.ok(
-        "serde",
-        &versions_body(&[("1.5.0", 5, false), ("1.4.0", 50, false)], now()),
-    );
-    transport.index_ok(
-                "app",
-                r#"{"vers":"1.0.0","deps":[{"name":"serde","req":"^1.5"},{"name":"serde","req":"^1","kind":"build"}]}"#,
-            );
-    let mut client = fast_client(transport);
-
-    let violations = vec![too_new("serde", "1.5.0")];
-    let packages = vec![
-        pkg("serde", "1.5.0", &[]),
-        pkg("app", "1.0.0", &[("serde", "1.5.0")]),
-    ];
-    let outcomes = suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
-
-    match &outcomes[0] {
-        Outcome::Blocked {
-            newest_compliant,
-            blocker,
-            ..
-        } => {
-            assert_eq!(newest_compliant, "1.4.0");
-            assert_eq!(blocker.name, "app");
-            assert_eq!(blocker.req, "^1.5");
-        }
-        _ => panic!("expected serde to be Blocked by app's mandatory requirement"),
-    }
-}
-
-#[test]
-fn mandatory_requirement_still_blocks_alongside_uncertain_declaration() {
-    // "app" declares an unconditional, nonoptional normal
-    // requirement of `^1.5`, and a separate disabled, renamed
-    // optional declaration matching a looser `^1`. The mandatory
-    // requirement is enforced regardless of the uncertain one, even
-    // though the uncertain one alone would have permitted the
-    // downgrade.
-    let transport = FakeTransport::default();
-    transport.ok(
-        "serde",
-        &versions_body(&[("1.5.0", 5, false), ("1.4.0", 50, false)], now()),
-    );
-    transport.index_ok(
-                "app",
-                r#"{"vers":"1.0.0","deps":[{"name":"serde","req":"^1.5"},{"name":"serde_new","package":"serde","req":"^1","optional":true}]}"#,
-            );
-    let mut client = fast_client(transport);
-
-    let violations = vec![too_new("serde", "1.5.0")];
-    let packages = vec![
-        pkg("serde", "1.5.0", &[]),
-        pkg("app", "1.0.0", &[("serde", "1.5.0")]),
-    ];
-    let outcomes = suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
-
-    match &outcomes[0] {
-        Outcome::Blocked {
-            newest_compliant,
-            blocker,
-            ..
-        } => {
-            assert_eq!(newest_compliant, "1.4.0");
-            assert_eq!(blocker.name, "app");
-            assert_eq!(blocker.req, "^1.5");
-        }
-        _ => panic!("expected serde to be Blocked by app's mandatory requirement"),
-    }
-}
-
-#[test]
-fn target_specific_requirement_is_always_enforced() {
-    // "app" declares an unconditional `serde = "^1"` and a stricter
-    // `serde = "^1.4"` under a target-specific table. Cargo's resolver
-    // evaluates every target table regardless of the host platform, so
-    // the target-specific requirement is just as mandatory as the
-    // unconditional one and must be enforced alongside it.
-    let transport = FakeTransport::default();
-    transport.ok(
-        "serde",
-        &versions_body(&[("1.5.0", 5, false), ("1.3.0", 50, false)], now()),
-    );
-    transport.index_ok(
-                "app",
-                r#"{"vers":"1.0.0","deps":[{"name":"serde","req":"^1"},{"name":"serde","req":"^1.4","target":"cfg(unix)"}]}"#,
-            );
-    let mut client = fast_client(transport);
-
-    let violations = vec![too_new("serde", "1.5.0")];
-    let packages = vec![
-        pkg("serde", "1.5.0", &[]),
-        pkg("app", "1.0.0", &[("serde", "1.5.0")]),
-    ];
-    let outcomes = suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
-
-    match &outcomes[0] {
-        Outcome::Blocked {
-            newest_compliant,
-            blocker,
-            ..
-        } => {
-            assert_eq!(newest_compliant, "1.3.0");
-            assert_eq!(blocker.name, "app");
-            assert_eq!(blocker.req, "^1.4");
-        }
-        _ => panic!("expected serde to be Blocked by app's target-specific requirement"),
-    }
-}
-
-#[test]
-fn identical_requirement_repeated_across_targets_still_blocks() {
-    // "app" declares the same `serde = "^1.5"` requirement under two
-    // target-specific tables (e.g. cfg(unix) and cfg(windows)), which
-    // the index lists as two separate `deps` entries with identical
-    // `req` strings. This is not the same situation as two distinct
-    // declarations that might not both be active — the requirement
-    // is identical either way, so it must still be enforced as a
-    // definite blocker rather than merely "unverified".
-    let transport = FakeTransport::default();
-    transport.ok(
-        "serde",
-        &versions_body(&[("1.5.0", 5, false), ("1.4.0", 50, false)], now()),
-    );
-    transport.index_ok(
-                "app",
-                r#"{"vers":"1.0.0","deps":[{"name":"serde","req":"^1.5","target":"cfg(unix)"},{"name":"serde","req":"^1.5","target":"cfg(windows)"}]}"#,
-            );
-    let mut client = fast_client(transport);
-
-    let violations = vec![too_new("serde", "1.5.0")];
-    let packages = vec![
-        pkg("serde", "1.5.0", &[]),
-        pkg("app", "1.0.0", &[("serde", "1.5.0")]),
-    ];
-    let outcomes = suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
-
-    match &outcomes[0] {
-        Outcome::Blocked {
-            newest_compliant,
-            blocker,
-            ..
-        } => {
-            assert_eq!(newest_compliant, "1.4.0");
-            assert_eq!(blocker.name, "app");
-            assert_eq!(blocker.req, "^1.5");
-        }
-        _ => panic!("expected serde to be Blocked by app's requirement, not merely unverified"),
-    }
-}
-
-#[test]
-fn requirement_attribution_acceptance_cases() {
-    // name, second version, requirements, unverified, blocks 1.7
-    let cases: &[(&str, bool, &[&str], bool, bool)] = &[
-        ("overlap", true, &["^1", ">=1.8,<3"], true, false),
-        ("disjoint", true, &["^1", "^2"], false, false),
-        (
-            "identical aliases",
-            true,
-            &[">=1.8,<3", ">=1.8, <3"],
-            false,
-            true,
-        ),
-        ("single version", false, &["^1", ">=1.8,<2"], false, true),
-        ("optional", true, &["^1", ">=1.8,<3"], true, false),
-        ("target", true, &["^1", ">=1.8,<3"], true, false),
-        ("other blocker", true, &["^1", ">=1.8,<3"], true, true),
-        ("other parent", false, &["^1", ">=1.8,<3"], false, true),
-        ("other source", true, &["^1", ">=1.8,<3"], false, true),
-        ("path sibling", false, &["^1", ">=1.8,<3"], false, true),
-        ("duplicate edge", false, &["^1", ">=1.8,<3"], false, true),
-        ("unreadable", false, &[], true, false),
-    ];
-    for registry in [true, false] {
-        for &(case, second_version, reqs, unverified, blocked) in cases {
-            if !registry && matches!(case, "optional" | "target") {
-                continue;
-            }
-            let transport = FakeTransport::default();
-            let mut requirements = Vec::new();
-            let mut app = if registry {
-                pkg("app", "1.0.0", &[("foo", "1.9.0")])
-            } else {
-                non_registry_pkg("app", "1.0.0", &[("foo", "1.9.0")])
-            };
-            let source = pkg("foo", "1.9.0", &[]).source.unwrap();
-            app.dependencies[0].source = Some(source.clone());
-            let mut packages = vec![pkg("foo", "1.9.0", &[])];
-            if second_version {
-                let mut sibling = pkg("foo", "2.0.0", &[]);
-                if case == "other source" {
-                    sibling = external_pkg("foo", "2.0.0", ALT_REGISTRY_SOURCE, &[]);
-                }
-                app.dependencies.push(PackageRef {
-                    name: "foo".into(),
-                    version: sibling.version.clone(),
-                    source: sibling.source.clone(),
-                });
-                packages.push(sibling);
-            }
-            match case {
-                "path sibling" => {
-                    packages.push(non_registry_pkg("foo", "1.9.0", &[]));
-                    app.dependencies.push(PackageRef {
-                        name: "foo".into(),
-                        version: "1.9.0".into(),
-                        source: None,
-                    });
-                }
-                "duplicate edge" => app.dependencies.push(PackageRef {
-                    name: "foo".into(),
-                    version: "1.9.0".into(),
-                    source: Some(source.clone()),
-                }),
-                "other parent" => {
-                    packages.push(pkg("foo", "2.0.0", &[]));
-                    packages.push(pkg("other", "1.0.0", &[("foo", "2.0.0")]));
-                }
-                "other blocker" => {
-                    if registry {
-                        packages.push(pkg("other", "1.0.0", &[("foo", "1.9.0")]));
-                        transport.index_ok(
-                            "other",
-                            r#"{"vers":"1.0.0","deps":[{"name":"foo","req":">=1.8"}]}"#,
-                        );
-                    } else {
-                        packages.push(non_registry_pkg("other", "1.0.0", &[("foo", "1.9.0")]));
-                        requirements.push(local_requirement("other", "1.0.0", "foo", ">=1.8"));
-                    }
-                }
-                _ => {}
-            }
-            packages.push(app);
-            if registry && case != "unreadable" {
-                let deps: Vec<_> = reqs.iter().enumerate().map(|(i, req)| {
-                            serde_json::json!({
-                                "name": format!("alias_{i}"), "package": "foo", "req": req,
-                                "optional": case == "optional" && i == 0,
-                                "target": if case == "target" && i == 0 { Some("cfg(unix)") } else { None },
-                            })
-                        }).collect();
-                transport.index_ok(
-                    "app",
-                    &serde_json::json!({
-                        "vers": "1.0.0", "deps": deps,
-                    })
-                    .to_string(),
-                );
-            } else if registry {
-                transport.index_error("app");
-            } else {
-                requirements.extend(
-                    reqs.iter()
-                        .map(|req| local_requirement("app", "1.0.0", "foo", req)),
-                );
-            }
-            let mut client = fast_client(transport);
-            let index = build_indexes(&packages).0;
-            let gathered = gather_constraints(
-                &mut client,
-                &index,
-                &requirements,
-                Path::new("/work"),
-                "foo",
-                "1.9.0",
-                Some(&source),
-            );
-            let expected_unverified = if unverified { vec!["app"] } else { vec![] };
-            assert_eq!(
-                gathered.unverified_dependents, expected_unverified,
-                "{case}, registry={registry}"
-            );
-            if case == "disjoint" {
-                assert!(
-                    gathered
-                        .constraints
-                        .iter()
-                        .any(|c| !c.req.matches(&v("0.9.0")))
-                );
-            }
-            let result = walk(vec![(v("1.7.0"), 80)], gathered.constraints);
-            assert_eq!(
-                matches!(result, WalkResult::Blocked { .. }),
-                blocked,
-                "{case}, registry={registry}"
-            );
-            if case == "other blocker" {
-                let WalkResult::Blocked { blocker, .. } = result else {
-                    unreachable!()
-                };
-                assert_eq!(
-                    blocker.blocker_name,
-                    if registry { "other" } else { "Cargo.toml" }
-                );
-            } else if !blocked {
-                assert!(
-                    matches!(result, WalkResult::Suggest(version, 80) if version == v("1.7.0"))
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn failed_index_fetch_yields_suggestion_with_unverified_annotation() {
-    let transport = FakeTransport::default();
-    transport.ok(
-        "serde",
-        &versions_body(&[("1.5.0", 5, false), ("1.4.0", 50, false)], now()),
-    );
-    transport.index_error("app");
-    let mut client = fast_client(transport);
-
-    let violations = vec![too_new("serde", "1.5.0")];
-    let packages = vec![
-        pkg("serde", "1.5.0", &[]),
-        pkg("app", "1.0.0", &[("serde", "1.5.0")]),
-    ];
-    let outcomes = suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
-
-    match &outcomes[0] {
-        Outcome::Suggest {
-            unverified_dependents,
-            ..
-        } => assert_eq!(unverified_dependents, &["app".to_string()]),
-        _ => panic!("expected Suggest"),
-    }
-}
-
-#[test]
-fn a_package_locked_at_two_versions_produces_two_outcomes() {
-    let transport = FakeTransport::default();
-    transport.ok(
-        "serde",
-        &versions_body(&[("1.0.0", 50, false), ("2.0.0", 50, false)], now()),
-    );
-    let mut client = fast_client(transport);
-
-    let violations = vec![too_new("serde", "1.0.0"), too_new("serde", "2.0.0")];
-    let packages = vec![pkg("serde", "1.0.0", &[]), pkg("serde", "2.0.0", &[])];
-    let outcomes = suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
-
-    assert_eq!(outcomes.len(), 2);
-}
-
-#[test]
-fn also_suggested_is_false_when_the_blocker_itself_has_no_suggestion() {
-    // "y" blocks "target", and "y" is itself in the too-new set —
-    // but y's own walk resolves to NoCompliantVersion, not Suggest,
-    // so the blocked message must not claim a fix for y exists.
-    let transport = FakeTransport::default();
-    transport.ok(
-        "target",
-        &versions_body(&[("1.5.0", 5, false), ("1.4.0", 50, false)], now()),
-    );
-    transport.ok("y", &versions_body(&[("1.5.0", 5, false)], now()));
-    transport.index_ok(
-        "y",
-        r#"{"vers":"1.5.0","deps":[{"name":"target","req":"^1.5"}]}"#,
-    );
-    let mut client = fast_client(transport);
-
-    let violations = vec![too_new("target", "1.5.0"), too_new("y", "1.5.0")];
-    let packages = vec![
-        pkg("target", "1.5.0", &[]),
-        pkg("y", "1.5.0", &[("target", "1.5.0")]),
-    ];
-    let outcomes = suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
-
-    match &outcomes[0] {
-        Outcome::Blocked { blocker, .. } => {
-            assert_eq!(blocker.name, "y");
-            assert!(
-                !blocker.also_suggested,
-                "y has no Suggest outcome of its own"
-            );
-        }
-        _ => panic!("expected target to be Blocked"),
-    }
-    assert!(matches!(
-        &outcomes[1],
-        Outcome::NoCompliantVersion { package, .. } if package == "y"
-    ));
-}
-
-#[test]
-fn also_suggested_is_false_when_only_another_version_of_the_blocker_is_suggested() {
-    // "foo" is locked at both 1.5.0 and 2.5.0. Only 1.5.0 resolves to
-    // a Suggest; the 2.5.0 that blocks "target" has no compliant
-    // version, so the blocked message must not point at the unrelated
-    // 1.5.0 downgrade.
-    let transport = FakeTransport::default();
-    transport.ok(
-        "target",
-        &versions_body(&[("1.5.0", 5, false), ("1.4.0", 50, false)], now()),
-    );
-    transport.ok(
-        "foo",
-        &versions_body(
-            &[
-                ("1.5.0", 5, false),
-                ("1.4.0", 50, false),
-                ("2.5.0", 5, false),
-            ],
-            now(),
-        ),
-    );
-    transport.index_ok(
-        "foo",
-        r#"{"vers":"2.5.0","deps":[{"name":"target","req":"^1.5"}]}"#,
-    );
-    let mut client = fast_client(transport);
-
-    let violations = vec![
-        too_new("target", "1.5.0"),
-        too_new("foo", "1.5.0"),
-        too_new("foo", "2.5.0"),
-    ];
-    let packages = vec![
-        pkg("target", "1.5.0", &[]),
-        pkg("foo", "1.5.0", &[]),
-        pkg("foo", "2.5.0", &[("target", "1.5.0")]),
-    ];
-    let outcomes = suggestions(&mut client, &violations, &packages, &[], Path::new("/work"));
-
-    assert!(
-        matches!(&outcomes[1], Outcome::Suggest { package, locked_version, .. }
-                    if package == "foo" && locked_version == "1.5.0"),
-        "foo 1.5.0 should be suggested, otherwise the test proves nothing"
-    );
-    match &outcomes[0] {
-        Outcome::Blocked { blocker, .. } => {
-            assert_eq!(blocker.name, "foo");
-            assert_eq!(blocker.version.as_deref(), Some("2.5.0"));
-            assert!(
-                !blocker.also_suggested,
-                "the suggestion is for foo 1.5.0, which does not unblock foo 2.5.0"
-            );
-        }
-        _ => panic!("expected target to be Blocked"),
+fn only_crates_io_declarations_constrain_the_crates_io_package() {
+    // "app" declares foo on crates.io and, renamed, on a private registry.
+    let private = |req| DirectRequirement {
+        source: RequirementSource::Registry("priv".to_string()),
+        ..local_requirement("app", "0.1.0", "foo", req)
+    };
+    let packages = [non_registry_pkg("app", "0.1.0", &[("foo", "1.9.0")])];
+    for (crates_io_req, private_req) in [("^1.0", "=1.9.0"), ("=1.9.0", "^1.0")] {
+        let requirements = [
+            local_requirement("app", "0.1.0", "foo", crates_io_req),
+            private(private_req),
+        ];
+        let gathered = gather(FakeTransport::default(), &packages, &requirements, "1.9.0");
+        assert_eq!(reqs(&gathered), [crates_io_req]);
+        assert!(gathered.unverified_dependents.is_empty());
     }
 }
 
 #[test]
 fn manifest_constraint_is_scoped_to_the_declaring_dependent() {
-    // member_a locks clap@2.5.0 and requires ^2; member_b locks a
-    // different clap version and requires ^3. member_b's unrelated
-    // requirement must not leak into member_a's constraint set.
-    let transport = FakeTransport::default();
-    transport.ok(
-        "clap",
-        &versions_body(&[("2.5.0", 5, false), ("2.0.0", 50, false)], now()),
-    );
-    let mut client = fast_client(transport);
-
-    let direct_requirements = vec![
-        crate::manifest::DirectRequirement {
-            manifest: PathBuf::from("/work/member_a/Cargo.toml"),
-            declaring_package: "member_a".to_string(),
-            declaring_version: Some("0.1.0".to_string()),
-            crate_name: "clap".to_string(),
-            req: VersionReq::parse("^2").unwrap(),
-            source: RequirementSource::CratesIo,
-        },
-        crate::manifest::DirectRequirement {
-            manifest: PathBuf::from("/work/member_b/Cargo.toml"),
-            declaring_package: "member_b".to_string(),
-            declaring_version: Some("0.1.0".to_string()),
-            crate_name: "clap".to_string(),
-            req: VersionReq::parse("^3").unwrap(),
-            source: RequirementSource::CratesIo,
-        },
+    // member_a locks foo 2.5.0 and requires ^2; member_b locks a
+    // different foo version and requires ^2.4. member_b's requirement also
+    // matches 2.5.0, but it must not leak into member_a's constraint set.
+    let packages = [
+        non_registry_pkg("member_a", "0.1.0", &[("foo", "2.5.0")]),
+        non_registry_pkg("member_b", "0.1.0", &[("foo", "2.6.0")]),
     ];
-    let packages = vec![
-        pkg("clap", "2.5.0", &[]),
-        non_registry_pkg("member_a", "0.1.0", &[("clap", "2.5.0")]),
-        non_registry_pkg("member_b", "0.1.0", &[("clap", "3.1.0")]),
+    let requirements = [
+        local_requirement("member_a", "0.1.0", "foo", "^2"),
+        local_requirement("member_b", "0.1.0", "foo", "^2.4"),
     ];
+    let gathered = gather(FakeTransport::default(), &packages, &requirements, "2.5.0");
+    assert_eq!(reqs(&gathered), ["^2"]);
+}
 
-    let violations = vec![too_new("clap", "2.5.0")];
-    let outcomes = suggestions(
-        &mut client,
-        &violations,
-        &packages,
-        &direct_requirements,
-        Path::new("/work"),
-    );
+#[test]
+fn also_suggested_follows_whether_the_blocker_itself_has_a_suggestion() {
+    // "y" blocks "target" and is itself too new; whether y's own walk
+    // finds a downgrade decides whether the block may claim a fix for y.
+    let cases = [
+        (
+            &[("1.5.0", 5)][..],
+            [
+                "target: blocked at 1.4.0 by y@1.5.0 ^1.5",
+                "y: no compliant version",
+            ],
+        ),
+        (
+            &[("1.5.0", 5), ("1.4.0", 50)],
+            [
+                "target: blocked at 1.4.0 by y@1.5.0 ^1.5 (also suggested)",
+                "y: suggest 1.4.0 (50d)",
+            ],
+        ),
+    ];
+    for (y_versions, expected) in cases {
+        let transport = FakeTransport::default();
+        transport.versions("target", &[("1.5.0", 5), ("1.4.0", 50)]);
+        transport.versions("y", y_versions);
+        transport.index_ok(
+            "y",
+            r#"{"vers":"1.5.0","deps":[{"name":"target","req":"^1.5"}]}"#,
+        );
+        let violations = [too_new("target", "1.5.0"), too_new("y", "1.5.0")];
+        let packages = [
+            pkg("target", "1.5.0", &[]),
+            pkg("y", "1.5.0", &[("target", "1.5.0")]),
+        ];
+        let outcomes = suggestions(transport, &violations, &packages, &[], Path::new("/work"));
 
-    match &outcomes[0] {
-        Outcome::Suggest {
-            suggested_version, ..
-        } => assert_eq!(suggested_version, "2.0.0"),
-        _ => panic!("expected clap to be Suggest: member_b's ^3 must not apply"),
+        assert_eq!(summaries(&outcomes), expected, "y versions {y_versions:?}");
     }
 }
 
 #[test]
+fn also_suggested_is_false_when_only_another_version_of_the_blocker_is_suggested() {
+    // "foo" is locked at 1.5.0 and 2.5.0. Only 1.5.0 resolves to a
+    // suggestion; the 2.5.0 that blocks "target" has no compliant
+    // version, so the block must not point at the unrelated 1.5.0 fix.
+    let transport = FakeTransport::default();
+    transport.versions("target", &[("1.5.0", 5), ("1.4.0", 50)]);
+    transport.versions("foo", &[("1.5.0", 5), ("1.4.0", 50), ("2.5.0", 5)]);
+    transport.index_ok(
+        "foo",
+        r#"{"vers":"2.5.0","deps":[{"name":"target","req":"^1.5"}]}"#,
+    );
+    let violations = [
+        too_new("target", "1.5.0"),
+        too_new("foo", "1.5.0"),
+        too_new("foo", "2.5.0"),
+    ];
+    let packages = [
+        pkg("target", "1.5.0", &[]),
+        pkg("foo", "1.5.0", &[]),
+        pkg("foo", "2.5.0", &[("target", "1.5.0")]),
+    ];
+    let outcomes = suggestions(transport, &violations, &packages, &[], Path::new("/work"));
+
+    assert_eq!(
+        summaries(&outcomes),
+        [
+            "target: blocked at 1.4.0 by foo@2.5.0 ^1.5",
+            "foo: suggest 1.4.0 (50d)",
+            "foo: no compliant version"
+        ]
+    );
+}
+
+#[test]
 fn stale_cached_index_records_missing_dependent_version_are_refetched() {
-    // The cache holds "app"'s index records as of an earlier, older
-    // release ("1.0.0"). The lockfile has since moved to "1.0.1",
-    // which the cache entry (still within its max age) doesn't list.
-    // Looking up "1.0.1" must fall back to a live fetch rather than
-    // silently treating the requirement as unreadable.
+    // The cache holds "app"'s index records as of "1.0.0", but the
+    // lockfile has moved to "1.0.1", which the cached entry doesn't
+    // list. Looking up "1.0.1" must fall back to a live fetch rather
+    // than silently treating the requirement as unreadable.
     let dir = tempfile::tempdir().unwrap();
     let cache_path = dir.path().join("cache.json");
     let mut cache = crate::cache::ResponseCache::load(Some(&cache_path));
@@ -1558,22 +474,10 @@ fn stale_cached_index_records_missing_dependent_version_are_refetched() {
         "app",
         r#"{"vers":"1.0.1","deps":[{"name":"foo","req":"^1.5"}]}"#,
     );
-    let mut client = CratesIoClient::with_transport(
-        transport,
-        Some(&cache_path),
-        24,
-        RetryPolicy {
-            retry_count: NonZeroU32::new(1).unwrap(),
-            retry_delay: Duration::from_millis(0),
-            pacing_delay: Duration::from_millis(0),
-        },
-    );
-
-    let packages = vec![pkg("app", "1.0.1", &[("foo", "1.5.0")])];
-    let index = build_indexes(&packages).0;
+    let packages = [pkg("app", "1.0.1", &[("foo", "1.5.0")])];
     let gathered = gather_constraints(
-        &mut client,
-        &index,
+        &mut fast_client(transport, Some(&cache_path)),
+        &build_indexes(&packages).0,
         &[],
         Path::new("/work"),
         "foo",
@@ -1582,6 +486,252 @@ fn stale_cached_index_records_missing_dependent_version_are_refetched() {
     );
 
     assert!(gathered.unverified_dependents.is_empty());
-    assert_eq!(gathered.constraints.len(), 1);
-    assert!(!gathered.constraints[0].req.matches(&v("1.4.0")));
+    assert_eq!(reqs(&gathered), ["^1.5"]);
+}
+
+const OVERLAPPING: &[&str] = &["^1", ">=1.8,<3"];
+
+/// What else the lockfile holds besides `app` 1.0.0 locking crates.io
+/// `foo` 1.9.0.
+#[derive(Clone, Copy)]
+enum Lock {
+    OnlyFoo190,
+    /// `app` also locks crates.io `foo` 2.0.0.
+    SecondVersion,
+    /// `app` also locks `foo` 2.0.0, but from another registry.
+    SecondVersionFromOtherRegistry,
+    /// `app` also locks a path `foo` at the same 1.9.0.
+    PathFooAtSameVersion,
+    /// `app` lists its crates.io `foo` 1.9.0 edge twice.
+    DuplicateEdge,
+    /// Some other package, not `app`, locks `foo` 2.0.0.
+    OtherDependentOnSecondVersion,
+    /// `app` also locks `foo` 2.0.0, and `other` requires `foo >=1.8`.
+    SecondVersionAndOtherDependent,
+}
+
+/// Runs `check(gathered, registry)` with `app` declaring `foo` once per
+/// entry of `reqs` (none: unreadable), first in its registry index record,
+/// then in a local manifest.
+fn in_both_modes(reqs: &[&str], lock: Lock, check: impl Fn(GatheredConstraints, bool)) {
+    for registry in [true, false] {
+        let transport = FakeTransport::default();
+        let mut requirements = Vec::new();
+        let mut app = if registry {
+            pkg("app", "1.0.0", &[("foo", "1.9.0")])
+        } else {
+            non_registry_pkg("app", "1.0.0", &[("foo", "1.9.0")])
+        };
+        let foo_edge = |version: &str, source: Option<&str>| PackageRef {
+            name: "foo".into(),
+            version: version.into(),
+            source: source.map(Into::into),
+        };
+        let mut packages = vec![pkg("foo", "1.9.0", &[])];
+
+        let second = match lock {
+            Lock::SecondVersion | Lock::SecondVersionAndOtherDependent => {
+                Some(pkg("foo", "2.0.0", &[]))
+            }
+            Lock::SecondVersionFromOtherRegistry => {
+                Some(external_pkg("foo", "2.0.0", ALT_REGISTRY_SOURCE, &[]))
+            }
+            _ => None,
+        };
+        if let Some(second) = second {
+            app.dependencies
+                .push(foo_edge(&second.version, second.source.as_deref()));
+            packages.push(second);
+        }
+        match lock {
+            Lock::PathFooAtSameVersion => {
+                packages.push(non_registry_pkg("foo", "1.9.0", &[]));
+                app.dependencies.push(foo_edge("1.9.0", None));
+            }
+            Lock::DuplicateEdge => app
+                .dependencies
+                .push(foo_edge("1.9.0", Some(CRATES_IO_SOURCE))),
+            Lock::OtherDependentOnSecondVersion => {
+                packages.push(pkg("foo", "2.0.0", &[]));
+                packages.push(pkg("other", "1.0.0", &[("foo", "2.0.0")]));
+            }
+            Lock::SecondVersionAndOtherDependent if registry => {
+                packages.push(pkg("other", "1.0.0", &[("foo", "1.9.0")]));
+                transport.index_ok(
+                    "other",
+                    r#"{"vers":"1.0.0","deps":[{"name":"foo","req":">=1.8"}]}"#,
+                );
+            }
+            Lock::SecondVersionAndOtherDependent => {
+                packages.push(non_registry_pkg("other", "1.0.0", &[("foo", "1.9.0")]));
+                requirements.push(local_requirement("other", "1.0.0", "foo", ">=1.8"));
+            }
+            _ => {}
+        }
+        packages.push(app);
+
+        if !registry {
+            requirements.extend(
+                reqs.iter()
+                    .map(|req| local_requirement("app", "1.0.0", "foo", req)),
+            );
+        } else if reqs.is_empty() {
+            transport.index_error("app");
+        } else {
+            let deps: Vec<_> = reqs
+                .iter()
+                .enumerate()
+                .map(|(i, req)| {
+                    serde_json::json!({
+                        "name": format!("alias_{i}"), "package": "foo", "req": req,
+                    })
+                })
+                .collect();
+            transport.index_ok(
+                "app",
+                &serde_json::json!({ "vers": "1.0.0", "deps": deps }).to_string(),
+            );
+        }
+        check(
+            gather(transport, &packages, &requirements, "1.9.0"),
+            registry,
+        );
+    }
+}
+
+/// Walks the single candidate foo 1.7.0 against the gathered constraints.
+fn walk_1_7(gathered: GatheredConstraints) -> WalkResult {
+    walk(vec![(v("1.7.0"), 80)], gathered.constraints)
+}
+
+fn assert_suggests_1_7(result: WalkResult, registry: bool) {
+    assert!(
+        matches!(result, WalkResult::Suggest(version, 80) if version == v("1.7.0")),
+        "registry={registry}"
+    );
+}
+
+/// Asserts 1.7.0 is blocked and returns the blocking constraint.
+fn blocker_of(result: WalkResult, registry: bool) -> Constraint {
+    let WalkResult::Blocked { blocker, .. } = result else {
+        panic!("1.7.0 was not blocked, registry={registry}");
+    };
+    blocker
+}
+
+/// `app` is reported unverified and enforces nothing, so 1.7.0 passes.
+fn assert_unverified_and_unblocked(gathered: GatheredConstraints, registry: bool) {
+    assert_eq!(
+        gathered.unverified_dependents,
+        ["app"],
+        "registry={registry}"
+    );
+    assert_suggests_1_7(walk_1_7(gathered), registry);
+}
+
+/// `app` is verified and its enforced declarations block 1.7.0.
+fn assert_verified_and_blocked(gathered: GatheredConstraints, registry: bool) {
+    assert!(
+        gathered.unverified_dependents.is_empty(),
+        "registry={registry}"
+    );
+    blocker_of(walk_1_7(gathered), registry);
+}
+
+#[test]
+fn overlapping_declarations_across_two_locked_versions_are_unverified() {
+    in_both_modes(
+        OVERLAPPING,
+        Lock::SecondVersion,
+        assert_unverified_and_unblocked,
+    );
+}
+
+#[test]
+fn disjoint_declarations_enforce_the_one_matching_the_locked_version() {
+    in_both_modes(&["^1", "^2"], Lock::SecondVersion, |gathered, registry| {
+        assert!(
+            gathered.unverified_dependents.is_empty(),
+            "registry={registry}"
+        );
+        assert_eq!(reqs(&gathered), ["^1"], "registry={registry}");
+        assert_suggests_1_7(walk_1_7(gathered), registry);
+    });
+}
+
+#[test]
+fn identical_requirement_aliases_count_once() {
+    in_both_modes(
+        &[">=1.8,<3", ">=1.8, <3"],
+        Lock::SecondVersion,
+        assert_verified_and_blocked,
+    );
+}
+
+#[test]
+fn a_single_locked_version_enforces_every_declaration() {
+    in_both_modes(
+        &["^1", ">=1.8,<2"],
+        Lock::OnlyFoo190,
+        assert_verified_and_blocked,
+    );
+}
+
+#[test]
+fn another_dependents_requirement_still_blocks_when_app_is_unverified() {
+    in_both_modes(
+        OVERLAPPING,
+        Lock::SecondVersionAndOtherDependent,
+        |gathered, registry| {
+            assert_eq!(
+                gathered.unverified_dependents,
+                ["app"],
+                "registry={registry}"
+            );
+            let blocker = blocker_of(walk_1_7(gathered), registry);
+            let expected = if registry { "other" } else { "Cargo.toml" };
+            assert_eq!(blocker.blocker_name, expected);
+        },
+    );
+}
+
+#[test]
+fn another_dependents_second_version_does_not_make_app_ambiguous() {
+    in_both_modes(
+        OVERLAPPING,
+        Lock::OtherDependentOnSecondVersion,
+        assert_verified_and_blocked,
+    );
+}
+
+#[test]
+fn a_second_version_from_another_registry_does_not_make_app_ambiguous() {
+    in_both_modes(
+        OVERLAPPING,
+        Lock::SecondVersionFromOtherRegistry,
+        assert_verified_and_blocked,
+    );
+}
+
+#[test]
+fn a_path_foo_at_the_same_version_does_not_make_app_ambiguous() {
+    in_both_modes(
+        OVERLAPPING,
+        Lock::PathFooAtSameVersion,
+        assert_verified_and_blocked,
+    );
+}
+
+#[test]
+fn a_duplicate_lock_edge_does_not_make_app_ambiguous() {
+    in_both_modes(
+        OVERLAPPING,
+        Lock::DuplicateEdge,
+        assert_verified_and_blocked,
+    );
+}
+
+#[test]
+fn unreadable_declarations_are_unverified() {
+    in_both_modes(&[], Lock::OnlyFoo190, assert_unverified_and_unblocked);
 }
