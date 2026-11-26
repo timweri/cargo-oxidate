@@ -16,10 +16,6 @@ exclude = [
     ".github/",
 ]
 
-[[bin]]
-name = "cargo-oxidate"
-path = "src/main.rs"
-
 [dependencies]
 cargo-lock = "10"
 clap = { version = "4", features = ["derive", "env"] }

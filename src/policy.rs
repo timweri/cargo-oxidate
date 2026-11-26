@@ -1,7 +1,6 @@
 use crate::lockfile::Package;
-use crate::report::{Aged, Violation, ViolationKind};
+use crate::report::{Aged, Policy, Violation, ViolationKind};
 use chrono::{DateTime, Utc};
-use std::collections::HashSet;
 
 /// The freshness rule: minimum and maximum age thresholds, an exempt list,
 /// and what to do when a publish date cannot be determined.
@@ -10,53 +9,38 @@ use std::collections::HashSet;
 /// of a package, a publish-date lookup result, and a timestamp, so it's
 /// testable without a network connection.
 pub struct FreshnessPolicy {
-    min_age_days: Option<u64>,
-    max_age_days: Option<u64>,
-    exclude_missing: bool,
-    exempt: HashSet<String>,
-    effective_exemptions: Vec<String>,
+    policy: Policy,
 }
 
 impl FreshnessPolicy {
     /// Fails if neither threshold is given, since a policy with no thresholds
-    /// can never produce a violation.
-    pub fn new(
-        min_age_days: Option<u64>,
-        max_age_days: Option<u64>,
-        exclude_missing: bool,
-        exempt: Vec<String>,
-    ) -> anyhow::Result<Self> {
-        if min_age_days.is_none() && max_age_days.is_none() {
+    /// can never produce a violation, or if the minimum exceeds the maximum,
+    /// since every package would then be flagged.
+    pub fn new(policy: &Policy) -> anyhow::Result<Self> {
+        if policy.min_age_days.is_none() && policy.max_age_days.is_none() {
             anyhow::bail!("At least one of --min-age-days or --max-age-days must be specified");
         }
-
-        let effective_exemptions =
-            crate::report::Policy::new(min_age_days, max_age_days, exclude_missing, exempt).exempt;
+        if let (Some(min), Some(max)) = (policy.min_age_days, policy.max_age_days)
+            && min > max
+        {
+            anyhow::bail!("--min-age-days ({min}) must not exceed --max-age-days ({max})");
+        }
 
         Ok(Self {
-            min_age_days,
-            max_age_days,
-            exclude_missing,
-            exempt: effective_exemptions.iter().cloned().collect(),
-            effective_exemptions,
+            policy: policy.clone(),
         })
     }
 
     pub fn is_exempt(&self, name: &str) -> bool {
-        self.exempt.contains(name)
+        self.policy.exempt.iter().any(|exempt| exempt == name)
     }
 
-    pub fn report_policy(&self) -> crate::report::Policy {
-        crate::report::Policy {
-            min_age_days: self.min_age_days,
-            max_age_days: self.max_age_days,
-            exclude_missing: self.exclude_missing,
-            exempt: self.effective_exemptions.clone(),
-        }
+    pub fn report_policy(&self) -> &Policy {
+        &self.policy
     }
 
     pub fn excludes_missing(&self) -> bool {
-        self.exclude_missing
+        self.policy.exclude_missing
     }
 
     /// Evaluates a package against the policy given its publish date (`None`
@@ -67,47 +51,43 @@ impl FreshnessPolicy {
         published: Option<DateTime<Utc>>,
         now: DateTime<Utc>,
     ) -> Vec<Violation> {
-        let mut violations = Vec::new();
+        let violation = |kind| Violation {
+            package: pkg.name.clone(),
+            version: pkg.version.clone(),
+            kind,
+        };
 
         let Some(published) = published else {
-            if !self.exclude_missing {
-                violations.push(Violation {
-                    package: pkg.name.clone(),
-                    version: pkg.version.clone(),
-                    kind: ViolationKind::MissingPublishDate {
-                        reason: "crates.io did not return this package version".to_string(),
-                    },
-                });
-            }
-            return violations;
+            let missing = ViolationKind::MissingPublishDate {
+                reason: "crates.io did not return this package version".to_string(),
+            };
+            return if self.policy.exclude_missing {
+                vec![]
+            } else {
+                vec![violation(missing)]
+            };
         };
 
         let age_days = (now - published).num_days();
+        let aged = || Aged {
+            published,
+            age_days,
+        };
+        let mut violations = Vec::new();
 
-        if let Some(min) = self.min_age_days
-            && age_days < min as i64
+        if self
+            .policy
+            .min_age_days
+            .is_some_and(|min| age_days < min as i64)
         {
-            violations.push(Violation {
-                package: pkg.name.clone(),
-                version: pkg.version.clone(),
-                kind: ViolationKind::TooNew(Aged {
-                    published,
-                    age_days,
-                }),
-            });
+            violations.push(violation(ViolationKind::TooNew(aged())));
         }
-
-        if let Some(max) = self.max_age_days
-            && age_days > max as i64
+        if self
+            .policy
+            .max_age_days
+            .is_some_and(|max| age_days > max as i64)
         {
-            violations.push(Violation {
-                package: pkg.name.clone(),
-                version: pkg.version.clone(),
-                kind: ViolationKind::TooOld(Aged {
-                    published,
-                    age_days,
-                }),
-            });
+            violations.push(violation(ViolationKind::TooOld(aged())));
         }
 
         violations
@@ -129,103 +109,68 @@ mod tests {
         }
     }
 
-    fn published_days_ago(now: DateTime<Utc>, days: i64) -> DateTime<Utc> {
-        now - Duration::days(days)
+    #[test]
+    fn new_validates_thresholds() {
+        // (min, max, expected error message; `None` means accepted)
+        let cases = [
+            (
+                None,
+                None,
+                Some("At least one of --min-age-days or --max-age-days must be specified"),
+            ),
+            (Some(7), None, None),
+            (None, Some(365), None),
+            (Some(30), Some(30), None),
+            (
+                Some(400),
+                Some(30),
+                Some("--min-age-days (400) must not exceed --max-age-days (30)"),
+            ),
+        ];
+
+        for (min, max, expected) in cases {
+            let result = FreshnessPolicy::new(&Policy::new(min, max, false, vec![]));
+            assert_eq!(
+                result.err().map(|e| e.to_string()).as_deref(),
+                expected,
+                "min={min:?} max={max:?}"
+            );
+        }
     }
 
     #[test]
-    fn new_fails_without_any_threshold() {
-        let result = FreshnessPolicy::new(None, None, false, vec![]);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn new_succeeds_with_only_min() {
-        assert!(FreshnessPolicy::new(Some(7), None, false, vec![]).is_ok());
-    }
-
-    #[test]
-    fn new_succeeds_with_only_max() {
-        assert!(FreshnessPolicy::new(None, Some(365), false, vec![]).is_ok());
-    }
-
-    #[test]
-    fn package_exactly_at_min_age_is_compliant() {
+    fn age_thresholds_are_inclusive_and_independent() {
+        // (min, max, package age in days, expected violations as (kind, age))
+        let cases: [(_, _, _, &[(&str, i64)]); 7] = [
+            (Some(7), None, 7, &[]),
+            (None, Some(365), 365, &[]),
+            (Some(7), None, 6, &[("too new", 6)]),
+            (None, Some(365), 366, &[("too old", 366)]),
+            (Some(7), Some(365), 1, &[("too new", 1)]),
+            (Some(7), Some(365), 400, &[("too old", 400)]),
+            (Some(7), Some(365), 100, &[]),
+        ];
         let now = Utc::now();
-        let policy = FreshnessPolicy::new(Some(7), None, false, vec![]).unwrap();
-        let published = Some(published_days_ago(now, 7));
 
-        assert!(policy.evaluate(&pkg(), published, now).is_empty());
-    }
-
-    #[test]
-    fn package_exactly_at_max_age_is_compliant() {
-        let now = Utc::now();
-        let policy = FreshnessPolicy::new(None, Some(365), false, vec![]).unwrap();
-        let published = Some(published_days_ago(now, 365));
-
-        assert!(policy.evaluate(&pkg(), published, now).is_empty());
-    }
-
-    #[test]
-    fn package_one_day_below_min_age_is_too_new() {
-        let now = Utc::now();
-        let policy = FreshnessPolicy::new(Some(7), None, false, vec![]).unwrap();
-        let published = Some(published_days_ago(now, 6));
-
-        let violations = policy.evaluate(&pkg(), published, now);
-        assert_eq!(violations.len(), 1);
-        assert!(matches!(
-            violations[0].kind,
-            ViolationKind::TooNew(Aged { age_days: 6, .. })
-        ));
-    }
-
-    #[test]
-    fn package_one_day_above_max_age_is_too_old() {
-        let now = Utc::now();
-        let policy = FreshnessPolicy::new(None, Some(365), false, vec![]).unwrap();
-        let published = Some(published_days_ago(now, 366));
-
-        let violations = policy.evaluate(&pkg(), published, now);
-        assert_eq!(violations.len(), 1);
-        assert!(matches!(
-            violations[0].kind,
-            ViolationKind::TooOld(Aged { age_days: 366, .. })
-        ));
-    }
-
-    #[test]
-    fn both_thresholds_active_at_once() {
-        let now = Utc::now();
-        let policy = FreshnessPolicy::new(Some(7), Some(365), false, vec![]).unwrap();
-
-        let too_new = policy.evaluate(&pkg(), Some(published_days_ago(now, 1)), now);
-        assert!(matches!(
-            too_new.as_slice(),
-            [Violation {
-                kind: ViolationKind::TooNew(_),
-                ..
-            }]
-        ));
-
-        let too_old = policy.evaluate(&pkg(), Some(published_days_ago(now, 400)), now);
-        assert!(matches!(
-            too_old.as_slice(),
-            [Violation {
-                kind: ViolationKind::TooOld(_),
-                ..
-            }]
-        ));
-
-        let compliant = policy.evaluate(&pkg(), Some(published_days_ago(now, 100)), now);
-        assert!(compliant.is_empty());
+        for (min, max, age, expected) in cases {
+            let policy = FreshnessPolicy::new(&Policy::new(min, max, false, vec![])).unwrap();
+            let violations = policy.evaluate(&pkg(), Some(now - Duration::days(age)), now);
+            let actual: Vec<_> = violations
+                .iter()
+                .map(|v| match &v.kind {
+                    ViolationKind::TooNew(aged) => ("too new", aged.age_days),
+                    ViolationKind::TooOld(aged) => ("too old", aged.age_days),
+                    ViolationKind::MissingPublishDate { .. } => panic!("unexpected missing date"),
+                })
+                .collect();
+            assert_eq!(actual, expected, "min={min:?} max={max:?} age={age}");
+        }
     }
 
     #[test]
     fn missing_publish_date_is_unknown_by_default() {
         let now = Utc::now();
-        let policy = FreshnessPolicy::new(Some(7), None, false, vec![]).unwrap();
+        let policy = FreshnessPolicy::new(&Policy::new(Some(7), None, false, vec![])).unwrap();
 
         let violations = policy.evaluate(&pkg(), None, now);
         assert_eq!(violations.len(), 1);
@@ -238,34 +183,18 @@ mod tests {
     #[test]
     fn exclude_missing_suppresses_unknown() {
         let now = Utc::now();
-        let policy = FreshnessPolicy::new(Some(7), None, true, vec![]).unwrap();
+        let policy = FreshnessPolicy::new(&Policy::new(Some(7), None, true, vec![])).unwrap();
 
         assert!(policy.evaluate(&pkg(), None, now).is_empty());
     }
 
     #[test]
-    fn exempt_names_are_trimmed() {
-        let policy =
-            FreshnessPolicy::new(Some(7), None, false, vec![" serde ".to_string()]).unwrap();
-
-        assert!(policy.is_exempt("serde"));
-        assert!(!policy.is_exempt(" serde "));
-    }
-
-    #[test]
-    fn effective_exemptions_are_trimmed_deduplicated_and_sorted() {
-        let policy = FreshnessPolicy::new(
-            Some(7),
-            None,
-            false,
-            vec![
-                " zeta ".to_string(),
-                "alpha".to_string(),
-                "zeta".to_string(),
-            ],
-        )
-        .unwrap();
+    fn exemptions_are_trimmed_deduplicated_and_sorted() {
+        let exempt = [" zeta ", "alpha", "zeta"].map(String::from).to_vec();
+        let policy = FreshnessPolicy::new(&Policy::new(Some(7), None, false, exempt)).unwrap();
 
         assert_eq!(policy.report_policy().exempt, ["alpha", "zeta"]);
+        assert!(policy.is_exempt("zeta"));
+        assert!(!policy.is_exempt(" zeta "));
     }
 }

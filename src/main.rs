@@ -11,6 +11,12 @@ mod policy;
 mod report;
 mod suggest;
 
+/// Caps on age arguments that keep chrono date arithmetic in range, and on the
+/// timeout that keeps `Instant` arithmetic in range.
+const MAX_AGE_DAYS: u64 = 100_000;
+const MAX_CACHE_AGE_HOURS: u64 = 10_000_000;
+const MAX_TIMEOUT_SECS: u64 = 86_400;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Verbosity {
     Quiet,
@@ -48,11 +54,11 @@ struct Cli {
     cargo_lock: PathBuf,
 
     /// Minimum age in days - packages newer than this are flagged (supply chain security)
-    #[arg(long)]
+    #[arg(long, value_parser = clap::value_parser!(u64).range(..=MAX_AGE_DAYS))]
     min_age_days: Option<u64>,
 
     /// Maximum age in days - packages older than this are flagged (staleness)
-    #[arg(long)]
+    #[arg(long, value_parser = clap::value_parser!(u64).range(..=MAX_AGE_DAYS))]
     max_age_days: Option<u64>,
 
     /// Comma-separated list of package names to exempt from checks
@@ -64,7 +70,7 @@ struct Cli {
     exclude_missing: bool,
 
     /// HTTP request timeout in seconds
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=MAX_TIMEOUT_SECS))]
     timeout: u64,
 
     /// For "too new" violations, suggest cargo update commands to downgrade to compliant versions
@@ -84,7 +90,7 @@ struct Cli {
     cache_path: Option<PathBuf>,
 
     /// Maximum age in hours for cached all-versions responses
-    #[arg(long, default_value_t = 24)]
+    #[arg(long, default_value_t = 24, value_parser = clap::value_parser!(u64).range(..=MAX_CACHE_AGE_HOURS))]
     cache_max_age_hours: u64,
 
     /// Suppress start and progress messages
@@ -138,68 +144,21 @@ fn failed_report(
     report
 }
 
-fn setup_failure_report(
-    lockfile: PathBuf,
-    policy: report::Policy,
-    freshness_policy: &policy::FreshnessPolicy,
-    packages: &[lockfile::Package],
-    message: impl Into<String>,
-    started: Instant,
-) -> report::RunReport {
-    let message = message.into();
-    eprintln!("error: {message}");
-    let mut report = report::RunReport::completed(
-        lockfile,
-        policy,
-        report::Summary {
-            total_packages: packages.len(),
-            ..Default::default()
-        },
-    );
-    let summary = report
-        .summary
-        .as_mut()
-        .expect("completed reports have coverage");
-    for package in packages {
-        if !package.is_registry {
-            summary.unsupported_packages += 1;
-        } else if freshness_policy.is_exempt(&package.name) {
-            summary.exempt_packages += 1;
-        } else {
-            summary.not_checked_packages += 1;
-        }
-    }
-    report.required_errors.push(report::Diagnostic {
-        category: "input",
-        package: None,
-        version: None,
-        path: None,
-        message,
-        retryable: false,
-    });
-    report.duration = started.elapsed();
-    report
-}
-
 fn record_cache_warnings(
     report: &mut report::RunReport,
     warnings: impl IntoIterator<Item = cache::CacheWarning>,
 ) {
     for warning in warnings {
         report.warnings.push(report::Diagnostic {
-            category: "cache",
-            package: None,
-            version: None,
             path: Some(warning.path),
-            message: warning.message,
-            retryable: false,
+            ..report::Diagnostic::new("cache", warning.message)
         });
     }
 }
 
 fn main() -> ExitCode {
     // Filter out the "oxidate" subcommand name that cargo passes when invoked as `cargo oxidate`
-    let args: Vec<String> = std::env::args()
+    let args: Vec<std::ffi::OsString> = std::env::args_os()
         .enumerate()
         .filter(|(i, arg)| !(*i == 1 && arg == "oxidate"))
         .map(|(_, arg)| arg)
@@ -238,7 +197,7 @@ fn check_packages<T: api::Transport>(
     let started = Instant::now();
     let mut report = report::RunReport::completed(
         supplied_lockfile,
-        freshness_policy.report_policy(),
+        freshness_policy.report_policy().clone(),
         report::Summary {
             total_packages: packages.len(),
             ..Default::default()
@@ -286,12 +245,10 @@ fn check_packages<T: api::Transport>(
                 );
                 summary.failed_packages += 1;
                 report.required_errors.push(report::Diagnostic {
-                    category: "lookup",
                     package: Some(pkg.name.clone()),
                     version: Some(pkg.version.clone()),
-                    path: None,
                     retryable: matches!(error, api::FetchError::Retryable(_)),
-                    message: error.to_string(),
+                    ..report::Diagnostic::new("lookup", error.to_string())
                 });
             }
         }
@@ -308,23 +265,20 @@ fn run(cli: Cli, verbosity: Verbosity) -> report::RunReport {
         cli.min_age_days,
         cli.max_age_days,
         cli.exclude_missing,
-        cli.exempt.clone(),
-    );
-    let freshness_policy = policy::FreshnessPolicy::new(
-        cli.min_age_days,
-        cli.max_age_days,
-        cli.exclude_missing,
         cli.exempt,
     );
-    let freshness_policy = match freshness_policy {
+    let freshness_policy = match policy::FreshnessPolicy::new(&report_policy) {
         Ok(policy) => policy,
         Err(error) => {
             return failed_report(supplied_lockfile, report_policy, error.to_string(), started);
         }
     };
 
-    let suggest_min_age = if cli.suggest_fix {
-        cli.min_age_days
+    let suggest_age_bounds = if cli.suggest_fix {
+        cli.min_age_days.map(|min_days| suggest::AgeBounds {
+            min_days,
+            max_days: cli.max_age_days,
+        })
     } else {
         None
     };
@@ -341,7 +295,6 @@ fn run(cli: Cli, verbosity: Verbosity) -> report::RunReport {
         }
     };
 
-    // Parse lockfile
     let loaded_lockfile = match lockfile::load(&cli.cargo_lock, &working_dir) {
         Ok(lockfile) => lockfile,
         Err(error) => {
@@ -355,31 +308,18 @@ fn run(cli: Cli, verbosity: Verbosity) -> report::RunReport {
     };
     let packages = loaded_lockfile.packages;
 
-    // Build API client
-    let mut client = match api::CratesIoClient::new(
+    let mut client = api::CratesIoClient::new(
         cli.timeout,
         cli.cache_path.as_deref(),
         cli.cache_max_age_hours,
-    ) {
-        Ok(client) => client,
-        Err(error) => {
-            return setup_failure_report(
-                supplied_lockfile,
-                report_policy,
-                &freshness_policy,
-                &packages,
-                error.to_string(),
-                started,
-            );
-        }
-    };
+    );
     let initial_cache_warning = client.take_cache_warning();
     if let Some(warning) = &initial_cache_warning {
         eprintln!("warning: {}: {}", warning.path.display(), warning.message);
     }
 
     if verbosity.shows_start() {
-        print_start(&loaded_lockfile.path, &freshness_policy.report_policy());
+        print_start(&loaded_lockfile.path, freshness_policy.report_policy());
     }
 
     let now = chrono::Utc::now();
@@ -398,12 +338,11 @@ fn run(cli: Cli, verbosity: Verbosity) -> report::RunReport {
     );
     record_cache_warnings(&mut report, initial_cache_warning);
 
-    // Generate suggestions if requested
     let has_too_new = report
         .violations
         .iter()
         .any(|violation| matches!(violation.kind, report::ViolationKind::TooNew(_)));
-    if let Some(min_age) = suggest_min_age
+    if let Some(age_bounds) = suggest_age_bounds
         && has_too_new
     {
         let lockfile_dir = loaded_lockfile.path.parent().unwrap_or(&working_dir);
@@ -412,14 +351,9 @@ fn run(cli: Cli, verbosity: Verbosity) -> report::RunReport {
             manifest::load_direct_requirements(lockfile_dir);
         for warning in manifest_warnings {
             eprintln!("warning: {warning}");
-            report.warnings.push(report::Diagnostic {
-                category: "manifest",
-                package: None,
-                version: None,
-                path: None,
-                message: warning,
-                retryable: false,
-            });
+            report
+                .warnings
+                .push(report::Diagnostic::new("manifest", warning));
         }
 
         let mut print_suggestion_progress = |progress: suggest::SuggestionProgress| {
@@ -436,12 +370,11 @@ fn run(cli: Cli, verbosity: Verbosity) -> report::RunReport {
             &packages,
             &direct_requirements,
             lockfile_dir,
-            min_age,
+            age_bounds,
             cli.include_prerelease,
             now,
             &mut print_suggestion_progress,
-        )
-        .unwrap_or_default();
+        );
         for outcome in &outcomes {
             if let suggest::Outcome::Unavailable {
                 package,
@@ -454,12 +387,9 @@ fn run(cli: Cli, verbosity: Verbosity) -> report::RunReport {
                 );
                 eprintln!("warning: {message}");
                 report.warnings.push(report::Diagnostic {
-                    category: "suggestion",
                     package: Some(package.clone()),
                     version: Some(locked_version.clone()),
-                    path: None,
-                    message,
-                    retryable: false,
+                    ..report::Diagnostic::new("suggestion", message)
                 });
             }
         }

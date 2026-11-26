@@ -72,15 +72,8 @@ pub fn sparse_index_path(name: &str) -> String {
     match lower.len() {
         1 => format!("1/{lower}"),
         2 => format!("2/{lower}"),
-        3 => {
-            let c0 = &lower[0..1];
-            format!("3/{c0}/{lower}")
-        }
-        _ => {
-            let c01 = &lower[0..2];
-            let c23 = &lower[2..4];
-            format!("{c01}/{c23}/{lower}")
-        }
+        3 => format!("3/{}/{lower}", &lower[0..1]),
+        _ => format!("{}/{}/{lower}", &lower[0..2], &lower[2..4]),
     }
 }
 
@@ -96,8 +89,7 @@ pub enum FetchError {
 impl std::fmt::Display for FetchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FetchError::Retryable(msg) => write!(f, "{msg}"),
-            FetchError::Permanent(msg) => write!(f, "{msg}"),
+            Self::Retryable(msg) | Self::Permanent(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -140,7 +132,11 @@ pub struct UreqTransport {
 impl UreqTransport {
     pub fn new(timeout_secs: u64) -> Self {
         let agent = ureq::Agent::config_builder()
-            .user_agent("cargo-oxidate/0.1 (https://github.com/timweri/cargo-oxidate)")
+            .user_agent(concat!(
+                "cargo-oxidate/",
+                env!("CARGO_PKG_VERSION"),
+                " (https://github.com/timweri/cargo-oxidate)"
+            ))
             .timeout_global(Some(Duration::from_secs(timeout_secs)))
             .http_status_as_error(false)
             .build()
@@ -189,8 +185,7 @@ impl Default for RetryPolicy {
 pub struct CratesIoClient<T: Transport = UreqTransport> {
     transport: T,
     cache: ResponseCache,
-    cache_warning: Option<CacheWarning>,
-    cache_max_age_hours: u64,
+    cache_max_age: ChronoDuration,
     retry_policy: RetryPolicy,
     /// Per-run memo of successfully fetched index records, keyed by crate
     /// name. Confined to this process; never persisted.
@@ -198,17 +193,13 @@ pub struct CratesIoClient<T: Transport = UreqTransport> {
 }
 
 impl CratesIoClient<UreqTransport> {
-    pub fn new(
-        timeout_secs: u64,
-        cache_path: Option<&Path>,
-        cache_max_age_hours: u64,
-    ) -> Result<Self> {
-        Ok(Self::with_transport(
+    pub fn new(timeout_secs: u64, cache_path: Option<&Path>, cache_max_age_hours: u64) -> Self {
+        Self::with_transport(
             UreqTransport::new(timeout_secs),
             cache_path,
             cache_max_age_hours,
             RetryPolicy::default(),
-        ))
+        )
     }
 }
 
@@ -219,21 +210,17 @@ impl<T: Transport> CratesIoClient<T> {
         cache_max_age_hours: u64,
         retry_policy: RetryPolicy,
     ) -> Self {
-        let mut cache = ResponseCache::load(cache_path);
-        let cache_warning = cache.take_load_warning();
-
         Self {
             transport,
-            cache,
-            cache_warning,
-            cache_max_age_hours,
+            cache: ResponseCache::load(cache_path),
+            cache_max_age: ChronoDuration::hours(cache_max_age_hours as i64),
             retry_policy,
             fetched_index_records: HashMap::new(),
         }
     }
 
     pub fn take_cache_warning(&mut self) -> Option<CacheWarning> {
-        self.cache_warning.take()
+        self.cache.take_load_warning()
     }
 
     /// Saves the cache and returns any save error as a warning.
@@ -302,25 +289,15 @@ impl<T: Transport> CratesIoClient<T> {
         &mut self,
         mut op: impl FnMut(&mut Self) -> Result<R, FetchError>,
     ) -> Result<R, FetchError> {
-        let retry_count = self.retry_policy.retry_count.get();
-        let mut last_error = None;
-
-        for attempt in 0..retry_count {
+        for _ in 1..self.retry_policy.retry_count.get() {
             match op(self) {
                 Ok(result) => return Ok(result),
-                Err(FetchError::Permanent(msg)) => return Err(FetchError::Permanent(msg)),
-                Err(e) => {
-                    if attempt + 1 < retry_count {
-                        std::thread::sleep(self.retry_policy.retry_delay);
-                    }
-                    last_error = Some(e);
-                }
+                Err(error @ FetchError::Permanent(_)) => return Err(error),
+                Err(FetchError::Retryable(_)) => std::thread::sleep(self.retry_policy.retry_delay),
             }
         }
-
-        // `retry_count` is a `NonZeroU32`, so the loop above ran at least
-        // once and `last_error` is always populated here.
-        Err(last_error.unwrap())
+        // The final attempt runs outside the loop so its error is returned as is.
+        op(self)
     }
 
     fn fetch_publish_date_uncached(
@@ -362,9 +339,7 @@ impl<T: Transport> CratesIoClient<T> {
     }
 
     pub fn fetch_all_versions(&mut self, name: &str) -> Result<Vec<CrateVersionInfo>, FetchError> {
-        let max_age = ChronoDuration::hours(self.cache_max_age_hours as i64);
-
-        if let Some(versions) = self.cache.get_all_versions(name, max_age) {
+        if let Some(versions) = self.cache.get_all_versions(name, self.cache_max_age) {
             return Ok(versions);
         }
 
@@ -424,9 +399,7 @@ impl<T: Transport> CratesIoClient<T> {
             return Ok(records.clone());
         }
 
-        let max_age = ChronoDuration::hours(self.cache_max_age_hours as i64);
-
-        if let Some(records) = self.cache.get_index_records(name, max_age)
+        if let Some(records) = self.cache.get_index_records(name, self.cache_max_age)
             && records.iter().any(|r| r.vers == needed_version)
         {
             return Ok(records);
@@ -467,10 +440,6 @@ pub(crate) mod test_support {
     }
 
     impl FakeTransport {
-        pub(crate) fn new() -> Self {
-            Self::default()
-        }
-
         pub(crate) fn push(&self, url: &str, response: ScriptedResponse) {
             self.responses
                 .borrow_mut()
@@ -511,37 +480,45 @@ pub(crate) mod test_support {
     pub(crate) fn index_url(name: &str) -> String {
         format!("https://index.crates.io/{}", super::sparse_index_path(name))
     }
+
+    pub(crate) fn version_url(name: &str, version: &str) -> String {
+        format!("https://crates.io/api/v1/crates/{name}/{version}")
+    }
+
+    pub(crate) fn version_body(created_at: impl std::fmt::Display) -> String {
+        format!(r#"{{"version":{{"created_at":"{created_at}"}}}}"#)
+    }
+
+    /// Retry and pacing delays zeroed out, so the test suite doesn't sleep.
+    pub(crate) fn instant_policy(retry_count: u32) -> super::RetryPolicy {
+        super::RetryPolicy {
+            retry_count: super::NonZeroU32::new(retry_count).unwrap(),
+            retry_delay: super::Duration::ZERO,
+            pacing_delay: super::Duration::ZERO,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{FakeTransport, ScriptedResponse, index_url, versions_url};
+    use super::test_support::{
+        FakeTransport, ScriptedResponse, index_url, instant_policy, version_body, version_url,
+        versions_url,
+    };
     use super::*;
-    use std::num::NonZeroU32;
     use std::time::Instant;
     use tempfile::tempdir;
 
-    fn version_url(name: &str, version: &str) -> String {
-        format!("https://crates.io/api/v1/crates/{name}/{version}")
+    fn record(vers: &str) -> IndexRecord {
+        IndexRecord {
+            vers: vers.to_string(),
+            yanked: false,
+            deps: vec![],
+        }
     }
 
-    fn version_body(created_at: &str) -> String {
-        format!(r#"{{"version":{{"created_at":"{created_at}"}}}}"#)
-    }
-
-    /// Builds a client with retry/pacing delays zeroed out, so the test
-    /// suite doesn't sleep.
     fn fast_client(transport: FakeTransport) -> CratesIoClient<FakeTransport> {
-        CratesIoClient::with_transport(
-            transport,
-            None,
-            24,
-            RetryPolicy {
-                retry_count: NonZeroU32::new(3).unwrap(),
-                retry_delay: Duration::from_millis(0),
-                pacing_delay: Duration::from_millis(0),
-            },
-        )
+        CratesIoClient::with_transport(transport, None, 24, instant_policy(3))
     }
 
     #[test]
@@ -551,21 +528,13 @@ mod tests {
         std::fs::write(&blocking_parent, "file").unwrap();
         let cache_path = blocking_parent.join("responses.json");
         let url = version_url("serde", "1.0.0");
-        let transport = FakeTransport::new();
+        let transport = FakeTransport::default();
         transport.push(
             &url,
             ScriptedResponse::Http(200, version_body("2020-01-01T00:00:00Z")),
         );
-        let mut client = CratesIoClient::with_transport(
-            transport,
-            Some(&cache_path),
-            24,
-            RetryPolicy {
-                retry_count: NonZeroU32::new(3).unwrap(),
-                retry_delay: Duration::ZERO,
-                pacing_delay: Duration::ZERO,
-            },
-        );
+        let mut client =
+            CratesIoClient::with_transport(transport, Some(&cache_path), 24, instant_policy(3));
 
         assert!(
             client
@@ -585,51 +554,49 @@ mod tests {
     }
 
     #[test]
-    fn retries_429_then_succeeds() {
-        let url = version_url("serde", "1.0.0");
-        let transport = FakeTransport::new();
-        transport.push(&url, ScriptedResponse::Http(429, String::new()));
-        transport.push(
-            &url,
-            ScriptedResponse::Http(200, version_body("2020-01-01T00:00:00Z")),
-        );
+    fn transient_failure_is_retried_then_succeeds() {
+        let failures = [
+            ScriptedResponse::Http(429, String::new()),
+            ScriptedResponse::Http(503, String::new()),
+            ScriptedResponse::Error,
+        ];
+        for failure in failures {
+            let url = version_url("serde", "1.0.0");
+            let transport = FakeTransport::default();
+            transport.push(&url, failure);
+            transport.push(
+                &url,
+                ScriptedResponse::Http(200, version_body("2020-01-01T00:00:00Z")),
+            );
 
-        let mut client = fast_client(transport);
-        let result = client.fetch_publish_date("serde", "1.0.0").unwrap();
-        assert!(result.is_some());
+            let mut client = fast_client(transport);
+            let result = client.fetch_publish_date("serde", "1.0.0").unwrap();
+            assert!(result.is_some());
+            assert_eq!(client.transport.call_count(), 2);
+        }
     }
 
     #[test]
-    fn retries_5xx_then_succeeds() {
-        let url = version_url("serde", "1.0.0");
-        let transport = FakeTransport::new();
-        transport.push(&url, ScriptedResponse::Http(503, String::new()));
-        transport.push(
-            &url,
-            ScriptedResponse::Http(200, version_body("2020-01-01T00:00:00Z")),
-        );
+    fn permanent_failure_is_not_retried() {
+        let responses = [
+            ScriptedResponse::Http(400, String::new()),
+            ScriptedResponse::Http(200, "not json".to_string()),
+        ];
+        for response in responses {
+            let transport = FakeTransport::default();
+            transport.push(&version_url("serde", "1.0.0"), response);
 
-        let mut client = fast_client(transport);
-        let result = client.fetch_publish_date("serde", "1.0.0").unwrap();
-        assert!(result.is_some());
-    }
-
-    #[test]
-    fn permanent_4xx_fails_without_retry() {
-        let url = version_url("serde", "1.0.0");
-        let transport = FakeTransport::new();
-        transport.push(&url, ScriptedResponse::Http(400, String::new()));
-
-        let mut client = fast_client(transport);
-        let result = client.fetch_publish_date("serde", "1.0.0");
-        assert!(matches!(result, Err(FetchError::Permanent(_))));
-        assert_eq!(client.transport.call_count(), 1);
+            let mut client = fast_client(transport);
+            let result = client.fetch_publish_date("serde", "1.0.0");
+            assert!(matches!(result, Err(FetchError::Permanent(_))));
+            assert_eq!(client.transport.call_count(), 1);
+        }
     }
 
     #[test]
     fn not_found_yields_no_date_not_an_error() {
         let url = version_url("serde", "1.0.0");
-        let transport = FakeTransport::new();
+        let transport = FakeTransport::default();
         transport.push(&url, ScriptedResponse::Http(404, String::new()));
 
         let mut client = fast_client(transport);
@@ -638,113 +605,47 @@ mod tests {
     }
 
     #[test]
-    fn malformed_body_is_permanent() {
-        let url = version_url("serde", "1.0.0");
-        let transport = FakeTransport::new();
-        transport.push(&url, ScriptedResponse::Http(200, "not json".to_string()));
+    fn gives_up_after_retry_count_attempts() {
+        for retry_count in [1, 3] {
+            let url = version_url("serde", "1.0.0");
+            let transport = FakeTransport::default();
+            for _ in 0..retry_count {
+                transport.push(&url, ScriptedResponse::Http(503, String::new()));
+            }
 
-        let mut client = fast_client(transport);
-        let result = client.fetch_publish_date("serde", "1.0.0");
-        assert!(matches!(result, Err(FetchError::Permanent(_))));
-        assert_eq!(client.transport.call_count(), 1);
-    }
-
-    #[test]
-    fn gives_up_after_exactly_three_attempts() {
-        let url = version_url("serde", "1.0.0");
-        let transport = FakeTransport::new();
-        for _ in 0..3 {
-            transport.push(&url, ScriptedResponse::Http(503, String::new()));
+            let mut client =
+                CratesIoClient::with_transport(transport, None, 24, instant_policy(retry_count));
+            let result = client.fetch_publish_date("serde", "1.0.0");
+            assert!(matches!(result, Err(FetchError::Retryable(_))));
+            assert_eq!(client.transport.call_count(), retry_count as usize);
         }
-
-        let mut client = fast_client(transport);
-        let result = client.fetch_publish_date("serde", "1.0.0");
-        assert!(matches!(result, Err(FetchError::Retryable(_))));
-        assert_eq!(client.transport.call_count(), 3);
     }
 
     #[test]
-    fn gives_up_after_a_single_attempt_without_panicking() {
-        let url = version_url("serde", "1.0.0");
-        let transport = FakeTransport::new();
-        transport.push(&url, ScriptedResponse::Http(503, String::new()));
-
+    fn cache_hit_issues_no_request_and_skips_pacing_delay() {
         let mut client = CratesIoClient::with_transport(
-            transport,
+            FakeTransport::default(),
             None,
             24,
             RetryPolicy {
-                retry_count: NonZeroU32::new(1).unwrap(),
-                retry_delay: Duration::from_millis(0),
-                pacing_delay: Duration::from_millis(0),
+                pacing_delay: Duration::from_millis(300),
+                ..instant_policy(3)
             },
         );
-        let result = client.fetch_publish_date("serde", "1.0.0");
-        assert!(matches!(result, Err(FetchError::Retryable(_))));
-        assert_eq!(client.transport.call_count(), 1);
-    }
+        client
+            .cache
+            .set_publish_date("serde", "1.0.0", "2020-01-01T00:00:00Z".parse().unwrap());
 
-    #[test]
-    fn transport_error_is_retried() {
-        let url = version_url("serde", "1.0.0");
-        let transport = FakeTransport::new();
-        transport.push(&url, ScriptedResponse::Error);
-        transport.push(
-            &url,
-            ScriptedResponse::Http(200, version_body("2020-01-01T00:00:00Z")),
-        );
-
-        let mut client = fast_client(transport);
-        let result = client.fetch_publish_date("serde", "1.0.0").unwrap();
-        assert!(result.is_some());
-    }
-
-    #[test]
-    fn cache_hit_issues_no_request() {
-        let transport = FakeTransport::new();
-        let mut client = fast_client(transport);
-        client.cache.set_publish_date(
-            "serde",
-            "1.0.0",
-            DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
-        );
-
+        let started = Instant::now();
         let result = client.fetch_publish_date("serde", "1.0.0").unwrap();
         assert!(result.is_some());
         assert_eq!(client.transport.call_count(), 0);
-    }
-
-    #[test]
-    fn cache_hit_skips_pacing_delay() {
-        let transport = FakeTransport::new();
-        let mut client = CratesIoClient::with_transport(
-            transport,
-            None,
-            24,
-            RetryPolicy {
-                retry_count: NonZeroU32::new(3).unwrap(),
-                retry_delay: Duration::from_millis(0),
-                pacing_delay: Duration::from_millis(300),
-            },
-        );
-        client.cache.set_publish_date(
-            "serde",
-            "1.0.0",
-            DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
-        );
-
-        let started = Instant::now();
-        client.fetch_publish_date("serde", "1.0.0").unwrap();
         assert!(started.elapsed() < Duration::from_millis(300));
     }
 
     #[test]
     fn all_versions_cache_hit_issues_no_request() {
-        let transport = FakeTransport::new();
+        let transport = FakeTransport::default();
         let mut client = fast_client(transport);
         client.cache.set_all_versions("serde", vec![]);
 
@@ -756,7 +657,7 @@ mod tests {
     #[test]
     fn fetch_all_versions_retries_and_parses() {
         let url = versions_url("serde");
-        let transport = FakeTransport::new();
+        let transport = FakeTransport::default();
         transport.push(&url, ScriptedResponse::Http(500, String::new()));
         transport.push(
             &url,
@@ -784,7 +685,7 @@ mod tests {
     #[test]
     fn fetch_index_record_parses_multiple_lines_with_defaults() {
         let url = index_url("serde");
-        let transport = FakeTransport::new();
+        let transport = FakeTransport::default();
         transport.push(
             &url,
             ScriptedResponse::Http(
@@ -817,60 +718,22 @@ mod tests {
     }
 
     #[test]
-    fn fetch_index_record_missing_crate_yields_empty_result() {
-        let url = index_url("does-not-exist");
-        let transport = FakeTransport::new();
-        transport.push(&url, ScriptedResponse::Http(404, String::new()));
-
-        let mut client = fast_client(transport);
-        let records = client
-            .fetch_index_record("does-not-exist", "1.0.0")
-            .unwrap();
-        assert!(records.is_empty());
-    }
-
-    #[test]
     fn empty_sparse_index_result_is_cached_within_one_client() {
-        let url = index_url("does-not-exist");
-        let transport = FakeTransport::new();
-        transport.push(&url, ScriptedResponse::Http(404, String::new()));
+        let responses = [
+            ScriptedResponse::Http(404, String::new()),
+            ScriptedResponse::Http(200, " \n\t\n ".to_string()),
+        ];
+        for response in responses {
+            let transport = FakeTransport::default();
+            transport.push(&index_url("empty-index"), response);
 
-        let mut client = fast_client(transport);
-        assert!(
-            client
-                .fetch_index_record("does-not-exist", "1.0.0")
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            client
-                .fetch_index_record("does-not-exist", "2.0.0")
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(client.transport.call_count(), 1);
-    }
-
-    #[test]
-    fn blank_sparse_index_response_is_cached_within_one_client() {
-        let url = index_url("empty-index");
-        let transport = FakeTransport::new();
-        transport.push(&url, ScriptedResponse::Http(200, " \n\t\n ".to_string()));
-
-        let mut client = fast_client(transport);
-        assert!(
-            client
-                .fetch_index_record("empty-index", "1.0.0")
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            client
-                .fetch_index_record("empty-index", "2.0.0")
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(client.transport.call_count(), 1);
+            let mut client = fast_client(transport);
+            for version in ["1.0.0", "2.0.0"] {
+                let records = client.fetch_index_record("empty-index", version).unwrap();
+                assert!(records.is_empty());
+            }
+            assert_eq!(client.transport.call_count(), 1);
+        }
     }
 
     #[test]
@@ -881,18 +744,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let cache_path = dir.path().join("cache.json");
         let url = index_url("does-not-exist");
-        let first_transport = FakeTransport::new();
+        let first_transport = FakeTransport::default();
         first_transport.push(&url, ScriptedResponse::Http(404, String::new()));
 
         let mut first_client = CratesIoClient::with_transport(
             first_transport,
             Some(&cache_path),
             24,
-            RetryPolicy {
-                retry_count: NonZeroU32::new(1).unwrap(),
-                retry_delay: Duration::ZERO,
-                pacing_delay: Duration::ZERO,
-            },
+            instant_policy(1),
         );
         assert!(
             first_client
@@ -902,17 +761,13 @@ mod tests {
         );
         first_client.finish();
 
-        let second_transport = FakeTransport::new();
+        let second_transport = FakeTransport::default();
         second_transport.push(&url, ScriptedResponse::Http(404, String::new()));
         let mut second_client = CratesIoClient::with_transport(
             second_transport,
             Some(&cache_path),
             24,
-            RetryPolicy {
-                retry_count: NonZeroU32::new(1).unwrap(),
-                retry_delay: Duration::ZERO,
-                pacing_delay: Duration::ZERO,
-            },
+            instant_policy(1),
         );
         assert!(
             second_client
@@ -926,20 +781,11 @@ mod tests {
     #[test]
     fn sparse_index_transport_failure_is_not_cached() {
         let url = index_url("retryable");
-        let transport = FakeTransport::new();
+        let transport = FakeTransport::default();
         transport.push(&url, ScriptedResponse::Error);
         transport.push(&url, ScriptedResponse::Http(404, String::new()));
 
-        let mut client = CratesIoClient::with_transport(
-            transport,
-            None,
-            24,
-            RetryPolicy {
-                retry_count: NonZeroU32::new(1).unwrap(),
-                retry_delay: Duration::ZERO,
-                pacing_delay: Duration::ZERO,
-            },
-        );
+        let mut client = CratesIoClient::with_transport(transport, None, 24, instant_policy(1));
         assert!(matches!(
             client.fetch_index_record("retryable", "1.0.0"),
             Err(FetchError::Retryable(_))
@@ -955,16 +801,11 @@ mod tests {
 
     #[test]
     fn fetch_index_record_cache_hit_issues_no_request() {
-        let transport = FakeTransport::new();
+        let transport = FakeTransport::default();
         let mut client = fast_client(transport);
-        client.cache.set_index_records(
-            "serde",
-            vec![IndexRecord {
-                vers: "1.0.0".to_string(),
-                yanked: false,
-                deps: vec![],
-            }],
-        );
+        client
+            .cache
+            .set_index_records("serde", vec![record("1.0.0")]);
 
         let records = client.fetch_index_record("serde", "1.0.0").unwrap();
         assert_eq!(records.len(), 1);
@@ -973,50 +814,20 @@ mod tests {
     }
 
     #[test]
-    fn fetch_index_record_refetches_when_cached_records_miss_needed_version() {
-        let url = index_url("serde");
-        let transport = FakeTransport::new();
-        transport.push(
-            &url,
-            ScriptedResponse::Http(200, r#"{"vers":"1.0.1","yanked":false}"#.to_string()),
-        );
-
-        let mut client = fast_client(transport);
-        client.cache.set_index_records(
-            "serde",
-            vec![IndexRecord {
-                vers: "1.0.0".to_string(),
-                yanked: false,
-                deps: vec![],
-            }],
-        );
-
-        let records = client.fetch_index_record("serde", "1.0.1").unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].vers, "1.0.1");
-        assert_eq!(client.transport.call_count(), 1);
-    }
-
-    #[test]
     fn fetch_index_record_missing_version_is_refetched_once_per_run() {
         // A non-empty cached entry that lacks the needed version is fetched
         // once per run across repeated lookups, not once per lookup.
         let url = index_url("serde");
-        let transport = FakeTransport::new();
+        let transport = FakeTransport::default();
         transport.push(
             &url,
             ScriptedResponse::Http(200, r#"{"vers":"1.0.1","yanked":false}"#.to_string()),
         );
 
         let mut client = fast_client(transport);
-        client.cache.set_index_records(
-            "serde",
-            vec![IndexRecord {
-                vers: "1.0.0".to_string(),
-                yanked: false,
-                deps: vec![],
-            }],
-        );
+        client
+            .cache
+            .set_index_records("serde", vec![record("1.0.0")]);
 
         for _ in 0..2 {
             let records = client.fetch_index_record("serde", "1.0.1").unwrap();
@@ -1033,22 +844,13 @@ mod tests {
         // memo were a name set that re-reads the cache, since a
         // just-written cache entry would then be judged expired.
         let url = index_url("serde");
-        let transport = FakeTransport::new();
+        let transport = FakeTransport::default();
         transport.push(
             &url,
             ScriptedResponse::Http(200, r#"{"vers":"1.0.0","yanked":false}"#.to_string()),
         );
 
-        let mut client = CratesIoClient::with_transport(
-            transport,
-            None,
-            0,
-            RetryPolicy {
-                retry_count: NonZeroU32::new(3).unwrap(),
-                retry_delay: Duration::from_millis(0),
-                pacing_delay: Duration::from_millis(0),
-            },
-        );
+        let mut client = CratesIoClient::with_transport(transport, None, 0, instant_policy(3));
 
         for _ in 0..2 {
             let records = client.fetch_index_record("serde", "1.0.0").unwrap();

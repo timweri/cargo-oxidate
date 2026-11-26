@@ -35,13 +35,15 @@ cargo-oxidate Cargo.lock --min-age-days 14 --max-age-days 730
 | `--verbose` | Show each package as it is checked |
 | `--format text\|json` | Render the final result as text (default) or JSON |
 
-At least one of `--min-age-days` or `--max-age-days` must be specified.
+At least one of `--min-age-days` or `--max-age-days` must be specified. `--min-age-days` must not
+exceed `--max-age-days`. Age thresholds are capped at 100000 days, `--cache-max-age-hours` at
+10000000, and `--timeout` must be 1–86400 seconds.
 
 ## `--suggest-fix`
 
 `--suggest-fix` prints a `cargo update --precise` command for the newest eligible downgrade of
 each package that is too new. It checks dependency requirements it can verify from `Cargo.lock`
-and workspace manifests.
+and workspace manifests. Suggested versions also satisfy `--max-age-days` when it is set.
 
 Registry requirements come from the crates.io index. An optional registry declaration that cannot
 be confirmed active is shown as unverified. Target-specific registry declarations are enforced.

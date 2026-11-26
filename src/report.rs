@@ -1,3 +1,4 @@
+use crate::suggest::Outcome;
 use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -25,6 +26,7 @@ pub struct Violation {
 }
 
 /// The normalized age policy used for a run.
+#[derive(Clone)]
 pub struct Policy {
     pub min_age_days: Option<u64>,
     pub max_age_days: Option<u64>,
@@ -63,6 +65,8 @@ pub struct Summary {
     pub unsupported_packages: usize,
     pub excluded_missing_packages: usize,
     pub failed_packages: usize,
+    /// Kept for JSON schema v1 compatibility; currently always 0 because no
+    /// code path skips eligible packages.
     pub not_checked_packages: usize,
 }
 
@@ -73,6 +77,20 @@ pub struct Diagnostic {
     pub path: Option<PathBuf>,
     pub message: String,
     pub retryable: bool,
+}
+
+impl Diagnostic {
+    /// A non-retryable diagnostic with no package, version, or path.
+    pub fn new(category: &'static str, message: String) -> Self {
+        Self {
+            category,
+            package: None,
+            version: None,
+            path: None,
+            message,
+            retryable: false,
+        }
+    }
 }
 
 /// The complete outcome of one invocation after argument parsing.
@@ -86,7 +104,7 @@ pub struct RunReport {
     pub warnings: Vec<Diagnostic>,
     /// None when suggestions were not requested. Otherwise, this contains
     /// every investigation outcome and may be empty.
-    pub suggestions: Option<Vec<crate::suggest::Outcome>>,
+    pub suggestions: Option<Vec<Outcome>>,
     pub duration: Duration,
 }
 
@@ -110,14 +128,7 @@ impl RunReport {
             policy,
             summary: None,
             violations: Vec::new(),
-            required_errors: vec![Diagnostic {
-                category: "input",
-                package: None,
-                version: None,
-                path: None,
-                message: message.into(),
-                retryable: false,
-            }],
+            required_errors: vec![Diagnostic::new("input", message.into())],
             warnings: Vec::new(),
             suggestions: None,
             duration: Duration::ZERO,
@@ -242,109 +253,95 @@ pub fn print_report(report: &RunReport) {
     }
 }
 
-pub fn print_suggestions(outcomes: &[crate::suggest::Outcome]) {
-    if outcomes.is_empty() {
-        return;
-    }
+fn print_suggestions(outcomes: &[Outcome]) {
+    let suggested: Vec<String> = outcomes.iter().filter_map(suggestion_line).collect();
+    let others: Vec<String> = outcomes.iter().filter_map(other_outcome_line).collect();
 
-    let suggestions: Vec<_> = outcomes
-        .iter()
-        .filter_map(|outcome| match outcome {
-            crate::suggest::Outcome::Suggest {
-                package_spec,
-                locked_version,
-                suggested_version,
-                suggested_age_days,
-                unverified_dependents,
-                ..
-            } => Some((
-                package_spec,
-                locked_version,
-                suggested_version,
-                suggested_age_days,
-                unverified_dependents,
-            )),
-            _ => None,
-        })
-        .collect();
-
-    if !suggestions.is_empty() {
+    if !suggested.is_empty() {
         println!(
             "\nSuggested downgrades. Apply them from top to bottom, then run this check again:"
         );
-        for (
-            package_spec,
-            locked_version,
-            suggested_version,
-            suggested_age_days,
-            unverified_dependents,
-        ) in &suggestions
-        {
-            let annotation = if unverified_dependents.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    " (requirement of {} unverified)",
-                    unverified_dependents.join(", ")
-                )
-            };
-            println!(
-                "  cargo update -p {package_spec}@{locked_version} --precise {suggested_version} # {suggested_age_days} days old{annotation}"
-            );
-        }
+    }
+    for line in &suggested {
+        println!("{line}");
     }
 
-    let blocked: Vec<_> = outcomes
-        .iter()
-        .filter(|outcome| !matches!(outcome, crate::suggest::Outcome::Suggest { .. }))
-        .collect();
-    if !blocked.is_empty() {
+    if !others.is_empty() {
         println!("\nOther downgrade outcomes:");
-        for outcome in blocked {
-            match outcome {
-                crate::suggest::Outcome::Blocked {
-                    package,
-                    locked_version,
-                    newest_compliant,
-                    blocker,
-                } => {
-                    let source = match &blocker.version {
-                        Some(version) => format!("{} {version}", blocker.name),
-                        None => blocker.name.clone(),
-                    };
-                    let also_suggested = if blocker.also_suggested {
-                        format!(
-                            " ({source} also has a suggested downgrade above; applying it may unblock this, so re-run to check)"
-                        )
-                    } else {
-                        String::new()
-                    };
-                    println!(
-                        "  Downgrade blocked by dependency requirements for {package}@{locked_version}: newest eligible version is {newest_compliant}, but {source} requires {}{also_suggested}",
-                        blocker.req
-                    );
-                }
-                crate::suggest::Outcome::NoCompliantVersion {
-                    package,
-                    locked_version,
-                } => println!(
-                    "  No eligible downgrade found for {package}@{locked_version} within its compatible version range"
-                ),
-                crate::suggest::Outcome::Unavailable {
-                    package,
-                    locked_version,
-                    reason,
-                } => println!(
-                    "  Could not determine a downgrade for {package}@{locked_version}: {reason}"
-                ),
-                crate::suggest::Outcome::Suggest { .. } => unreachable!(),
-            }
-        }
+    }
+    for line in &others {
+        println!("{line}");
     }
 
-    if !suggestions.is_empty() {
+    if !suggested.is_empty() {
         println!(
             "\nThese suggestions check the version requirements in Cargo.lock and your manifests. They do not run Cargo's resolver, so Cargo may reject them. The check skipped requirements marked \"unverified\". Build or test after applying each suggestion."
         );
+    }
+}
+
+fn suggestion_line(outcome: &Outcome) -> Option<String> {
+    let Outcome::Suggest {
+        package_spec,
+        locked_version,
+        suggested_version,
+        suggested_age_days,
+        unverified_dependents,
+        ..
+    } = outcome
+    else {
+        return None;
+    };
+    let annotation = if unverified_dependents.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " (requirement of {} unverified)",
+            unverified_dependents.join(", ")
+        )
+    };
+    Some(format!(
+        "  cargo update -p {package_spec}@{locked_version} --precise {suggested_version} # {suggested_age_days} days old{annotation}"
+    ))
+}
+
+fn other_outcome_line(outcome: &Outcome) -> Option<String> {
+    match outcome {
+        Outcome::Suggest { .. } => None,
+        Outcome::Blocked {
+            package,
+            locked_version,
+            newest_compliant,
+            blocker,
+        } => {
+            let source = match &blocker.version {
+                Some(version) => format!("{} {version}", blocker.name),
+                None => blocker.name.clone(),
+            };
+            let also_suggested = if blocker.also_suggested {
+                format!(
+                    " ({source} also has a suggested downgrade above; applying it may unblock this, so re-run to check)"
+                )
+            } else {
+                String::new()
+            };
+            Some(format!(
+                "  Downgrade blocked by dependency requirements for {package}@{locked_version}: newest eligible version is {newest_compliant}, but {source} requires {}{also_suggested}",
+                blocker.req
+            ))
+        }
+        Outcome::NoCompliantVersion {
+            package,
+            locked_version,
+        } => Some(format!(
+            "  No eligible downgrade found for {package}@{locked_version} within its compatible version range and age limits"
+        )),
+        Outcome::Unavailable {
+            package,
+            locked_version,
+            reason,
+        } => Some(format!(
+            "  Could not determine a downgrade for {package}@{locked_version}: {reason}"
+        )),
     }
 }

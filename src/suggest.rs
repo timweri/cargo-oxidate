@@ -71,17 +71,25 @@ fn same_compatible_zone(a: &Version, b: &Version) -> bool {
     }
 }
 
-/// Keeps old-enough, non-yanked compatible versions older than `locked`,
-/// ordered by semver precedence descending (publish date breaks ties).
-/// Excludes prereleases unless allowed or `locked` is one.
+/// Age limits a suggested version must satisfy, mirroring the policy check.
+#[derive(Debug, Clone, Copy)]
+pub struct AgeBounds {
+    pub min_days: u64,
+    pub max_days: Option<u64>,
+}
+
+/// Keeps old-enough, non-yanked compatible versions older than `locked`
+/// and no older than the maximum age, ordered by semver precedence
+/// descending (publish date breaks ties). Excludes prereleases unless
+/// allowed or `locked` is one.
 fn filter_candidates(
     versions: &[CrateVersionInfo],
     locked: &Version,
-    min_age_days: u64,
+    age_bounds: AgeBounds,
     now: DateTime<Utc>,
     allow_prerelease: bool,
 ) -> Vec<(Version, i64)> {
-    let min_age_threshold = now - chrono::Duration::days(min_age_days as i64);
+    let min_age_threshold = now - chrono::Duration::days(age_bounds.min_days as i64);
     let allow_pre = allow_prerelease || !locked.pre.is_empty();
 
     let mut candidates: Vec<(Version, DateTime<Utc>, i64)> = versions
@@ -105,6 +113,9 @@ fn filter_candidates(
                 return None;
             }
             let age_days = (now - v.created_at).num_days();
+            if age_bounds.max_days.is_some_and(|max| age_days > max as i64) {
+                return None;
+            }
             Some((parsed, v.created_at, age_days))
         })
         .collect();
@@ -278,7 +289,6 @@ fn attribute_requirements(
 }
 
 /// Gathers requirements from registry dependents and local manifests.
-#[allow(clippy::too_many_arguments)]
 fn gather_constraints<T: Transport>(
     client: &mut CratesIoClient<T>,
     dependents_index: &DependentsIndex,
@@ -290,6 +300,7 @@ fn gather_constraints<T: Transport>(
 ) -> GatheredConstraints {
     let mut constraints = Vec::new();
     let mut unverified_dependents = Vec::new();
+    let locked = Version::parse(locked_version).ok();
 
     let dependents = dependents_index
         .get(&(name, locked_version, source))
@@ -300,7 +311,7 @@ fn gather_constraints<T: Transport>(
     for dependent in dependents {
         let unverified = if dependent.is_registry {
             let result =
-                registry_dependent_constraints(client, dependent, name, locked_version, source);
+                registry_dependent_constraints(client, dependent, name, locked.as_ref(), source);
             let unverified = result.unverified;
             constraints.extend(result.constraints);
             unverified
@@ -314,9 +325,7 @@ fn gather_constraints<T: Transport>(
                 .filter(|r| r.crate_name == name && r.declaring_package == dependent.name)
                 .filter(|r| r.declaring_version.as_deref() == Some(dependent.version.as_str()))
                 .filter(|r| r.source == RequirementSource::CratesIo)
-                .filter(|r| {
-                    Version::parse(locked_version).is_ok_and(|version| r.req.matches(&version))
-                })
+                .filter(|r| locked.as_ref().is_some_and(|v| r.req.matches(v)))
                 .collect();
 
             let declarations: Vec<NormalizedDeclaration> = matching
@@ -336,13 +345,11 @@ fn gather_constraints<T: Transport>(
                 // non-ambiguous path `result.enforced` always contains every
                 // deduped requirement from `matching`; no filter is needed to
                 // decide which of `matching` to keep.
-                for req in &matching {
-                    constraints.push(Constraint {
-                        blocker_name: manifest_label(&req.manifest, working_dir),
-                        blocker_version: None,
-                        req: req.req.clone(),
-                    });
-                }
+                constraints.extend(matching.iter().map(|req| Constraint {
+                    blocker_name: manifest_label(&req.manifest, working_dir),
+                    blocker_version: None,
+                    req: req.req.clone(),
+                }));
                 false
             }
         } else {
@@ -361,52 +368,44 @@ fn gather_constraints<T: Transport>(
 }
 
 /// Requirements a registry dependent's crates.io index record places on
-/// `name` at `locked_version`, plus whether an uncertain declaration remains.
+/// `name` at `locked`, plus whether an uncertain declaration remains.
 struct RegistryConstraints {
     constraints: Vec<Constraint>,
     unverified: bool,
-}
-
-impl RegistryConstraints {
-    /// The index record for the dependent (or the matching version within
-    /// it) couldn't be read at all, so nothing can be enforced.
-    fn unreadable() -> Self {
-        RegistryConstraints {
-            constraints: Vec::new(),
-            unverified: true,
-        }
-    }
 }
 
 fn registry_dependent_constraints<T: Transport>(
     client: &mut CratesIoClient<T>,
     dependent: &Package,
     name: &str,
-    locked_version: &str,
+    locked: Option<&Version>,
     source: Option<&str>,
 ) -> RegistryConstraints {
-    let Ok(records) = client.fetch_index_record(&dependent.name, &dependent.version) else {
-        return RegistryConstraints::unreadable();
-    };
-    let Some(record) = records.iter().find(|r| r.vers == dependent.version) else {
-        return RegistryConstraints::unreadable();
+    // Without a readable index record for the dependent, nothing can be enforced.
+    let record = client
+        .fetch_index_record(&dependent.name, &dependent.version)
+        .ok()
+        .and_then(|records| {
+            records
+                .into_iter()
+                .find(|record| record.vers == dependent.version)
+        });
+    let Some(record) = record else {
+        return RegistryConstraints {
+            constraints: Vec::new(),
+            unverified: true,
+        };
     };
 
     let mut declarations = Vec::new();
     let mut unverified = false;
     for dep in &record.deps {
-        if dep.kind.as_deref() == Some("dev") {
-            continue;
-        }
-        if dep.registry.is_some() {
-            continue;
-        }
         let real_name = dep.package.as_deref().unwrap_or(&dep.name);
-        if real_name != name {
+        if dep.kind.as_deref() == Some("dev") || dep.registry.is_some() || real_name != name {
             continue;
         }
         match VersionReq::parse(&dep.req) {
-            Ok(req) if Version::parse(locked_version).is_ok_and(|v| req.matches(&v)) => {
+            Ok(req) if locked.is_some_and(|v| req.matches(v)) => {
                 let mandatory = dep.optional != Some(true);
                 declarations.push(NormalizedDeclaration { req, mandatory });
             }
@@ -449,7 +448,7 @@ fn build_package_spec(name: &str, target_source: Option<&str>, is_ambiguous: boo
     }
 }
 
-/// Generates outcomes for "too new" violations, or `None` when there are none.
+/// Generates outcomes for "too new" violations; empty when there are none.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_suggestions<T: Transport>(
     client: &mut CratesIoClient<T>,
@@ -457,19 +456,15 @@ pub fn generate_suggestions<T: Transport>(
     all_packages: &[Package],
     direct_requirements: &[DirectRequirement],
     working_dir: &Path,
-    min_age_days: u64,
+    age_bounds: AgeBounds,
     allow_prerelease: bool,
     now: DateTime<Utc>,
     on_progress: &mut dyn FnMut(SuggestionProgress),
-) -> Option<Vec<Outcome>> {
+) -> Vec<Outcome> {
     let too_new: Vec<&Violation> = violations
         .iter()
         .filter(|v| matches!(v.kind, ViolationKind::TooNew(_)))
         .collect();
-
-    if too_new.is_empty() {
-        return None;
-    }
 
     let (dependents_index, name_version_index) = build_indexes(all_packages);
 
@@ -529,7 +524,7 @@ pub fn generate_suggestions<T: Transport>(
             &violation.version,
             target_source,
         );
-        let candidates = filter_candidates(&versions, &locked, min_age_days, now, allow_prerelease);
+        let candidates = filter_candidates(&versions, &locked, age_bounds, now, allow_prerelease);
 
         let outcome = match walk(candidates, gathered.constraints) {
             WalkResult::Suggest(version, age_days) => Outcome::Suggest {
@@ -587,7 +582,7 @@ pub fn generate_suggestions<T: Transport>(
         }
     }
 
-    Some(outcomes)
+    outcomes
 }
 
 #[cfg(test)]

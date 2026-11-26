@@ -16,7 +16,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - run: cargo build --release
       - run: cargo test
-      - run: cargo clippy -- -D warnings
+      - run: cargo clippy --all-targets -- -D warnings
       - run: cargo fmt --check
 
   # Self-test: run the action against its own lockfile
