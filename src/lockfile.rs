@@ -29,7 +29,8 @@ pub struct LoadedLockfile {
 /// Loads every package in a lockfile, together with its canonical path.
 ///
 /// `path` is resolved against `working_dir` if relative, and must be a regular
-/// file within `working_dir` (`..` traversal and symlink escapes included).
+/// file within `working_dir`; paths that leave it through `..` or a symlink are
+/// rejected.
 /// `cargo_lock` resolves each dependency edge to a concrete version itself, so
 /// every `PackageRef` carries one.
 pub fn load(path: &Path, working_dir: &Path) -> Result<LoadedLockfile> {
