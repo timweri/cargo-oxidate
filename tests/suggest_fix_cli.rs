@@ -557,7 +557,7 @@ fn printed_source_qualified_command_updates_only_the_registry_package() {
         .map(|arg| arg.as_str().unwrap())
         .collect();
     assert!(
-        printed.trim_start().starts_with(&format!("{command} # ")),
+        printed.trim() == command,
         "printed: {printed}\ncommand: {command}"
     );
     assert!(
