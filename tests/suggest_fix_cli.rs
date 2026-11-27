@@ -145,6 +145,14 @@ fn suggest_fix_cli_reports_mixed_outcomes_and_preserves_project_files() {
         "stdout was:\n{stdout}"
     );
     assert!(stdout.contains("They do not run Cargo's resolver"));
+    for package in ["beta", "gamma", "delta"] {
+        assert!(
+            !stdout.lines().any(|line| line
+                .trim_start()
+                .starts_with(&format!("cargo update -p {package}@"))),
+            "no command expected for {package}; stdout was:\n{stdout}"
+        );
+    }
     assert_eq!(
         fs::read(project.path().join("Cargo.toml")).unwrap(),
         manifest_before
@@ -268,6 +276,75 @@ fn suggest_fix_cli_retains_best_effort_qualification() {
     );
 }
 
+#[test]
+fn violations_without_suggest_fix_print_no_downgrade_output() {
+    let project = copied_fixture();
+    let cache = write_cache(
+        project.path(),
+        &[
+            ("alpha", "1.5.0", 2, vec![("1.5.0", 2), ("1.4.0", 80)]),
+            ("beta", "1.5.0", 100, vec![]),
+            ("gamma", "1.5.0", 100, vec![]),
+            ("delta", "1.5.0", 100, vec![]),
+            ("consumer", "2.0.0", 100, vec![]),
+        ],
+    );
+    let output = run_oxidate(
+        project.path(),
+        &[
+            "--min-age-days",
+            "30",
+            "--cache-path",
+            cache.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("alpha@1.5.0: Below minimum age 30 days"),
+        "stdout was:\n{stdout}"
+    );
+    for absent in [
+        "cargo update",
+        "Suggested downgrades",
+        "Other downgrade outcomes",
+    ] {
+        assert!(!stdout.contains(absent), "stdout was:\n{stdout}");
+    }
+}
+
+#[test]
+fn suggest_fix_over_a_compliant_registry_package_prints_no_command() {
+    let project = copied_fixture();
+    let cache = write_cache(
+        project.path(),
+        &[
+            ("alpha", "1.5.0", 100, vec![]),
+            ("beta", "1.5.0", 100, vec![]),
+            ("gamma", "1.5.0", 100, vec![]),
+            ("delta", "1.5.0", 100, vec![]),
+            ("consumer", "2.0.0", 100, vec![]),
+        ],
+    );
+    let output = run_suggest_fix(project.path(), &cache);
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("No dependency age violations found."),
+        "stdout was:\n{stdout}"
+    );
+    assert!(!stdout.contains("cargo update"), "stdout was:\n{stdout}");
+}
+
+#[test]
+fn suggest_fix_without_min_age_days_is_a_usage_error() {
+    let project = copied_fixture();
+    let output = run_oxidate(project.path(), &["--suggest-fix"]);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("--min-age-days"), "stderr was:\n{stderr}");
+}
+
 #[cfg(unix)]
 #[test]
 fn suggest_fix_uses_manifest_beside_the_symlinks_real_lockfile() {
@@ -383,11 +460,21 @@ fn write_local_registry(registry: &Path, name: &str, version: &str) {
         .unwrap();
 }
 
+/// A `cargo` command that reads no user-global configuration: `CARGO_HOME` is
+/// an empty directory, so only the project's own `.cargo/config.toml` applies.
+fn isolated_cargo(project: &Path, cargo_home: &Path) -> Command {
+    let mut command = Command::new("cargo");
+    command.env("CARGO_HOME", cargo_home).current_dir(project);
+    command
+}
+
 #[test]
 fn printed_source_qualified_command_updates_only_the_registry_package() {
     let root = tempdir().unwrap();
     let registry = root.path().join("registry");
     let project = root.path().join("project");
+    let cargo_home = root.path().join("cargo-home");
+    fs::create_dir(&cargo_home).unwrap();
     write_local_registry(&registry, "semver", "1.0.28");
     write_local_registry(&registry, "semver", "1.0.27");
     write_crate_source(&project.join("vendor-semver"), "semver", "1.0.28");
@@ -396,9 +483,8 @@ fn printed_source_qualified_command_updates_only_the_registry_package() {
     fs::write(project.join("src/main.rs"), "fn main() {}\n").unwrap();
     fs::write(project.join(".cargo/config.toml"), format!("[source.local-vendor]\nlocal-registry = \"{}\"\n\n[source.crates-io]\nreplace-with = \"local-vendor\"\n", registry.display())).unwrap();
     fs::write(project.join("Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nsemver = \"1\"\nsemver-path = { package = \"semver\", path = \"vendor-semver\" }\n").unwrap();
-    let generated = Command::new("cargo")
+    let generated = isolated_cargo(&project, &cargo_home)
         .args(["generate-lockfile", "--offline"])
-        .current_dir(&project)
         .output()
         .unwrap();
     assert!(
@@ -410,7 +496,7 @@ fn printed_source_qualified_command_updates_only_the_registry_package() {
     // The abbreviated spec really is ambiguous in this fixture; otherwise the
     // printed source-qualified command below proves nothing.
     let lock_before = fs::read_to_string(project.join("Cargo.lock")).unwrap();
-    let abbreviated = Command::new("cargo")
+    let abbreviated = isolated_cargo(&project, &cargo_home)
         .args([
             "update",
             "-p",
@@ -419,7 +505,6 @@ fn printed_source_qualified_command_updates_only_the_registry_package() {
             "1.0.27",
             "--offline",
         ])
-        .current_dir(&project)
         .output()
         .unwrap();
     assert!(
@@ -455,10 +540,9 @@ fn printed_source_qualified_command_updates_only_the_registry_package() {
         args.iter().any(|arg| arg.contains('#')),
         "expected source-qualified package spec: {command}"
     );
-    let applied = Command::new("cargo")
+    let applied = isolated_cargo(&project, &cargo_home)
         .args(args)
         .arg("--offline")
-        .current_dir(&project)
         .output()
         .unwrap();
     assert!(
