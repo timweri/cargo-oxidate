@@ -467,6 +467,7 @@ fn isolated_cargo(project: &Path, cargo_home: &Path) -> Command {
     command
 }
 
+#[cfg(unix)]
 #[test]
 fn printed_source_qualified_command_updates_only_the_registry_package() {
     let root = tempdir().unwrap();

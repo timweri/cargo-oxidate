@@ -56,7 +56,7 @@ run your tests.
 
 ## JSON output
 
-`--format json` prints one JSON document with `schema_version` 2. Each suggestion carries
+`--format json` prints one JSON document with `schema_version` 2. Each `suggested` entry carries
 `command`, quoted for a shell, and `command_argv`, the same command as an argument array.
 
 ## Exit Codes
