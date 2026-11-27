@@ -303,8 +303,9 @@ fn suggestion_line(outcome: &Outcome) -> Option<String> {
         locked_version,
         suggested_version,
     ));
+    // The detail goes on its own line so the command line pastes into any shell.
     Some(format!(
-        "  {command} # {suggested_age_days} days old{annotation}"
+        "  {command}\n      {suggested_version} is {suggested_age_days} days old{annotation}"
     ))
 }
 
