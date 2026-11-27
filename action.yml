@@ -71,9 +71,10 @@ runs:
       shell: bash
       run: echo "path=$HOME/.cargo-oxidate-cache/responses.json" >> "$GITHUB_OUTPUT"
 
-    - name: Cache crates.io API responses
+    - name: Restore crates.io API responses
       if: inputs.cache-responses == 'true'
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      id: restore-cache
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: ${{ steps.cache-path.outputs.path }}
         key: cargo-oxidate-responses-v1-${{ runner.os }}-${{ hashFiles(inputs.cargo-lock-path) }}
@@ -81,6 +82,7 @@ runs:
           cargo-oxidate-responses-v1-${{ runner.os }}-
 
     - name: Run cargo-oxidate
+      id: run
       shell: bash
       env:
         INPUT_CARGO_LOCK_PATH: ${{ inputs.cargo-lock-path }}
@@ -127,4 +129,13 @@ runs:
           fi
         fi
 
-        ~/.cargo-oxidate-bin/cargo-oxidate "${ARGS[@]}"
+        ~/.cargo-oxidate-bin/cargo-oxidate "${ARGS[@]}" || { code=$?; echo "exit-code=$code" >> "$GITHUB_OUTPUT"; exit "$code"; }
+
+    # Exit 1 means violations: every lookup finished, so the cache is complete
+    # and worth saving. Exit 2 can leave it partial, so that run saves nothing.
+    - name: Save crates.io API responses
+      if: (success() || steps.run.outputs.exit-code == '1') && inputs.cache-responses == 'true' && steps.restore-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ${{ steps.cache-path.outputs.path }}
+        key: ${{ steps.restore-cache.outputs.cache-primary-key }}
