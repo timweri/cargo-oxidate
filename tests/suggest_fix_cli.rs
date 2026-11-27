@@ -476,3 +476,65 @@ fn printed_source_qualified_command_updates_only_the_registry_package() {
                 && package.source.is_none())
     );
 }
+
+#[test]
+fn suggest_fix_cli_qualifies_an_ambiguous_blocker_in_text_and_json() {
+    // `consumer 2.0.0` is locked from both crates.io and a git source, so the
+    // blocker's abbreviated `consumer 2.0.0` would not identify which one
+    // pins `gamma`.
+    let project = tempdir().unwrap();
+    fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \"consumer 2.0.0 (git+https://example.com/consumer#0000000000000000000000000000000000000000)\",\n \"consumer 2.0.0 (registry+https://github.com/rust-lang/crates.io-index)\",\n]\n\n[[package]]\nname = \"consumer\"\nversion = \"2.0.0\"\nsource = \"git+https://example.com/consumer#0000000000000000000000000000000000000000\"\n\n[[package]]\nname = \"consumer\"\nversion = \"2.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"0000000000000000000000000000000000000000000000000000000000000000\"\ndependencies = [\n \"gamma\",\n]\n\n[[package]]\nname = \"gamma\"\nversion = \"1.5.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"0000000000000000000000000000000000000000000000000000000000000000\"\n",
+    )
+    .unwrap();
+    let cache = write_cache(
+        project.path(),
+        &[
+            ("gamma", "1.5.0", 2, vec![("1.5.0", 2), ("1.4.0", 80)]),
+            ("consumer", "2.0.0", 100, vec![("2.0.0", 100)]),
+        ],
+    );
+    edit_cache(&cache, |cache| {
+        cache["index_records"]["consumer"]["records"] = serde_json::json!([{
+            "vers": "2.0.0",
+            "yanked": false,
+            "deps": [
+                { "name": "gamma", "req": "^1.5", "kind": null, "target": null, "optional": false, "package": null }
+            ]
+        }]);
+    });
+    let spec = "registry+https://github.com/rust-lang/crates.io-index#consumer";
+
+    let output = run_suggest_fix(project.path(), &cache);
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains(&format!("but {spec}@2.0.0 requires ^1.5\n")),
+        "stdout was:\n{stdout}"
+    );
+
+    let output = run_oxidate(
+        project.path(),
+        &[
+            "--min-age-days",
+            "30",
+            "--suggest-fix",
+            "--format",
+            "json",
+            "--cache-path",
+            cache.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["suggestions"][0]["blocker"]["package_spec"], spec,
+        "json was:\n{json:#}"
+    );
+}
