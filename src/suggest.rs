@@ -38,6 +38,8 @@ pub enum Outcome {
         locked_version: String,
         suggested_version: String,
         suggested_age_days: i64,
+        /// Dependent labels: the bare name when its name and version are
+        /// unique in the lockfile, else its source-qualified spec.
         unverified_dependents: Vec<String>,
     },
     Blocked {
@@ -300,9 +302,11 @@ fn attribute_requirements(
 }
 
 /// Gathers requirements from registry dependents and local manifests.
+#[allow(clippy::too_many_arguments)]
 fn gather_constraints<T: Transport>(
     client: &mut CratesIoClient<T>,
     dependents_index: &DependentsIndex,
+    name_version_index: &NameVersionIndex,
     direct_requirements: &[DirectRequirement],
     working_dir: &Path,
     name: &str,
@@ -368,8 +372,16 @@ fn gather_constraints<T: Transport>(
             // Git and alternate-registry requirements cannot be read here.
             true
         };
-        if unverified && !unverified_dependents.contains(&dependent.name) {
-            unverified_dependents.push(dependent.name.clone());
+        if unverified {
+            // The bare name when it identifies the dependent, else its spec.
+            let is_ambiguous = name_version_index
+                .get(&(dependent.name.as_str(), dependent.version.as_str()))
+                .is_some_and(|packages| packages.len() > 1);
+            let label =
+                build_package_spec(&dependent.name, dependent.source.as_deref(), is_ambiguous);
+            if !unverified_dependents.contains(&label) {
+                unverified_dependents.push(label);
+            }
         }
     }
 
@@ -454,9 +466,14 @@ fn manifest_label(path: &Path, working_dir: &Path) -> String {
 }
 
 /// Uses a source-qualified pkgid when a shared name and version is ambiguous.
+/// A lockfile source can already end in a `#fragment` (a git source's precise
+/// commit); it is dropped so the result stays a single `{source}#{name}`.
 fn build_package_spec(name: &str, target_source: Option<&str>, is_ambiguous: bool) -> String {
     match (is_ambiguous, target_source) {
-        (true, Some(source)) => format!("{source}#{name}"),
+        (true, Some(source)) => {
+            let source = source.split_once('#').map_or(source, |(base, _)| base);
+            format!("{source}#{name}")
+        }
         _ => name.to_string(),
     }
 }
@@ -543,6 +560,7 @@ pub fn generate_suggestions<T: Transport>(
         let gathered = gather_constraints(
             client,
             &dependents_index,
+            &name_version_index,
             direct_requirements,
             working_dir,
             &violation.package,

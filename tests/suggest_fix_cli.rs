@@ -629,3 +629,71 @@ fn suggest_fix_cli_qualifies_an_ambiguous_blocker_in_text_and_json() {
         "json was:\n{json:#}"
     );
 }
+
+#[test]
+fn suggest_fix_cli_labels_an_ambiguous_unverified_dependent_by_spec() {
+    // crates.io `app 1.0.0` is verified through its index record, while the
+    // git `app 1.0.0` cannot be, and shares its name and version. Only the git
+    // one's label must be source-qualified, with a single `#`.
+    let project = tempdir().unwrap();
+    fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname = \"root\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    let git = "git+https://example.com/app#0000000000000000000000000000000000000000";
+    let registry = "registry+https://github.com/rust-lang/crates.io-index";
+    let checksum = "0".repeat(64);
+    fs::write(
+        project.path().join("Cargo.lock"),
+        format!(
+            "version = 4\n\n[[package]]\nname = \"root\"\nversion = \"0.1.0\"\ndependencies = [\n \"app 1.0.0 ({git})\",\n \"app 1.0.0 ({registry})\",\n]\n\n[[package]]\nname = \"app\"\nversion = \"1.0.0\"\nsource = \"{git}\"\ndependencies = [\n \"gamma\",\n]\n\n[[package]]\nname = \"app\"\nversion = \"1.0.0\"\nsource = \"{registry}\"\nchecksum = \"{checksum}\"\ndependencies = [\n \"gamma\",\n]\n\n[[package]]\nname = \"gamma\"\nversion = \"1.5.0\"\nsource = \"{registry}\"\nchecksum = \"{checksum}\"\n"
+        ),
+    )
+    .unwrap();
+    let cache = write_cache(
+        project.path(),
+        &[
+            ("gamma", "1.5.0", 2, vec![("1.5.0", 2), ("1.4.0", 80)]),
+            ("app", "1.0.0", 100, vec![("1.0.0", 100)]),
+        ],
+    );
+    edit_cache(&cache, |cache| {
+        cache["index_records"]["app"]["records"] = serde_json::json!([{
+            "vers": "1.0.0",
+            "yanked": false,
+            "deps": [
+                { "name": "gamma", "req": "^1.0", "kind": null, "target": null, "optional": false, "package": null }
+            ]
+        }]);
+    });
+    let label = "git+https://example.com/app#app";
+
+    let output = run_suggest_fix(project.path(), &cache);
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains(&format!("(requirement of {label} unverified)")),
+        "stdout was:\n{stdout}"
+    );
+
+    let output = run_oxidate(
+        project.path(),
+        &[
+            "--min-age-days",
+            "30",
+            "--suggest-fix",
+            "--format",
+            "json",
+            "--cache-path",
+            cache.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["suggestions"][0]["unverified_dependents"],
+        serde_json::json!([label]),
+        "json was:\n{json:#}"
+    );
+}
