@@ -236,8 +236,15 @@ fn suggest_fix_cli_retains_best_effort_qualification() {
         ],
     );
     edit_cache(&cache, |cache| {
+        // The record must be for the locked `2.0.0`, or the cache treats it as
+        // a miss and the run reaches out to the network. The unparseable `req`
+        // is what leaves the requirement unverified.
         cache["index_records"]["consumer"]["records"] = serde_json::json!([{
-            "vers": "1.0.0", "yanked": false, "deps": []
+            "vers": "2.0.0",
+            "yanked": false,
+            "deps": [
+                { "name": "gamma", "req": "not a requirement", "kind": null, "target": null, "optional": false, "package": null }
+            ]
         }]);
     });
     let output = run_suggest_fix(project.path(), &cache);
