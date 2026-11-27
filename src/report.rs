@@ -317,14 +317,17 @@ fn other_outcome_line(outcome: &Outcome) -> Option<String> {
             blocker,
             ..
         } => {
+            let short_source = match &blocker.version {
+                Some(version) => format!("{} {version}", blocker.name),
+                None => blocker.name.clone(),
+            };
             let source = match (&blocker.version, &blocker.package_spec) {
                 (Some(version), Some(spec)) => format!("{spec}@{version}"),
-                (Some(version), None) => format!("{} {version}", blocker.name),
-                (None, _) => blocker.name.clone(),
+                _ => short_source.clone(),
             };
             let also_suggested = if blocker.also_suggested {
                 format!(
-                    " ({source} also has a suggested downgrade above; applying it may unblock this, so re-run to check)"
+                    " ({short_source} also has a suggested downgrade above; applying it may unblock this, so re-run to check)"
                 )
             } else {
                 String::new()
@@ -426,5 +429,28 @@ mod tests {
             "clap 4.6.9 requires =4.6.9"
         );
         assert_eq!(tail(blocked(None, None)), "clap requires =4.6.9");
+    }
+
+    #[test]
+    fn also_suggested_note_uses_the_short_form_even_when_the_blocker_is_qualified() {
+        let outcome = Outcome::Blocked {
+            package: "clap_derive".into(),
+            package_spec: "clap_derive".into(),
+            locked_version: "4.6.9".into(),
+            newest_compliant: "4.6.7".into(),
+            blocker: Blocker {
+                name: "clap".into(),
+                version: Some("4.6.9".into()),
+                package_spec: Some("registry+https://example.com/index#clap".into()),
+                req: "=4.6.9".into(),
+                also_suggested: true,
+            },
+        };
+        let line = other_outcome_line(&outcome).unwrap();
+
+        assert_eq!(
+            line.split_once(", but ").unwrap().1,
+            "registry+https://example.com/index#clap@4.6.9 requires =4.6.9 (clap 4.6.9 also has a suggested downgrade above; applying it may unblock this, so re-run to check)"
+        );
     }
 }

@@ -559,13 +559,11 @@ pub fn generate_suggestions<T: Transport>(
                         .get(&(blocker.blocker_name.as_str(), version))
                         .is_some_and(|packages| packages.len() > 1)
                 });
-                let blocker_spec = is_ambiguous.then(|| {
-                    build_package_spec(
-                        &blocker.blocker_name,
-                        blocker.blocker_source.as_deref(),
-                        true,
-                    )
-                });
+                let blocker_spec = blocker
+                    .blocker_source
+                    .as_deref()
+                    .filter(|_| is_ambiguous)
+                    .map(|source| build_package_spec(&blocker.blocker_name, Some(source), true));
                 Outcome::Blocked {
                     package: violation.package.clone(),
                     package_spec,
