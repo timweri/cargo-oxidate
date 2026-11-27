@@ -11,6 +11,8 @@ use std::path::Path;
 pub struct Constraint {
     pub blocker_name: String,
     pub blocker_version: Option<String>,
+    /// The lockfile source of a dependent blocker; `None` for manifest blockers.
+    pub blocker_source: Option<String>,
     pub req: VersionReq,
 }
 
@@ -18,6 +20,9 @@ pub struct Constraint {
 pub struct Blocker {
     pub name: String,
     pub version: Option<String>,
+    /// `{source}#{name}` when this lockfile dependent shares its name and
+    /// version with a package from another source; otherwise `None`.
+    pub package_spec: Option<String>,
     pub req: String,
     /// Whether this run also suggests downgrading this locked package.
     pub also_suggested: bool,
@@ -354,6 +359,7 @@ fn gather_constraints<T: Transport>(
                 constraints.extend(matching.iter().map(|req| Constraint {
                     blocker_name: manifest_label(&req.manifest, working_dir),
                     blocker_version: None,
+                    blocker_source: None,
                     req: req.req.clone(),
                 }));
                 false
@@ -429,6 +435,7 @@ fn registry_dependent_constraints<T: Transport>(
         .map(|req| Constraint {
             blocker_name: dependent.name.clone(),
             blocker_version: Some(dependent.version.clone()),
+            blocker_source: dependent.source.clone(),
             req,
         })
         .collect();
@@ -452,6 +459,16 @@ fn build_package_spec(name: &str, target_source: Option<&str>, is_ambiguous: boo
         (true, Some(source)) => format!("{source}#{name}"),
         _ => name.to_string(),
     }
+}
+
+/// The source-qualified pkgid of a lockfile blocker whose name and version
+/// are shared with a package from another source; otherwise `None`.
+fn blocker_package_spec(blocker: &Constraint, index: &NameVersionIndex) -> Option<String> {
+    let version = blocker.blocker_version.as_deref()?;
+    let source = blocker.blocker_source.as_deref()?;
+    let same_name_version = index.get(&(blocker.blocker_name.as_str(), version))?;
+    (same_name_version.len() > 1)
+        .then(|| build_package_spec(&blocker.blocker_name, Some(source), true))
 }
 
 /// Generates outcomes for "too new" violations; empty when there are none.
@@ -556,6 +573,7 @@ pub fn generate_suggestions<T: Transport>(
                     // suggestion is only known once every violation has been
                     // walked, so this starts false and is patched below.
                     also_suggested: false,
+                    package_spec: blocker_package_spec(&blocker, &name_version_index),
                     name: blocker.blocker_name,
                     version: blocker.blocker_version,
                     req: blocker.req.to_string(),

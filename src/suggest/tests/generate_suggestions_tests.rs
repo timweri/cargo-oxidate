@@ -345,6 +345,63 @@ fn same_name_version_registries_keep_their_dependents_and_manifest_requirements_
 }
 
 #[test]
+fn a_blocker_duplicated_at_the_same_name_version_is_source_qualified() {
+    // crates.io `app 1.0.0` pins serde; a git `app 1.0.0` shares its name and
+    // version, so naming the blocker bare would be ambiguous to Cargo.
+    let transport = FakeTransport::default();
+    transport.versions("serde", &[("1.5.0", 5), ("1.4.0", 50)]);
+    transport.index_ok(
+        "app",
+        r#"{"vers":"1.0.0","deps":[{"name":"serde","req":"^1.5"}]}"#,
+    );
+    let packages = [
+        pkg("serde", "1.5.0", &[]),
+        pkg("app", "1.0.0", &[("serde", "1.5.0")]),
+        external_pkg("app", "1.0.0", GIT_SOURCE, &[]),
+    ];
+    let violations = [too_new("serde", "1.5.0")];
+    let outcomes = suggestions(transport, &violations, &packages, &[], Path::new("/work"));
+
+    assert_eq!(
+        summaries(&outcomes),
+        [format!(
+            "serde: blocked at 1.4.0 by app@1.0.0 ^1.5 blocker_spec={CRATES_IO_SOURCE}#app"
+        )]
+    );
+}
+
+#[test]
+fn also_suggested_stays_keyed_by_name_and_version_when_the_blocker_is_duplicated() {
+    // The crates.io `app 1.1.0` blocks serde and has its own suggestion; a
+    // git `app 1.1.0` shares its name and version. The block still points at
+    // the app suggestion, and the blocker is source-qualified.
+    let transport = FakeTransport::default();
+    transport.versions("serde", &[("1.5.0", 5), ("1.4.0", 50)]);
+    transport.versions("app", &[("1.1.0", 5), ("1.0.0", 50)]);
+    transport.index_ok(
+        "app",
+        r#"{"vers":"1.1.0","deps":[{"name":"serde","req":"^1.5"}]}"#,
+    );
+    let packages = [
+        pkg("serde", "1.5.0", &[]),
+        pkg("app", "1.1.0", &[("serde", "1.5.0")]),
+        external_pkg("app", "1.1.0", GIT_SOURCE, &[]),
+    ];
+    let violations = [too_new("serde", "1.5.0"), too_new("app", "1.1.0")];
+    let outcomes = suggestions(transport, &violations, &packages, &[], Path::new("/work"));
+
+    assert_eq!(
+        summaries(&outcomes),
+        [
+            format!(
+                "serde: blocked at 1.4.0 by app@1.1.0 ^1.5 (also suggested) blocker_spec={CRATES_IO_SOURCE}#app"
+            ),
+            format!("app: suggest 1.0.0 (50d) spec={CRATES_IO_SOURCE}#app"),
+        ]
+    );
+}
+
+#[test]
 fn unavailable_outcome_for_a_duplicated_package_carries_the_qualified_spec() {
     // The invalid-SemVer early exit must still report the ambiguous spec.
     let packages = [
@@ -363,6 +420,25 @@ fn unavailable_outcome_for_a_duplicated_package_carries_the_qualified_spec() {
         summaries(&outcomes),
         [format!(
             "anyhow: unavailable (Locked version is not valid SemVer) spec={CRATES_IO_SOURCE}#anyhow"
+        )]
+    );
+}
+
+#[test]
+fn unavailable_outcome_for_a_failed_versions_fetch_carries_the_qualified_spec() {
+    // The fetch-error arm must also report the ambiguous spec.
+    let transport = FakeTransport::default();
+    transport.versions_error("anyhow");
+    let packages = [
+        pkg("anyhow", "1.0.102", &[]),
+        external_pkg("anyhow", "1.0.102", ALT_REGISTRY_SOURCE, &[]),
+    ];
+    let violations = [too_new("anyhow", "1.0.102")];
+    let outcomes = suggestions(transport, &violations, &packages, &[], Path::new("/work"));
+    assert_eq!(
+        summaries(&outcomes),
+        [format!(
+            "anyhow: unavailable (Network error fetching versions for anyhow: connection timed out) spec={CRATES_IO_SOURCE}#anyhow"
         )]
     );
 }

@@ -145,3 +145,24 @@ fn unsupported_entries_are_counted_before_exemptions() {
     assert_eq!(summary.exempt_packages, 1);
     assert_eq!(summary.checked_packages, 0);
 }
+
+#[test]
+fn unavailable_warning_carries_the_package_spec() {
+    let spec = "registry+https://example.test/index#anyhow";
+    let warning = unavailable_warning(&suggest::Outcome::Unavailable {
+        package: "anyhow".into(),
+        package_spec: spec.into(),
+        locked_version: "1.0.102".into(),
+        reason: "network error".into(),
+    })
+    .unwrap();
+
+    assert_eq!(warning.category, "suggestion");
+    assert_eq!(warning.package.as_deref(), Some("anyhow"));
+    assert_eq!(warning.version.as_deref(), Some("1.0.102"));
+    assert_eq!(warning.package_spec.as_deref(), Some(spec));
+    assert_eq!(
+        warning.message,
+        format!("Could not determine a downgrade for {spec}@1.0.102: network error")
+    );
+}

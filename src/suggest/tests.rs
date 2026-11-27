@@ -132,8 +132,12 @@ fn summary(outcome: &Outcome) -> String {
             } else {
                 ""
             };
+            let blocker_spec = blocker
+                .package_spec
+                .as_deref()
+                .map_or_else(String::new, |spec| format!(" blocker_spec={spec}"));
             format!(
-                "{package}: blocked at {newest_compliant} by {}{version} {}{also}{}",
+                "{package}: blocked at {newest_compliant} by {}{version} {}{also}{blocker_spec}{}",
                 blocker.name,
                 blocker.req,
                 spec_suffix(package, package_spec)
@@ -189,6 +193,7 @@ fn constraint(req: &str) -> Constraint {
     Constraint {
         blocker_name: "dep".to_string(),
         blocker_version: Some("1.0.0".to_string()),
+        blocker_source: None,
         req: VersionReq::parse(req).unwrap(),
     }
 }

@@ -64,6 +64,8 @@ struct JsonDiagnostic {
     path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     retryable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    package_spec: Option<String>,
 }
 
 #[derive(Serialize, Default)]
@@ -93,6 +95,9 @@ struct JsonSuggestion {
 struct JsonBlocker {
     name: String,
     version: Option<String>,
+    /// Omitted unless `name` and `version` are ambiguous in the lockfile.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    package_spec: Option<String>,
     requirement: String,
     also_suggested: bool,
 }
@@ -153,6 +158,7 @@ fn diagnostic_json(diagnostic: &Diagnostic) -> JsonDiagnostic {
             .as_ref()
             .map(|path| path.display().to_string()),
         retryable: (diagnostic.category == "lookup").then_some(diagnostic.retryable),
+        package_spec: diagnostic.package_spec.clone(),
     }
 }
 
@@ -180,18 +186,20 @@ fn suggestion_json(outcome: &Outcome) -> JsonSuggestion {
         },
         Outcome::Blocked {
             package,
+            package_spec,
             locked_version,
             newest_compliant,
             blocker,
-            ..
         } => JsonSuggestion {
             kind: "blocked",
             package: package.clone(),
             locked_version: locked_version.clone(),
+            package_spec: Some(package_spec.clone()),
             newest_compliant: Some(newest_compliant.clone()),
             blocker: Some(JsonBlocker {
                 name: blocker.name.clone(),
                 version: blocker.version.clone(),
+                package_spec: blocker.package_spec.clone(),
                 requirement: blocker.req.clone(),
                 also_suggested: blocker.also_suggested,
             }),
@@ -199,23 +207,25 @@ fn suggestion_json(outcome: &Outcome) -> JsonSuggestion {
         },
         Outcome::NoCompliantVersion {
             package,
+            package_spec,
             locked_version,
-            ..
         } => JsonSuggestion {
             kind: "no_eligible_downgrade",
             package: package.clone(),
             locked_version: locked_version.clone(),
+            package_spec: Some(package_spec.clone()),
             ..Default::default()
         },
         Outcome::Unavailable {
             package,
+            package_spec,
             locked_version,
             reason,
-            ..
         } => JsonSuggestion {
             kind: "unavailable",
             package: package.clone(),
             locked_version: locked_version.clone(),
+            package_spec: Some(package_spec.clone()),
             reason: Some(reason.clone()),
             ..Default::default()
         },
@@ -317,6 +327,7 @@ mod tests {
             path: None,
             message: "Client error 400".into(),
             retryable: false,
+            package_spec: None,
         });
 
         let json = render(&report);
@@ -377,7 +388,7 @@ mod tests {
         report.suggestions = Some(vec![
             Outcome::Suggest {
                 package: "widget".into(),
-                package_spec: "registry+https://example.test#index#widget".into(),
+                package_spec: "registry+https://example.test/index#widget".into(),
                 locked_version: "2.0.0".into(),
                 suggested_version: "1.9.0".into(),
                 suggested_age_days: 30,
@@ -385,12 +396,13 @@ mod tests {
             },
             Outcome::Blocked {
                 package: "blocked".into(),
-                package_spec: "blocked".into(),
+                package_spec: "registry+https://example.test/index#blocked".into(),
                 locked_version: "2.0.0".into(),
                 newest_compliant: "1.9.0".into(),
                 blocker: crate::suggest::Blocker {
                     name: "consumer".into(),
                     version: Some("3.0.0".into()),
+                    package_spec: None,
                     req: "^2".into(),
                     also_suggested: true,
                 },
@@ -402,7 +414,7 @@ mod tests {
             },
             Outcome::Unavailable {
                 package: "unavailable".into(),
-                package_spec: "unavailable".into(),
+                package_spec: "registry+https://example.test/index#unavailable".into(),
                 locked_version: "2.0.0".into(),
                 reason: "registry request failed".into(),
             },
@@ -415,8 +427,8 @@ mod tests {
                     "kind": "suggested",
                     "package": "widget",
                     "locked_version": "2.0.0",
-                    "package_spec": "registry+https://example.test#index#widget",
-                    "command": "cargo update -p registry+https://example.test#index#widget@2.0.0 --precise 1.9.0",
+                    "package_spec": "registry+https://example.test/index#widget",
+                    "command": "cargo update -p registry+https://example.test/index#widget@2.0.0 --precise 1.9.0",
                     "suggested_version": "1.9.0",
                     "suggested_age_days": 30,
                     "unverified_dependents": ["consumer"],
@@ -425,6 +437,7 @@ mod tests {
                     "kind": "blocked",
                     "package": "blocked",
                     "locked_version": "2.0.0",
+                    "package_spec": "registry+https://example.test/index#blocked",
                     "newest_compliant": "1.9.0",
                     "blocker": {
                         "name": "consumer",
@@ -437,14 +450,45 @@ mod tests {
                     "kind": "no_eligible_downgrade",
                     "package": "none",
                     "locked_version": "2.0.0",
+                    "package_spec": "none",
                 },
                 {
                     "kind": "unavailable",
                     "package": "unavailable",
                     "locked_version": "2.0.0",
+                    "package_spec": "registry+https://example.test/index#unavailable",
                     "reason": "registry request failed",
                 },
             ])
+        );
+    }
+
+    #[test]
+    fn qualified_blocker_emits_its_package_spec() {
+        let mut report = completed_report(Summary::default());
+        report.suggestions = Some(vec![Outcome::Blocked {
+            package: "clap_derive".into(),
+            package_spec: "clap_derive".into(),
+            locked_version: "4.6.9".into(),
+            newest_compliant: "4.6.7".into(),
+            blocker: crate::suggest::Blocker {
+                name: "clap".into(),
+                version: Some("4.6.9".into()),
+                package_spec: Some("registry+https://example.test/index#clap".into()),
+                req: "=4.6.9".into(),
+                also_suggested: false,
+            },
+        }]);
+
+        assert_eq!(
+            render(&report)["suggestions"][0]["blocker"],
+            json!({
+                "name": "clap",
+                "version": "4.6.9",
+                "package_spec": "registry+https://example.test/index#clap",
+                "requirement": "=4.6.9",
+                "also_suggested": false,
+            })
         );
     }
 
@@ -458,6 +502,13 @@ mod tests {
             path: Some("responses.json".into()),
             message: "Could not save cache".into(),
             retryable: false,
+            package_spec: None,
+        });
+        report.warnings.push(Diagnostic {
+            package: Some("widget".into()),
+            version: Some("2.0.0".into()),
+            package_spec: Some("registry+https://example.test/index#widget".into()),
+            ..Diagnostic::new("suggestion", "Could not determine a downgrade".into())
         });
         report.suggestions = Some(vec![]);
 
@@ -467,6 +518,11 @@ mod tests {
         assert_eq!(json["warnings"][0]["category"], "cache");
         assert_eq!(json["warnings"][0]["path"], "responses.json");
         assert!(json["warnings"][0].get("retryable").is_none());
+        assert!(json["warnings"][0].get("package_spec").is_none());
+        assert_eq!(
+            json["warnings"][1]["package_spec"],
+            "registry+https://example.test/index#widget"
+        );
         assert_eq!(json["suggestions"], json!([]));
     }
 }
