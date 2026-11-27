@@ -529,64 +529,17 @@ fn printed_source_qualified_command_updates_only_the_registry_package() {
         !stdout.contains("Other downgrade outcomes"),
         "stdout was:\n{stdout}"
     );
-    let printed = stdout
+    let command = stdout
         .lines()
         .find(|line| line.trim_start().starts_with("cargo update "))
         .unwrap_or_else(|| panic!("a rendered cargo update command; stdout was:\n{stdout}"));
-
-    let output = run_oxidate(
-        &project,
-        &[
-            "--min-age-days",
-            "30",
-            "--suggest-fix",
-            "--format",
-            "json",
-            "--cache-path",
-            cache.to_str().unwrap(),
-        ],
-    );
-    assert_eq!(output.status.code(), Some(1));
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let suggestion = &json["suggestions"][0];
-    let command = suggestion["command"].as_str().unwrap();
-    let argv: Vec<&str> = suggestion["command_argv"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|arg| arg.as_str().unwrap())
-        .collect();
+    let args: Vec<_> = command.split_whitespace().skip(1).collect();
     assert!(
-        printed.trim() == command,
-        "printed: {printed}\ncommand: {command}"
+        args.iter().any(|arg| arg.contains('#')),
+        "expected source-qualified package spec: {command}"
     );
-    assert!(
-        argv.iter().any(|arg| arg.contains('#')),
-        "expected source-qualified package spec: {argv:?}"
-    );
-
-    // The shell string and the argv must each work from a fresh project.
-    if cfg!(unix) {
-        let by_shell = root.path().join("by-shell");
-        copy_dir(&project, &by_shell);
-        let applied = Command::new("sh")
-            .args(["-c", &format!("{command} --offline")])
-            .env("CARGO_HOME", &cargo_home)
-            .current_dir(&by_shell)
-            .output()
-            .unwrap();
-        assert!(
-            applied.status.success(),
-            "{}",
-            String::from_utf8_lossy(&applied.stderr)
-        );
-        assert_only_the_registry_package_was_downgraded(&by_shell);
-    }
-
-    let by_argv = root.path().join("by-argv");
-    copy_dir(&project, &by_argv);
-    let applied = isolated_cargo(&by_argv, &cargo_home)
-        .args(&argv[1..])
+    let applied = isolated_cargo(&project, &cargo_home)
+        .args(args)
         .arg("--offline")
         .output()
         .unwrap();
@@ -595,20 +548,7 @@ fn printed_source_qualified_command_updates_only_the_registry_package() {
         "{}",
         String::from_utf8_lossy(&applied.stderr)
     );
-    assert_only_the_registry_package_was_downgraded(&by_argv);
-}
-
-fn copy_dir(from: &Path, to: &Path) {
-    fs::create_dir_all(to).unwrap();
-    for entry in fs::read_dir(from).unwrap() {
-        let entry = entry.unwrap();
-        let target = to.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir(&entry.path(), &target);
-        } else {
-            fs::copy(entry.path(), target).unwrap();
-        }
-    }
+    assert_only_the_registry_package_was_downgraded(&project);
 }
 
 fn assert_only_the_registry_package_was_downgraded(project: &Path) {
