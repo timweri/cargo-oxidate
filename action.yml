@@ -71,9 +71,10 @@ runs:
       shell: bash
       run: echo "path=$HOME/.cargo-oxidate-cache/responses.json" >> "$GITHUB_OUTPUT"
 
-    - name: Cache crates.io API responses
+    - name: Restore crates.io API responses
       if: inputs.cache-responses == 'true'
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      id: restore-cache
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: ${{ steps.cache-path.outputs.path }}
         key: cargo-oxidate-responses-v1-${{ runner.os }}-${{ hashFiles(inputs.cargo-lock-path) }}
@@ -128,3 +129,11 @@ runs:
         fi
 
         ~/.cargo-oxidate-bin/cargo-oxidate "${ARGS[@]}"
+
+    # A run that finds violations exits non-zero; save what it fetched anyway.
+    - name: Save crates.io API responses
+      if: always() && inputs.cache-responses == 'true' && steps.restore-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ${{ steps.cache-path.outputs.path }}
+        key: ${{ steps.restore-cache.outputs.cache-primary-key }}
