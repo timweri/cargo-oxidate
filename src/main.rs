@@ -247,7 +247,7 @@ fn check_packages<T: api::Transport>(
                 report.required_errors.push(report::Diagnostic {
                     package: Some(pkg.name.clone()),
                     version: Some(pkg.version.clone()),
-                    retryable: !matches!(error, api::FetchError::Permanent(_)),
+                    retryable: matches!(error, api::FetchError::Retryable(_)),
                     ..report::Diagnostic::new("lookup", error.to_string())
                 });
             }
