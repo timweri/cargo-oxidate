@@ -185,13 +185,14 @@ impl Transport for UreqTransport {
     }
 }
 
-/// Retry and pacing timing, fixed at construction. Every wait goes through
+/// Retry and request-spacing timing, fixed at construction. Every wait goes through
 /// `sleep`, so tests substitute a recorder (or zeroed delays) and the suite
 /// never really sleeps; production uses `Default`.
 pub(crate) struct RetryPolicy {
     pub(crate) retry_count: NonZeroU32,
     pub(crate) retry_delay: Duration,
-    pub(crate) pacing_delay: Duration,
+    /// Minimum gap between the starts of two crates.io API requests.
+    pub(crate) api_spacing: Duration,
     pub(crate) sleep: Box<dyn Fn(Duration)>,
 }
 
@@ -200,11 +201,13 @@ impl Default for RetryPolicy {
         Self {
             retry_count: NonZeroU32::new(3).unwrap(),
             retry_delay: Duration::from_millis(500),
-            pacing_delay: Duration::from_millis(100),
+            api_spacing: Duration::from_secs(1),
             sleep: Box::new(std::thread::sleep),
         }
     }
 }
+
+const CRATES_IO_API: &str = "https://crates.io/api/v1/";
 
 /// The longest `Retry-After` wait a lookup will honour; a longer ask fails it.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
@@ -238,6 +241,9 @@ pub struct CratesIoClient<T: Transport = UreqTransport> {
     cache_max_age: ChronoDuration,
     retry_policy: RetryPolicy,
     retry_after: RetryAfterBudget,
+    /// Whether this run has issued a crates.io API request yet; only the
+    /// requests after the first wait out `api_spacing`.
+    api_requested: Cell<bool>,
     /// Per-run memo of successfully fetched index records, keyed by crate
     /// name. Confined to this process; never persisted.
     fetched_index_records: HashMap<String, Vec<IndexRecord>>,
@@ -267,6 +273,7 @@ impl<T: Transport> CratesIoClient<T> {
             cache_max_age: ChronoDuration::hours(cache_max_age_hours as i64),
             retry_policy,
             retry_after: RetryAfterBudget::default(),
+            api_requested: Cell::new(false),
             fetched_index_records: HashMap::new(),
         }
     }
@@ -281,12 +288,6 @@ impl<T: Transport> CratesIoClient<T> {
             .save()
             .err()
             .map(|error| self.cache.save_warning(error))
-    }
-
-    /// Sleeps for the inter-request rate limit window. Called only from the
-    /// fetch methods' cache-miss path, so a cache hit never pays it.
-    fn pace(&self) {
-        (self.retry_policy.sleep)(self.retry_policy.pacing_delay);
     }
 
     /// Issues a GET, classifies HTTP errors, and parses JSON.
@@ -318,6 +319,12 @@ impl<T: Transport> CratesIoClient<T> {
     /// Returns `Ok(None)` on HTTP 404, same as `fetch_json`.
     fn fetch_body(&self, url: &str, subject: &str) -> Result<Option<Vec<u8>>, FetchError> {
         self.retry_after.pending.set(None);
+        // Every crates.io API request, retries included, starts at least
+        // `api_spacing` after the previous one. Cache and memo hits never
+        // reach here, so they never wait.
+        if url.starts_with(CRATES_IO_API) && self.api_requested.replace(true) {
+            (self.retry_policy.sleep)(self.retry_policy.api_spacing);
+        }
         let response = self
             .transport
             .get(url)
@@ -405,7 +412,7 @@ impl<T: Transport> CratesIoClient<T> {
         name: &str,
         version: &str,
     ) -> Result<Option<DateTime<Utc>>, FetchError> {
-        let url = format!("https://crates.io/api/v1/crates/{name}/{version}");
+        let url = format!("{CRATES_IO_API}crates/{name}/{version}");
         let subject = format!("for {name}@{version}");
         let data: Option<CrateVersionResponse> = self.fetch_json(&url, &subject)?;
         Ok(data.map(|d| d.version.created_at))
@@ -420,19 +427,17 @@ impl<T: Transport> CratesIoClient<T> {
             return Ok(Some(date));
         }
 
-        let result = self.with_retry(|client| {
+        self.with_retry(|client| {
             let result = client.fetch_publish_date_uncached(name, version)?;
             if let Some(date) = result {
                 client.cache.set_publish_date(name, version, date);
             }
             Ok(result)
-        });
-        self.pace();
-        result
+        })
     }
 
     fn fetch_all_versions_uncached(&self, name: &str) -> Result<Vec<CrateVersionInfo>, FetchError> {
-        let url = format!("https://crates.io/api/v1/crates/{name}");
+        let url = format!("{CRATES_IO_API}crates/{name}");
         let subject = format!("fetching versions for {name}");
         let data: Option<CrateResponse> = self.fetch_json(&url, &subject)?;
         Ok(data.map(|d| d.versions).unwrap_or_default())
@@ -443,15 +448,13 @@ impl<T: Transport> CratesIoClient<T> {
             return Ok(versions);
         }
 
-        let result = self.with_retry(|client| {
+        self.with_retry(|client| {
             let result = client.fetch_all_versions_uncached(name)?;
             if !result.is_empty() {
                 client.cache.set_all_versions(name, result.clone());
             }
             Ok(result)
-        });
-        self.pace();
-        result
+        })
     }
 
     fn fetch_index_record_uncached(&self, name: &str) -> Result<Vec<IndexRecord>, FetchError> {
@@ -597,12 +600,12 @@ pub(crate) mod test_support {
         format!(r#"{{"version":{{"created_at":"{created_at}"}}}}"#)
     }
 
-    /// Retry and pacing delays zeroed out, so the test suite doesn't sleep.
+    /// Retry and spacing delays zeroed out, so the test suite doesn't sleep.
     pub(crate) fn instant_policy(retry_count: u32) -> super::RetryPolicy {
         super::RetryPolicy {
             retry_count: super::NonZeroU32::new(retry_count).unwrap(),
             retry_delay: super::Duration::ZERO,
-            pacing_delay: super::Duration::ZERO,
+            api_spacing: super::Duration::ZERO,
             sleep: Box::new(|_| {}),
         }
     }
@@ -631,7 +634,6 @@ mod tests {
         version_body, version_url, versions_url,
     };
     use super::*;
-    use std::time::Instant;
     use tempfile::tempdir;
 
     fn record(vers: &str) -> IndexRecord {
@@ -747,25 +749,95 @@ mod tests {
     }
 
     #[test]
-    fn cache_hit_issues_no_request_and_skips_pacing_delay() {
-        let mut client = CratesIoClient::with_transport(
-            FakeTransport::default(),
-            None,
-            24,
-            RetryPolicy {
-                pacing_delay: Duration::from_millis(300),
-                ..instant_policy(3)
-            },
-        );
+    fn cache_hit_issues_no_request_and_never_waits() {
+        let (mut client, waits) = recording_client(FakeTransport::default());
         client
             .cache
             .set_publish_date("serde", "1.0.0", "2020-01-01T00:00:00Z".parse().unwrap());
 
-        let started = Instant::now();
         let result = client.fetch_publish_date("serde", "1.0.0").unwrap();
         assert!(result.is_some());
         assert_eq!(client.transport.call_count(), 0);
-        assert!(started.elapsed() < Duration::from_millis(300));
+        assert!(waits.borrow().is_empty());
+    }
+
+    #[test]
+    fn api_requests_start_one_second_apart() {
+        let transport = FakeTransport::default();
+        transport.push(
+            &version_url("serde", "1.0.0"),
+            ScriptedResponse::Http(200, OK_BODY.to_string()),
+        );
+        transport.push(
+            &versions_url("serde"),
+            ScriptedResponse::Http(200, r#"{"versions":[]}"#.to_string()),
+        );
+        transport.push(
+            &version_url("serde", "1.0.1"),
+            ScriptedResponse::Http(404, String::new()),
+        );
+        let (mut client, waits) = recording_client(transport);
+
+        client.fetch_publish_date("serde", "1.0.0").unwrap();
+        assert!(waits.borrow().is_empty(), "the first request never waits");
+        client.fetch_all_versions("serde").unwrap();
+        client.fetch_publish_date("serde", "1.0.1").unwrap();
+        assert_eq!(*waits.borrow(), [secs(1), secs(1)]);
+    }
+
+    #[test]
+    fn api_retries_keep_the_spacing_the_retry_delay_would_undercut() {
+        let url = version_url("serde", "1.0.0");
+        let transport = FakeTransport::default();
+        for _ in 0..3 {
+            transport.push(&url, ScriptedResponse::Http(503, String::new()));
+        }
+        let (mut client, waits) = recording_client(transport);
+
+        assert!(client.fetch_publish_date("serde", "1.0.0").is_err());
+        let retry_delay = Duration::from_millis(500);
+        assert_eq!(
+            *waits.borrow(),
+            [retry_delay, secs(1), retry_delay, secs(1)]
+        );
+    }
+
+    #[test]
+    fn cache_hits_between_api_requests_add_no_wait() {
+        let transport = FakeTransport::default();
+        transport.push(
+            &version_url("serde", "1.0.0"),
+            ScriptedResponse::Http(200, OK_BODY.to_string()),
+        );
+        transport.push(
+            &version_url("serde", "1.0.2"),
+            ScriptedResponse::Http(200, OK_BODY.to_string()),
+        );
+        let (mut client, waits) = recording_client(transport);
+
+        client.fetch_publish_date("serde", "1.0.0").unwrap();
+        client.fetch_publish_date("serde", "1.0.0").unwrap();
+        client.fetch_publish_date("serde", "1.0.2").unwrap();
+        assert_eq!(client.transport.call_count(), 2);
+        assert_eq!(*waits.borrow(), [secs(1)]);
+    }
+
+    #[test]
+    fn index_requests_are_not_paced_and_do_not_delay_the_first_api_request() {
+        let transport = FakeTransport::default();
+        for name in ["serde", "rand"] {
+            transport.push(&index_url(name), ScriptedResponse::Http(404, String::new()));
+        }
+        transport.push(
+            &version_url("serde", "1.0.0"),
+            ScriptedResponse::Http(200, OK_BODY.to_string()),
+        );
+        let (mut client, waits) = recording_client(transport);
+
+        client.fetch_index_record("serde", "1.0.0").unwrap();
+        client.fetch_index_record("rand", "1.0.0").unwrap();
+        client.fetch_publish_date("serde", "1.0.0").unwrap();
+        assert!(waits.borrow().is_empty());
     }
 
     #[test]
@@ -812,6 +884,16 @@ mod tests {
         )
     }
 
+    /// How many recorded waits are `Retry-After` waits: the others (the
+    /// 500 ms retry delay and the 1 s API spacing) are at most 1 s.
+    fn retry_after_waits(waits: &SleepLog) -> usize {
+        waits
+            .borrow()
+            .iter()
+            .filter(|wait| **wait > secs(1))
+            .count()
+    }
+
     #[test]
     fn retry_after_seconds_up_to_the_cap_replace_the_retry_delay() {
         for seconds in ["5", "60"] {
@@ -827,9 +909,10 @@ mod tests {
                     .unwrap()
                     .is_some()
             );
-            // The requested wait, then the post-lookup pacing delay.
+            // The requested wait replaces the retry delay; the retry then
+            // keeps the API's request spacing.
             let requested = secs(seconds.parse().unwrap());
-            assert_eq!(*waits.borrow(), [requested, Duration::from_millis(100)]);
+            assert_eq!(*waits.borrow(), [requested, secs(1)]);
         }
     }
 
@@ -858,7 +941,7 @@ mod tests {
             );
             assert_eq!(
                 *waits.borrow(),
-                [Duration::from_millis(500), Duration::from_millis(100)],
+                [Duration::from_millis(500), secs(1)],
                 "Retry-After {header:?}"
             );
         }
@@ -878,7 +961,7 @@ mod tests {
             "{error}"
         );
         assert_eq!(client.transport.call_count(), 1);
-        assert!(waits.borrow().iter().all(|wait| *wait < secs(1)));
+        assert!(waits.borrow().is_empty());
     }
 
     #[test]
@@ -893,14 +976,7 @@ mod tests {
         for version in ["1.0.0", "1.0.1", "1.0.2"] {
             client.fetch_publish_date("serde", version).unwrap();
         }
-        let long_waits = |waits: &SleepLog| {
-            waits
-                .borrow()
-                .iter()
-                .filter(|wait| **wait >= secs(1))
-                .count()
-        };
-        assert_eq!(long_waits(&waits), 3);
+        assert_eq!(retry_after_waits(&waits), 3);
 
         // The budget is spent: even a 1 s request no longer fits.
         let url = version_url("serde", "1.0.3");
@@ -913,7 +989,7 @@ mod tests {
             "{error}"
         );
         assert_eq!(client.transport.call_count(), 7);
-        assert_eq!(long_waits(&waits), 3);
+        assert_eq!(retry_after_waits(&waits), 3);
     }
 
     #[test]
@@ -954,14 +1030,7 @@ mod tests {
             );
         }
         assert_eq!(client.transport.call_count(), calls_before + 3);
-        assert_eq!(
-            waits
-                .borrow()
-                .iter()
-                .filter(|wait| **wait >= secs(1))
-                .count(),
-            3
-        );
+        assert_eq!(retry_after_waits(&waits), 3);
     }
 
     #[test]
