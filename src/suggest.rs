@@ -11,6 +11,8 @@ use std::path::Path;
 pub struct Constraint {
     pub blocker_name: String,
     pub blocker_version: Option<String>,
+    /// The lockfile source of a dependent blocker; `None` for manifest blockers.
+    pub blocker_source: Option<String>,
     pub req: VersionReq,
 }
 
@@ -18,6 +20,9 @@ pub struct Constraint {
 pub struct Blocker {
     pub name: String,
     pub version: Option<String>,
+    /// `{source}#{name}` when this lockfile dependent shares its name and
+    /// version with a package from another source; otherwise `None`.
+    pub package_spec: Option<String>,
     pub req: String,
     /// Whether this run also suggests downgrading this locked package.
     pub also_suggested: bool,
@@ -354,6 +359,7 @@ fn gather_constraints<T: Transport>(
                 constraints.extend(matching.iter().map(|req| Constraint {
                     blocker_name: manifest_label(&req.manifest, working_dir),
                     blocker_version: None,
+                    blocker_source: None,
                     req: req.req.clone(),
                 }));
                 false
@@ -429,6 +435,7 @@ fn registry_dependent_constraints<T: Transport>(
         .map(|req| Constraint {
             blocker_name: dependent.name.clone(),
             blocker_version: Some(dependent.version.clone()),
+            blocker_source: dependent.source.clone(),
             req,
         })
         .collect();
@@ -546,21 +553,36 @@ pub fn generate_suggestions<T: Transport>(
             WalkResult::Blocked {
                 newest_compliant,
                 blocker,
-            } => Outcome::Blocked {
-                package: violation.package.clone(),
-                package_spec,
-                locked_version: violation.version.clone(),
-                newest_compliant: newest_compliant.to_string(),
-                blocker: Blocker {
-                    // Whether this blocker's own locked version resolved to a
-                    // suggestion is only known once every violation has been
-                    // walked, so this starts false and is patched below.
-                    also_suggested: false,
-                    name: blocker.blocker_name,
-                    version: blocker.blocker_version,
-                    req: blocker.req.to_string(),
-                },
-            },
+            } => {
+                let is_ambiguous = blocker.blocker_version.as_deref().is_some_and(|version| {
+                    name_version_index
+                        .get(&(blocker.blocker_name.as_str(), version))
+                        .is_some_and(|packages| packages.len() > 1)
+                });
+                let blocker_spec = is_ambiguous.then(|| {
+                    build_package_spec(
+                        &blocker.blocker_name,
+                        blocker.blocker_source.as_deref(),
+                        true,
+                    )
+                });
+                Outcome::Blocked {
+                    package: violation.package.clone(),
+                    package_spec,
+                    locked_version: violation.version.clone(),
+                    newest_compliant: newest_compliant.to_string(),
+                    blocker: Blocker {
+                        // Whether this blocker's own locked version resolved to a
+                        // suggestion is only known once every violation has been
+                        // walked, so this starts false and is patched below.
+                        also_suggested: false,
+                        name: blocker.blocker_name,
+                        version: blocker.blocker_version,
+                        package_spec: blocker_spec,
+                        req: blocker.req.to_string(),
+                    },
+                }
+            }
             WalkResult::NoCompliantVersion => Outcome::NoCompliantVersion {
                 package: violation.package.clone(),
                 package_spec,

@@ -95,6 +95,8 @@ struct JsonSuggestion {
 struct JsonBlocker {
     name: String,
     version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    package_spec: Option<String>,
     requirement: String,
     also_suggested: bool,
 }
@@ -196,6 +198,7 @@ fn suggestion_json(outcome: &Outcome) -> JsonSuggestion {
             blocker: Some(JsonBlocker {
                 name: blocker.name.clone(),
                 version: blocker.version.clone(),
+                package_spec: blocker.package_spec.clone(),
                 requirement: blocker.req.clone(),
                 also_suggested: blocker.also_suggested,
             }),
@@ -398,6 +401,7 @@ mod tests {
                 blocker: crate::suggest::Blocker {
                     name: "consumer".into(),
                     version: Some("3.0.0".into()),
+                    package_spec: None,
                     req: "^2".into(),
                     also_suggested: true,
                 },
@@ -455,6 +459,35 @@ mod tests {
                     "reason": "registry request failed",
                 },
             ])
+        );
+    }
+
+    #[test]
+    fn blocker_package_spec_is_emitted_only_when_present() {
+        let mut report = completed_report(Summary::default());
+        report.suggestions = Some(vec![Outcome::Blocked {
+            package: "clap_derive".into(),
+            package_spec: "clap_derive".into(),
+            locked_version: "4.6.9".into(),
+            newest_compliant: "4.6.7".into(),
+            blocker: crate::suggest::Blocker {
+                name: "clap".into(),
+                version: Some("4.6.9".into()),
+                package_spec: Some("registry+https://example.test/index#clap".into()),
+                req: "=4.6.9".into(),
+                also_suggested: false,
+            },
+        }]);
+
+        assert_eq!(
+            render(&report)["suggestions"][0]["blocker"],
+            json!({
+                "name": "clap",
+                "version": "4.6.9",
+                "package_spec": "registry+https://example.test/index#clap",
+                "requirement": "=4.6.9",
+                "also_suggested": false,
+            })
         );
     }
 

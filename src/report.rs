@@ -317,9 +317,10 @@ fn other_outcome_line(outcome: &Outcome) -> Option<String> {
             blocker,
             ..
         } => {
-            let source = match &blocker.version {
-                Some(version) => format!("{} {version}", blocker.name),
-                None => blocker.name.clone(),
+            let source = match (&blocker.version, &blocker.package_spec) {
+                (Some(version), Some(spec)) => format!("{spec}@{version}"),
+                (Some(version), None) => format!("{} {version}", blocker.name),
+                (None, _) => blocker.name.clone(),
             };
             let also_suggested = if blocker.also_suggested {
                 format!(
@@ -367,6 +368,7 @@ mod tests {
                 blocker: Blocker {
                     name: "app".into(),
                     version: None,
+                    package_spec: None,
                     req: "=1.0.102".into(),
                     also_suggested: false,
                 },
@@ -390,5 +392,39 @@ mod tests {
                 "{line}"
             );
         }
+    }
+
+    #[test]
+    fn blocker_line_qualifies_the_blocker_only_when_it_has_a_spec() {
+        let blocked = |version: Option<&str>, package_spec: Option<&str>| Outcome::Blocked {
+            package: "clap_derive".into(),
+            package_spec: "clap_derive".into(),
+            locked_version: "4.6.9".into(),
+            newest_compliant: "4.6.7".into(),
+            blocker: Blocker {
+                name: "clap".into(),
+                version: version.map(Into::into),
+                package_spec: package_spec.map(Into::into),
+                req: "=4.6.9".into(),
+                also_suggested: false,
+            },
+        };
+        let tail = |outcome| {
+            let line = other_outcome_line(&outcome).unwrap();
+            line.split_once(", but ").unwrap().1.to_string()
+        };
+
+        assert_eq!(
+            tail(blocked(
+                Some("4.6.9"),
+                Some("registry+https://example.com/index#clap")
+            )),
+            "registry+https://example.com/index#clap@4.6.9 requires =4.6.9"
+        );
+        assert_eq!(
+            tail(blocked(Some("4.6.9"), None)),
+            "clap 4.6.9 requires =4.6.9"
+        );
+        assert_eq!(tail(blocked(None, None)), "clap requires =4.6.9");
     }
 }
