@@ -461,6 +461,16 @@ fn build_package_spec(name: &str, target_source: Option<&str>, is_ambiguous: boo
     }
 }
 
+/// The source-qualified pkgid of a lockfile blocker whose name and version
+/// are shared with a package from another source; otherwise `None`.
+fn blocker_package_spec(blocker: &Constraint, index: &NameVersionIndex) -> Option<String> {
+    let version = blocker.blocker_version.as_deref()?;
+    let source = blocker.blocker_source.as_deref()?;
+    let same_name_version = index.get(&(blocker.blocker_name.as_str(), version))?;
+    (same_name_version.len() > 1)
+        .then(|| build_package_spec(&blocker.blocker_name, Some(source), true))
+}
+
 /// Generates outcomes for "too new" violations; empty when there are none.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_suggestions<T: Transport>(
@@ -553,34 +563,22 @@ pub fn generate_suggestions<T: Transport>(
             WalkResult::Blocked {
                 newest_compliant,
                 blocker,
-            } => {
-                let is_ambiguous = blocker.blocker_version.as_deref().is_some_and(|version| {
-                    name_version_index
-                        .get(&(blocker.blocker_name.as_str(), version))
-                        .is_some_and(|packages| packages.len() > 1)
-                });
-                let blocker_spec = blocker
-                    .blocker_source
-                    .as_deref()
-                    .filter(|_| is_ambiguous)
-                    .map(|source| build_package_spec(&blocker.blocker_name, Some(source), true));
-                Outcome::Blocked {
-                    package: violation.package.clone(),
-                    package_spec,
-                    locked_version: violation.version.clone(),
-                    newest_compliant: newest_compliant.to_string(),
-                    blocker: Blocker {
-                        // Whether this blocker's own locked version resolved to a
-                        // suggestion is only known once every violation has been
-                        // walked, so this starts false and is patched below.
-                        also_suggested: false,
-                        name: blocker.blocker_name,
-                        version: blocker.blocker_version,
-                        package_spec: blocker_spec,
-                        req: blocker.req.to_string(),
-                    },
-                }
-            }
+            } => Outcome::Blocked {
+                package: violation.package.clone(),
+                package_spec,
+                locked_version: violation.version.clone(),
+                newest_compliant: newest_compliant.to_string(),
+                blocker: Blocker {
+                    // Whether this blocker's own locked version resolved to a
+                    // suggestion is only known once every violation has been
+                    // walked, so this starts false and is patched below.
+                    also_suggested: false,
+                    package_spec: blocker_package_spec(&blocker, &name_version_index),
+                    name: blocker.blocker_name,
+                    version: blocker.blocker_version,
+                    req: blocker.req.to_string(),
+                },
+            },
             WalkResult::NoCompliantVersion => Outcome::NoCompliantVersion {
                 package: violation.package.clone(),
                 package_spec,

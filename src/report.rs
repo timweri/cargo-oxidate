@@ -317,17 +317,17 @@ fn other_outcome_line(outcome: &Outcome) -> Option<String> {
             blocker,
             ..
         } => {
-            let short_source = match &blocker.version {
+            let name_and_version = match &blocker.version {
                 Some(version) => format!("{} {version}", blocker.name),
                 None => blocker.name.clone(),
             };
             let source = match (&blocker.version, &blocker.package_spec) {
                 (Some(version), Some(spec)) => format!("{spec}@{version}"),
-                _ => short_source.clone(),
+                _ => name_and_version.clone(),
             };
             let also_suggested = if blocker.also_suggested {
                 format!(
-                    " ({short_source} also has a suggested downgrade above; applying it may unblock this, so re-run to check)"
+                    " ({name_and_version} also has a suggested downgrade above; applying it may unblock this, so re-run to check)"
                 )
             } else {
                 String::new()
