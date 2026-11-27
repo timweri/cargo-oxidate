@@ -70,9 +70,11 @@ fn gather(
     requirements: &[DirectRequirement],
     locked_version: &str,
 ) -> GatheredConstraints {
+    let (dependents_index, name_version_index) = build_indexes(packages);
     gather_constraints(
         &mut fast_client(transport, None),
-        &build_indexes(packages).0,
+        &dependents_index,
+        &name_version_index,
         requirements,
         Path::new("/work"),
         "foo",
@@ -371,6 +373,52 @@ fn a_blocker_duplicated_at_the_same_name_version_is_source_qualified() {
 }
 
 #[test]
+fn blockers_carry_their_kind_and_an_unambiguous_package_has_a_bare_spec() {
+    let blocked = |transport, packages: &[Package], requirements: &[DirectRequirement]| {
+        let violations = [too_new("serde", "1.5.0")];
+        let outcomes = suggestions(
+            transport,
+            &violations,
+            packages,
+            requirements,
+            Path::new("/work"),
+        );
+        let Some(Outcome::Blocked { blocker, .. }) = outcomes.into_iter().next() else {
+            panic!("expected a blocked outcome");
+        };
+        blocker
+    };
+
+    let transport = FakeTransport::default();
+    transport.versions("serde", &[("1.5.0", 5), ("1.4.0", 50)]);
+    transport.index_ok(
+        "app",
+        r#"{"vers":"1.0.0","deps":[{"name":"serde","req":"^1.5"}]}"#,
+    );
+    let packages = [
+        pkg("serde", "1.5.0", &[]),
+        pkg("app", "1.0.0", &[("serde", "1.5.0")]),
+    ];
+    let blocker = blocked(transport, &packages, &[]);
+    assert_eq!(blocker.name, "app");
+    assert!(matches!(
+        &blocker.kind,
+        BlockerKind::Package { version, package_spec } if version == "1.0.0" && package_spec == "app"
+    ));
+
+    let transport = FakeTransport::default();
+    transport.versions("serde", &[("1.5.0", 5), ("1.4.0", 50)]);
+    let packages = [
+        pkg("serde", "1.5.0", &[]),
+        non_registry_pkg("app", "0.1.0", &[("serde", "1.5.0")]),
+    ];
+    let requirements = [local_requirement("app", "0.1.0", "serde", "^1.5")];
+    let blocker = blocked(transport, &packages, &requirements);
+    assert_eq!(blocker.name, "Cargo.toml");
+    assert!(matches!(blocker.kind, BlockerKind::Manifest));
+}
+
+#[test]
 fn also_suggested_stays_keyed_by_name_and_version_when_the_blocker_is_duplicated() {
     // The crates.io `app 1.1.0` blocks serde and has its own suggestion; a
     // git `app 1.1.0` shares its name and version. The block still points at
@@ -468,10 +516,62 @@ fn git_dependents_are_reported_once_per_name() {
 }
 
 #[test]
+fn an_ambiguous_unverified_dependent_is_labelled_with_its_spec() {
+    // crates.io `app 1.0.0` is verified through the index. The git `app 1.0.0`
+    // shares its name and version, so its label must say which one it is. The
+    // git source's commit fragment must not survive into the label, or it
+    // would not be a valid pkgid.
+    let transport = FakeTransport::default();
+    transport.index_ok(
+        "app",
+        r#"{"vers":"1.0.0","deps":[{"name":"foo","req":"^1.5"}]}"#,
+    );
+    let packages = [
+        pkg("app", "1.0.0", &[("foo", "1.9.0")]),
+        external_pkg("app", "1.0.0", GIT_SOURCE, &[("foo", "1.9.0")]),
+    ];
+    let gathered = gather(transport, &packages, &[], "1.9.0");
+    assert_eq!(reqs(&gathered), ["^1.5"]);
+    assert_eq!(
+        gathered.unverified_dependents,
+        ["git+https://github.com/example/app#app"]
+    );
+}
+
+#[test]
+fn unverified_dependents_are_deduplicated_by_label() {
+    // Two versions of an unambiguous git dependent collapse to its name; the
+    // same name and version from two distinct sources stay distinct.
+    let other_git = "git+https://github.com/example/other#1111111111111111111111111111111111111111";
+    let packages = [
+        external_pkg("parent", "1.0.0", GIT_SOURCE, &[("foo", "1.9.0")]),
+        external_pkg("parent", "2.0.0", GIT_SOURCE, &[("foo", "1.9.0")]),
+        external_pkg("twin", "1.0.0", GIT_SOURCE, &[("foo", "1.9.0")]),
+        external_pkg("twin", "1.0.0", other_git, &[("foo", "1.9.0")]),
+    ];
+    let gathered = gather(FakeTransport::default(), &packages, &[], "1.9.0");
+    assert_eq!(
+        gathered.unverified_dependents,
+        [
+            "parent",
+            "git+https://github.com/example/app#twin",
+            "git+https://github.com/example/other#twin",
+        ]
+    );
+}
+
+#[test]
 fn external_dependent_sharing_a_local_packages_identity_stays_unverified() {
     // The local "app" manifest's requirement was never the external
     // "app" dependent's own, so it neither verifies nor constrains it.
-    for source in [GIT_SOURCE, ALT_REGISTRY_SOURCE] {
+    // The two share a name and version, so the external one is labelled by spec.
+    for (source, label) in [
+        (GIT_SOURCE, "git+https://github.com/example/app#app"),
+        (
+            ALT_REGISTRY_SOURCE,
+            "registry+https://example.com/priv-index#app",
+        ),
+    ] {
         let packages = [
             external_pkg("app", "1.0.0", source, &[("foo", "1.5.0")]),
             non_registry_pkg("app", "1.0.0", &[]),
@@ -479,7 +579,7 @@ fn external_dependent_sharing_a_local_packages_identity_stays_unverified() {
         let requirements = [local_requirement("app", "1.0.0", "foo", "^1.5")];
         let gathered = gather(FakeTransport::default(), &packages, &requirements, "1.5.0");
         assert!(gathered.constraints.is_empty(), "{source}");
-        assert_eq!(gathered.unverified_dependents, ["app"], "{source}");
+        assert_eq!(gathered.unverified_dependents, [label], "{source}");
     }
 }
 
@@ -641,9 +741,11 @@ fn stale_cached_index_records_missing_dependent_version_are_refetched() {
         r#"{"vers":"1.0.1","deps":[{"name":"foo","req":"^1.5"}]}"#,
     );
     let packages = [pkg("app", "1.0.1", &[("foo", "1.5.0")])];
+    let (dependents_index, name_version_index) = build_indexes(&packages);
     let gathered = gather_constraints(
         &mut fast_client(transport, Some(&cache_path)),
-        &build_indexes(&packages).0,
+        &dependents_index,
+        &name_version_index,
         &[],
         Path::new("/work"),
         "foo",

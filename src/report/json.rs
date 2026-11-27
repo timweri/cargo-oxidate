@@ -1,5 +1,5 @@
-use super::{Diagnostic, RunReport, Summary, Violation, ViolationKind};
-use crate::suggest::Outcome;
+use super::{Diagnostic, RunReport, Summary, Violation, ViolationKind, shell_command, update_argv};
+use crate::suggest::{BlockerKind, Outcome};
 use chrono::SecondsFormat;
 use serde::Serialize;
 
@@ -32,7 +32,6 @@ struct JsonSummary {
     unsupported_packages: Option<usize>,
     excluded_missing_packages: Option<usize>,
     failed_packages: Option<usize>,
-    not_checked_packages: Option<usize>,
     violations: usize,
     duration_ms: u128,
 }
@@ -77,6 +76,9 @@ struct JsonSuggestion {
     package_spec: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     command: Option<String>,
+    /// `command` as an argument array, unquoted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command_argv: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     suggested_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -93,9 +95,13 @@ struct JsonSuggestion {
 
 #[derive(Serialize)]
 struct JsonBlocker {
+    /// `"package"` or `"manifest"`.
+    kind: &'static str,
     name: String,
+    /// Present for package blockers only.
+    #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<String>,
-    /// Omitted unless `name` and `version` are ambiguous in the lockfile.
+    /// Present for package blockers only: the bare name when unambiguous.
     #[serde(skip_serializing_if = "Option::is_none")]
     package_spec: Option<String>,
     requirement: String,
@@ -111,7 +117,6 @@ impl JsonSummary {
             unsupported_packages: summary.map(|summary| summary.unsupported_packages),
             excluded_missing_packages: summary.map(|summary| summary.excluded_missing_packages),
             failed_packages: summary.map(|summary| summary.failed_packages),
-            not_checked_packages: summary.map(|summary| summary.not_checked_packages),
             violations,
             duration_ms,
         }
@@ -171,19 +176,21 @@ fn suggestion_json(outcome: &Outcome) -> JsonSuggestion {
             suggested_version,
             suggested_age_days,
             unverified_dependents,
-        } => JsonSuggestion {
-            kind: "suggested",
-            package: package.clone(),
-            locked_version: locked_version.clone(),
-            package_spec: Some(package_spec.clone()),
-            command: Some(format!(
-                "cargo update -p {package_spec}@{locked_version} --precise {suggested_version}"
-            )),
-            suggested_version: Some(suggested_version.clone()),
-            suggested_age_days: Some(*suggested_age_days),
-            unverified_dependents: Some(unverified_dependents.clone()),
-            ..Default::default()
-        },
+        } => {
+            let argv = update_argv(package_spec, locked_version, suggested_version);
+            JsonSuggestion {
+                kind: "suggested",
+                package: package.clone(),
+                locked_version: locked_version.clone(),
+                package_spec: Some(package_spec.clone()),
+                command: Some(shell_command(&argv)),
+                command_argv: Some(argv),
+                suggested_version: Some(suggested_version.clone()),
+                suggested_age_days: Some(*suggested_age_days),
+                unverified_dependents: Some(unverified_dependents.clone()),
+                ..Default::default()
+            }
+        }
         Outcome::Blocked {
             package,
             package_spec,
@@ -196,12 +203,22 @@ fn suggestion_json(outcome: &Outcome) -> JsonSuggestion {
             locked_version: locked_version.clone(),
             package_spec: Some(package_spec.clone()),
             newest_compliant: Some(newest_compliant.clone()),
-            blocker: Some(JsonBlocker {
-                name: blocker.name.clone(),
-                version: blocker.version.clone(),
-                package_spec: blocker.package_spec.clone(),
-                requirement: blocker.req.clone(),
-                also_suggested: blocker.also_suggested,
+            blocker: Some({
+                let (kind, version, package_spec) = match &blocker.kind {
+                    BlockerKind::Package {
+                        version,
+                        package_spec,
+                    } => ("package", Some(version), Some(package_spec)),
+                    BlockerKind::Manifest => ("manifest", None, None),
+                };
+                JsonBlocker {
+                    kind,
+                    name: blocker.name.clone(),
+                    version: version.cloned(),
+                    package_spec: package_spec.cloned(),
+                    requirement: blocker.req.clone(),
+                    also_suggested: blocker.also_suggested,
+                }
             }),
             ..Default::default()
         },
@@ -232,10 +249,10 @@ fn suggestion_json(outcome: &Outcome) -> JsonSuggestion {
     }
 }
 
-/// Serializes a CLI report as schema version 1.
+/// Serializes a CLI report as schema version 2.
 pub fn render_json(report: &RunReport) -> serde_json::Result<String> {
     serde_json::to_string(&JsonReport {
-        schema_version: 1,
+        schema_version: 2,
         status: match report.exit_code() {
             0 => "passed",
             1 => "violations",
@@ -331,7 +348,8 @@ mod tests {
         });
 
         let json = render(&report);
-        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["schema_version"], 2);
+        assert!(json["summary"].get("not_checked_packages").is_none());
         assert_eq!(json["status"], "error");
         assert_eq!(json["summary"]["violations"], 3);
         assert_eq!(json["errors"][0]["category"], "lookup");
@@ -401,8 +419,10 @@ mod tests {
                 newest_compliant: "1.9.0".into(),
                 blocker: crate::suggest::Blocker {
                     name: "consumer".into(),
-                    version: Some("3.0.0".into()),
-                    package_spec: None,
+                    kind: BlockerKind::Package {
+                        version: "3.0.0".into(),
+                        package_spec: "consumer".into(),
+                    },
                     req: "^2".into(),
                     also_suggested: true,
                 },
@@ -428,7 +448,15 @@ mod tests {
                     "package": "widget",
                     "locked_version": "2.0.0",
                     "package_spec": "registry+https://example.test/index#widget",
-                    "command": "cargo update -p registry+https://example.test/index#widget@2.0.0 --precise 1.9.0",
+                    "command": "cargo update -p \"registry+https://example.test/index#widget@2.0.0\" --precise 1.9.0",
+                    "command_argv": [
+                        "cargo",
+                        "update",
+                        "-p",
+                        "registry+https://example.test/index#widget@2.0.0",
+                        "--precise",
+                        "1.9.0"
+                    ],
                     "suggested_version": "1.9.0",
                     "suggested_age_days": 30,
                     "unverified_dependents": ["consumer"],
@@ -440,8 +468,10 @@ mod tests {
                     "package_spec": "registry+https://example.test/index#blocked",
                     "newest_compliant": "1.9.0",
                     "blocker": {
+                        "kind": "package",
                         "name": "consumer",
                         "version": "3.0.0",
+                        "package_spec": "consumer",
                         "requirement": "^2",
                         "also_suggested": true,
                     },
@@ -473,8 +503,10 @@ mod tests {
             newest_compliant: "4.6.7".into(),
             blocker: crate::suggest::Blocker {
                 name: "clap".into(),
-                version: Some("4.6.9".into()),
-                package_spec: Some("registry+https://example.test/index#clap".into()),
+                kind: BlockerKind::Package {
+                    version: "4.6.9".into(),
+                    package_spec: "registry+https://example.test/index#clap".into(),
+                },
                 req: "=4.6.9".into(),
                 also_suggested: false,
             },
@@ -483,9 +515,37 @@ mod tests {
         assert_eq!(
             render(&report)["suggestions"][0]["blocker"],
             json!({
+                "kind": "package",
                 "name": "clap",
                 "version": "4.6.9",
                 "package_spec": "registry+https://example.test/index#clap",
+                "requirement": "=4.6.9",
+                "also_suggested": false,
+            })
+        );
+    }
+
+    #[test]
+    fn manifest_blocker_has_a_kind_and_neither_version_nor_package_spec() {
+        let mut report = completed_report(Summary::default());
+        report.suggestions = Some(vec![Outcome::Blocked {
+            package: "clap_derive".into(),
+            package_spec: "clap_derive".into(),
+            locked_version: "4.6.9".into(),
+            newest_compliant: "4.6.7".into(),
+            blocker: crate::suggest::Blocker {
+                name: "app/Cargo.toml".into(),
+                kind: BlockerKind::Manifest,
+                req: "=4.6.9".into(),
+                also_suggested: false,
+            },
+        }]);
+
+        assert_eq!(
+            render(&report)["suggestions"][0]["blocker"],
+            json!({
+                "kind": "manifest",
+                "name": "app/Cargo.toml",
                 "requirement": "=4.6.9",
                 "also_suggested": false,
             })

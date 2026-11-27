@@ -145,6 +145,14 @@ fn suggest_fix_cli_reports_mixed_outcomes_and_preserves_project_files() {
         "stdout was:\n{stdout}"
     );
     assert!(stdout.contains("They do not run Cargo's resolver"));
+    for package in ["beta", "gamma", "delta"] {
+        assert!(
+            !stdout
+                .lines()
+                .any(|line| line.contains("cargo update") && line.contains(&format!("{package}@"))),
+            "no command expected for {package}; stdout was:\n{stdout}"
+        );
+    }
     assert_eq!(
         fs::read(project.path().join("Cargo.toml")).unwrap(),
         manifest_before
@@ -236,8 +244,15 @@ fn suggest_fix_cli_retains_best_effort_qualification() {
         ],
     );
     edit_cache(&cache, |cache| {
+        // The record must be for the locked `2.0.0`, or the cache treats it as
+        // a miss and the run reaches out to the network. The unparseable `req`
+        // is what leaves the requirement unverified.
         cache["index_records"]["consumer"]["records"] = serde_json::json!([{
-            "vers": "1.0.0", "yanked": false, "deps": []
+            "vers": "2.0.0",
+            "yanked": false,
+            "deps": [
+                { "name": "gamma", "req": "not a requirement", "kind": null, "target": null, "optional": false, "package": null }
+            ]
         }]);
     });
     let output = run_suggest_fix(project.path(), &cache);
@@ -259,6 +274,75 @@ fn suggest_fix_cli_retains_best_effort_qualification() {
         stdout.contains("Build or test after applying each suggestion"),
         "stdout was:\n{stdout}"
     );
+}
+
+#[test]
+fn violations_without_suggest_fix_print_no_downgrade_output() {
+    let project = copied_fixture();
+    let cache = write_cache(
+        project.path(),
+        &[
+            ("alpha", "1.5.0", 2, vec![("1.5.0", 2), ("1.4.0", 80)]),
+            ("beta", "1.5.0", 100, vec![]),
+            ("gamma", "1.5.0", 100, vec![]),
+            ("delta", "1.5.0", 100, vec![]),
+            ("consumer", "2.0.0", 100, vec![]),
+        ],
+    );
+    let output = run_oxidate(
+        project.path(),
+        &[
+            "--min-age-days",
+            "30",
+            "--cache-path",
+            cache.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("alpha@1.5.0: Below minimum age 30 days"),
+        "stdout was:\n{stdout}"
+    );
+    for absent in [
+        "cargo update",
+        "Suggested downgrades",
+        "Other downgrade outcomes",
+    ] {
+        assert!(!stdout.contains(absent), "stdout was:\n{stdout}");
+    }
+}
+
+#[test]
+fn suggest_fix_over_a_compliant_registry_package_prints_no_command() {
+    let project = copied_fixture();
+    let cache = write_cache(
+        project.path(),
+        &[
+            ("alpha", "1.5.0", 100, vec![]),
+            ("beta", "1.5.0", 100, vec![]),
+            ("gamma", "1.5.0", 100, vec![]),
+            ("delta", "1.5.0", 100, vec![]),
+            ("consumer", "2.0.0", 100, vec![]),
+        ],
+    );
+    let output = run_suggest_fix(project.path(), &cache);
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("No dependency age violations found."),
+        "stdout was:\n{stdout}"
+    );
+    assert!(!stdout.contains("cargo update"), "stdout was:\n{stdout}");
+}
+
+#[test]
+fn suggest_fix_without_min_age_days_is_a_usage_error() {
+    let project = copied_fixture();
+    let output = run_oxidate(project.path(), &["--suggest-fix"]);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("--min-age-days"), "stderr was:\n{stderr}");
 }
 
 #[cfg(unix)]
@@ -376,11 +460,20 @@ fn write_local_registry(registry: &Path, name: &str, version: &str) {
         .unwrap();
 }
 
+/// Cargo with an empty `CARGO_HOME`, so no user-global configuration applies.
+fn isolated_cargo(project: &Path, cargo_home: &Path) -> Command {
+    let mut command = Command::new("cargo");
+    command.env("CARGO_HOME", cargo_home).current_dir(project);
+    command
+}
+
 #[test]
 fn printed_source_qualified_command_updates_only_the_registry_package() {
     let root = tempdir().unwrap();
     let registry = root.path().join("registry");
     let project = root.path().join("project");
+    let cargo_home = root.path().join("cargo-home");
+    fs::create_dir(&cargo_home).unwrap();
     write_local_registry(&registry, "semver", "1.0.28");
     write_local_registry(&registry, "semver", "1.0.27");
     write_crate_source(&project.join("vendor-semver"), "semver", "1.0.28");
@@ -389,9 +482,8 @@ fn printed_source_qualified_command_updates_only_the_registry_package() {
     fs::write(project.join("src/main.rs"), "fn main() {}\n").unwrap();
     fs::write(project.join(".cargo/config.toml"), format!("[source.local-vendor]\nlocal-registry = \"{}\"\n\n[source.crates-io]\nreplace-with = \"local-vendor\"\n", registry.display())).unwrap();
     fs::write(project.join("Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nsemver = \"1\"\nsemver-path = { package = \"semver\", path = \"vendor-semver\" }\n").unwrap();
-    let generated = Command::new("cargo")
+    let generated = isolated_cargo(&project, &cargo_home)
         .args(["generate-lockfile", "--offline"])
-        .current_dir(&project)
         .output()
         .unwrap();
     assert!(
@@ -403,7 +495,7 @@ fn printed_source_qualified_command_updates_only_the_registry_package() {
     // The abbreviated spec really is ambiguous in this fixture; otherwise the
     // printed source-qualified command below proves nothing.
     let lock_before = fs::read_to_string(project.join("Cargo.lock")).unwrap();
-    let abbreviated = Command::new("cargo")
+    let abbreviated = isolated_cargo(&project, &cargo_home)
         .args([
             "update",
             "-p",
@@ -412,7 +504,6 @@ fn printed_source_qualified_command_updates_only_the_registry_package() {
             "1.0.27",
             "--offline",
         ])
-        .current_dir(&project)
         .output()
         .unwrap();
     assert!(
@@ -438,20 +529,65 @@ fn printed_source_qualified_command_updates_only_the_registry_package() {
         !stdout.contains("Other downgrade outcomes"),
         "stdout was:\n{stdout}"
     );
-    let line = stdout
+    let printed = stdout
         .lines()
         .find(|line| line.trim_start().starts_with("cargo update "))
         .unwrap_or_else(|| panic!("a rendered cargo update command; stdout was:\n{stdout}"));
-    let command = line.split(" #").next().unwrap().trim();
-    let args: Vec<_> = command.split_whitespace().skip(1).collect();
-    assert!(
-        args.iter().any(|arg| arg.contains('#')),
-        "expected source-qualified package spec: {command}"
+
+    let output = run_oxidate(
+        &project,
+        &[
+            "--min-age-days",
+            "30",
+            "--suggest-fix",
+            "--format",
+            "json",
+            "--cache-path",
+            cache.to_str().unwrap(),
+        ],
     );
-    let applied = Command::new("cargo")
-        .args(args)
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let suggestion = &json["suggestions"][0];
+    let command = suggestion["command"].as_str().unwrap();
+    let argv: Vec<&str> = suggestion["command_argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|arg| arg.as_str().unwrap())
+        .collect();
+    assert!(
+        printed.trim_start().starts_with(&format!("{command} # ")),
+        "printed: {printed}\ncommand: {command}"
+    );
+    assert!(
+        argv.iter().any(|arg| arg.contains('#')),
+        "expected source-qualified package spec: {argv:?}"
+    );
+
+    // The shell string and the argv must each work from a fresh project.
+    if cfg!(unix) {
+        let by_shell = root.path().join("by-shell");
+        copy_dir(&project, &by_shell);
+        let applied = Command::new("sh")
+            .args(["-c", &format!("{command} --offline")])
+            .env("CARGO_HOME", &cargo_home)
+            .current_dir(&by_shell)
+            .output()
+            .unwrap();
+        assert!(
+            applied.status.success(),
+            "{}",
+            String::from_utf8_lossy(&applied.stderr)
+        );
+        assert_only_the_registry_package_was_downgraded(&by_shell);
+    }
+
+    let by_argv = root.path().join("by-argv");
+    copy_dir(&project, &by_argv);
+    let applied = isolated_cargo(&by_argv, &cargo_home)
+        .args(&argv[1..])
         .arg("--offline")
-        .current_dir(&project)
         .output()
         .unwrap();
     assert!(
@@ -459,7 +595,23 @@ fn printed_source_qualified_command_updates_only_the_registry_package() {
         "{}",
         String::from_utf8_lossy(&applied.stderr)
     );
+    assert_only_the_registry_package_was_downgraded(&by_argv);
+}
 
+fn copy_dir(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+fn assert_only_the_registry_package_was_downgraded(project: &Path) {
     let lock = cargo_lock::Lockfile::load(project.join("Cargo.lock")).unwrap();
     assert!(
         lock.packages
@@ -533,8 +685,76 @@ fn suggest_fix_cli_qualifies_an_ambiguous_blocker_in_text_and_json() {
     );
     assert_eq!(output.status.code(), Some(1));
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let blocker = &json["suggestions"][0]["blocker"];
+    assert_eq!(blocker["kind"], "package", "json was:\n{json:#}");
+    assert_eq!(blocker["version"], "2.0.0", "json was:\n{json:#}");
+    assert_eq!(blocker["package_spec"], spec, "json was:\n{json:#}");
+}
+
+#[test]
+fn suggest_fix_cli_labels_an_ambiguous_unverified_dependent_by_spec() {
+    // crates.io `app 1.0.0` is verified through its index record, while the
+    // git `app 1.0.0` cannot be, and shares its name and version. Only the git
+    // one's label must be source-qualified, with a single `#`.
+    let project = tempdir().unwrap();
+    fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname = \"root\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    let git = "git+https://example.com/app#0000000000000000000000000000000000000000";
+    let registry = "registry+https://github.com/rust-lang/crates.io-index";
+    let checksum = "0".repeat(64);
+    fs::write(
+        project.path().join("Cargo.lock"),
+        format!(
+            "version = 4\n\n[[package]]\nname = \"root\"\nversion = \"0.1.0\"\ndependencies = [\n \"app 1.0.0 ({git})\",\n \"app 1.0.0 ({registry})\",\n]\n\n[[package]]\nname = \"app\"\nversion = \"1.0.0\"\nsource = \"{git}\"\ndependencies = [\n \"gamma\",\n]\n\n[[package]]\nname = \"app\"\nversion = \"1.0.0\"\nsource = \"{registry}\"\nchecksum = \"{checksum}\"\ndependencies = [\n \"gamma\",\n]\n\n[[package]]\nname = \"gamma\"\nversion = \"1.5.0\"\nsource = \"{registry}\"\nchecksum = \"{checksum}\"\n"
+        ),
+    )
+    .unwrap();
+    let cache = write_cache(
+        project.path(),
+        &[
+            ("gamma", "1.5.0", 2, vec![("1.5.0", 2), ("1.4.0", 80)]),
+            ("app", "1.0.0", 100, vec![("1.0.0", 100)]),
+        ],
+    );
+    edit_cache(&cache, |cache| {
+        cache["index_records"]["app"]["records"] = serde_json::json!([{
+            "vers": "1.0.0",
+            "yanked": false,
+            "deps": [
+                { "name": "gamma", "req": "^1.0", "kind": null, "target": null, "optional": false, "package": null }
+            ]
+        }]);
+    });
+    let label = "git+https://example.com/app#app";
+
+    let output = run_suggest_fix(project.path(), &cache);
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains(&format!("(requirement of {label} unverified)")),
+        "stdout was:\n{stdout}"
+    );
+
+    let output = run_oxidate(
+        project.path(),
+        &[
+            "--min-age-days",
+            "30",
+            "--suggest-fix",
+            "--format",
+            "json",
+            "--cache-path",
+            cache.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
-        json["suggestions"][0]["blocker"]["package_spec"], spec,
+        json["suggestions"][0]["unverified_dependents"],
+        serde_json::json!([label]),
         "json was:\n{json:#}"
     );
 }

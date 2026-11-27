@@ -1,4 +1,4 @@
-use crate::suggest::Outcome;
+use crate::suggest::{BlockerKind, Outcome};
 use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -65,9 +65,6 @@ pub struct Summary {
     pub unsupported_packages: usize,
     pub excluded_missing_packages: usize,
     pub failed_packages: usize,
-    /// Kept for JSON schema v1 compatibility; currently always 0 because no
-    /// code path skips eligible packages.
-    pub not_checked_packages: usize,
 }
 
 pub struct Diagnostic {
@@ -175,14 +172,13 @@ fn print_policy(policy: &Policy, lockfile: &Path) {
 fn print_summary(summary: &Summary, violations: usize, duration: Duration) {
     println!("Coverage");
     println!(
-        "  packages: total={}, checked={}, exempt={}, unsupported={}, excluded missing={}, failed={}, not checked={}",
+        "  packages: total={}, checked={}, exempt={}, unsupported={}, excluded missing={}, failed={}",
         summary.total_packages,
         summary.checked_packages,
         summary.exempt_packages,
         summary.unsupported_packages,
         summary.excluded_missing_packages,
         summary.failed_packages,
-        summary.not_checked_packages,
     );
     println!("  violations: {violations}");
     println!("  elapsed: {} ms", duration.as_millis());
@@ -302,9 +298,44 @@ fn suggestion_line(outcome: &Outcome) -> Option<String> {
             unverified_dependents.join(", ")
         )
     };
+    let command = shell_command(&update_argv(
+        package_spec,
+        locked_version,
+        suggested_version,
+    ));
     Some(format!(
-        "  cargo update -p {package_spec}@{locked_version} --precise {suggested_version} # {suggested_age_days} days old{annotation}"
+        "  {command} # {suggested_age_days} days old{annotation}"
     ))
+}
+
+/// The `cargo update` argv that applies a suggested downgrade, unquoted.
+fn update_argv(package_spec: &str, locked_version: &str, suggested_version: &str) -> Vec<String> {
+    vec![
+        "cargo".to_string(),
+        "update".to_string(),
+        "-p".to_string(),
+        format!("{package_spec}@{locked_version}"),
+        "--precise".to_string(),
+        suggested_version.to_string(),
+    ]
+}
+
+/// Renders an argv as a shell command. An argument with a character outside
+/// `[A-Za-z0-9_@%+=:,./-]` is put in double quotes, which sh, cmd.exe and
+/// PowerShell accept. The only such argument here is a source-qualified spec,
+/// which has nothing those shells expand inside double quotes.
+fn shell_command(argv: &[String]) -> String {
+    argv.iter()
+        .map(|arg| {
+            let plain = |c: char| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c);
+            if arg.chars().all(plain) {
+                arg.clone()
+            } else {
+                format!("\"{arg}\"")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn other_outcome_line(outcome: &Outcome) -> Option<String> {
@@ -317,13 +348,21 @@ fn other_outcome_line(outcome: &Outcome) -> Option<String> {
             blocker,
             ..
         } => {
-            let name_and_version = match &blocker.version {
-                Some(version) => format!("{} {version}", blocker.name),
-                None => blocker.name.clone(),
-            };
-            let source = match (&blocker.version, &blocker.package_spec) {
-                (Some(version), Some(spec)) => format!("{spec}@{version}"),
-                _ => name_and_version.clone(),
+            let (name_and_version, source) = match &blocker.kind {
+                BlockerKind::Manifest => (blocker.name.clone(), blocker.name.clone()),
+                BlockerKind::Package {
+                    version,
+                    package_spec,
+                } => {
+                    let name_and_version = format!("{} {version}", blocker.name);
+                    // A bare spec leaves the short form; a qualified one names the source.
+                    let source = if *package_spec == blocker.name {
+                        name_and_version.clone()
+                    } else {
+                        format!("{package_spec}@{version}")
+                    };
+                    (name_and_version, source)
+                }
             };
             let also_suggested = if blocker.also_suggested {
                 format!(
@@ -361,6 +400,36 @@ mod tests {
     use crate::suggest::Blocker;
 
     #[test]
+    fn update_argv_is_unquoted_and_shell_command_quotes_only_what_needs_it() {
+        let shell = |spec: &str| shell_command(&update_argv(spec, "1.0.28", "1.0.27"));
+
+        assert_eq!(
+            update_argv("semver", "1.0.28", "1.0.27"),
+            [
+                "cargo",
+                "update",
+                "-p",
+                "semver@1.0.28",
+                "--precise",
+                "1.0.27"
+            ]
+        );
+        assert_eq!(
+            shell("semver"),
+            "cargo update -p semver@1.0.28 --precise 1.0.27"
+        );
+        let spec = "registry+https://example.com/index#semver";
+        assert_eq!(
+            update_argv(spec, "1.0.28", "1.0.27")[3],
+            format!("{spec}@1.0.28")
+        );
+        assert_eq!(
+            shell(spec),
+            format!("cargo update -p \"{spec}@1.0.28\" --precise 1.0.27")
+        );
+    }
+
+    #[test]
     fn non_suggest_outcome_lines_name_the_package_by_its_spec() {
         let outcomes = [
             Outcome::Blocked {
@@ -370,8 +439,7 @@ mod tests {
                 newest_compliant: "1.0.100".into(),
                 blocker: Blocker {
                     name: "app".into(),
-                    version: None,
-                    package_spec: None,
+                    kind: BlockerKind::Manifest,
                     req: "=1.0.102".into(),
                     also_suggested: false,
                 },
@@ -398,9 +466,9 @@ mod tests {
     }
 
     #[test]
-    fn blocker_line_qualifies_the_blocker_only_when_it_has_a_spec() {
+    fn blocker_line_qualifies_the_blocker_only_when_its_spec_is_not_the_bare_name() {
         let spec = "registry+https://example.com/index#clap";
-        let tail = |version: Option<&str>, package_spec: Option<&str>, also_suggested| {
+        let tail = |kind: BlockerKind, also_suggested| {
             let line = other_outcome_line(&Outcome::Blocked {
                 package: "clap_derive".into(),
                 package_spec: "clap_derive".into(),
@@ -408,8 +476,7 @@ mod tests {
                 newest_compliant: "4.6.7".into(),
                 blocker: Blocker {
                     name: "clap".into(),
-                    version: version.map(Into::into),
-                    package_spec: package_spec.map(Into::into),
+                    kind,
                     req: "=4.6.9".into(),
                     also_suggested,
                 },
@@ -417,19 +484,20 @@ mod tests {
             .unwrap();
             line.split_once(", but ").unwrap().1.to_string()
         };
+        let package = |package_spec: &str| BlockerKind::Package {
+            version: "4.6.9".into(),
+            package_spec: package_spec.into(),
+        };
 
-        assert_eq!(tail(None, None, false), "clap requires =4.6.9");
+        assert_eq!(tail(BlockerKind::Manifest, false), "clap requires =4.6.9");
+        assert_eq!(tail(package("clap"), false), "clap 4.6.9 requires =4.6.9");
         assert_eq!(
-            tail(Some("4.6.9"), None, false),
-            "clap 4.6.9 requires =4.6.9"
-        );
-        assert_eq!(
-            tail(Some("4.6.9"), Some(spec), false),
+            tail(package(spec), false),
             format!("{spec}@4.6.9 requires =4.6.9")
         );
         // The note keeps the short form rather than repeating the spec.
         assert_eq!(
-            tail(Some("4.6.9"), Some(spec), true),
+            tail(package(spec), true),
             format!(
                 "{spec}@4.6.9 requires =4.6.9 (clap 4.6.9 also has a suggested downgrade above; applying it may unblock this, so re-run to check)"
             )

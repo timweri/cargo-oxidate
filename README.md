@@ -54,6 +54,11 @@ Suggestions are best effort. The tool does not run Cargo's resolver or build you
 can still reject a suggested command. Apply suggestions in order, then run the command again and
 run your tests.
 
+## JSON output
+
+`--format json` prints one JSON document with `schema_version` 2. Each `suggested` entry carries
+`command`, quoted for a shell, and `command_argv`, the same command as an argument array.
+
 ## Exit Codes
 
 | Code | Meaning |

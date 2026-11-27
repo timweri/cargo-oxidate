@@ -7,22 +7,31 @@ use semver::{Version, VersionReq};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+/// What places a requirement: a locked package or a manifest. The blocker's
+/// own name is carried beside it, so the two kinds cannot be confused.
+pub enum BlockerKind {
+    /// A lockfile package, named by the blocker's `name`.
+    Package {
+        version: String,
+        /// Cargo's pkgid: the bare name unless another package shares the
+        /// name and version, then `{source}#{name}`.
+        package_spec: String,
+    },
+    /// A `Cargo.toml`, named by the blocker's `name` as a path.
+    Manifest,
+}
+
 /// A requirement placed by a lockfile dependent or the user's manifest.
 pub struct Constraint {
     pub blocker_name: String,
-    pub blocker_version: Option<String>,
-    /// The lockfile source of a dependent blocker; `None` for manifest blockers.
-    pub blocker_source: Option<String>,
+    pub blocker_kind: BlockerKind,
     pub req: VersionReq,
 }
 
-/// The package and requirement blocking a downgrade.
+/// The package or manifest and requirement blocking a downgrade.
 pub struct Blocker {
     pub name: String,
-    pub version: Option<String>,
-    /// `{source}#{name}` when this lockfile dependent shares its name and
-    /// version with a package from another source; otherwise `None`.
-    pub package_spec: Option<String>,
+    pub kind: BlockerKind,
     pub req: String,
     /// Whether this run also suggests downgrading this locked package.
     pub also_suggested: bool,
@@ -38,6 +47,8 @@ pub enum Outcome {
         locked_version: String,
         suggested_version: String,
         suggested_age_days: i64,
+        /// Dependent labels: the bare name when its name and version are
+        /// unique in the lockfile or it has no source, else its spec.
         unverified_dependents: Vec<String>,
     },
     Blocked {
@@ -300,9 +311,11 @@ fn attribute_requirements(
 }
 
 /// Gathers requirements from registry dependents and local manifests.
+#[allow(clippy::too_many_arguments)]
 fn gather_constraints<T: Transport>(
     client: &mut CratesIoClient<T>,
     dependents_index: &DependentsIndex,
+    name_version_index: &NameVersionIndex,
     direct_requirements: &[DirectRequirement],
     working_dir: &Path,
     name: &str,
@@ -321,8 +334,14 @@ fn gather_constraints<T: Transport>(
 
     for dependent in dependents {
         let unverified = if dependent.is_registry {
-            let result =
-                registry_dependent_constraints(client, dependent, name, locked.as_ref(), source);
+            let result = registry_dependent_constraints(
+                client,
+                name_version_index,
+                dependent,
+                name,
+                locked.as_ref(),
+                source,
+            );
             let unverified = result.unverified;
             constraints.extend(result.constraints);
             unverified
@@ -358,8 +377,7 @@ fn gather_constraints<T: Transport>(
                 // decide which of `matching` to keep.
                 constraints.extend(matching.iter().map(|req| Constraint {
                     blocker_name: manifest_label(&req.manifest, working_dir),
-                    blocker_version: None,
-                    blocker_source: None,
+                    blocker_kind: BlockerKind::Manifest,
                     req: req.req.clone(),
                 }));
                 false
@@ -368,8 +386,12 @@ fn gather_constraints<T: Transport>(
             // Git and alternate-registry requirements cannot be read here.
             true
         };
-        if unverified && !unverified_dependents.contains(&dependent.name) {
-            unverified_dependents.push(dependent.name.clone());
+        if unverified {
+            // The bare name when it identifies the dependent, else its spec.
+            let label = package_spec_of(dependent, name_version_index);
+            if !unverified_dependents.contains(&label) {
+                unverified_dependents.push(label);
+            }
         }
     }
 
@@ -388,6 +410,7 @@ struct RegistryConstraints {
 
 fn registry_dependent_constraints<T: Transport>(
     client: &mut CratesIoClient<T>,
+    name_version_index: &NameVersionIndex,
     dependent: &Package,
     name: &str,
     locked: Option<&Version>,
@@ -434,8 +457,10 @@ fn registry_dependent_constraints<T: Transport>(
         .into_iter()
         .map(|req| Constraint {
             blocker_name: dependent.name.clone(),
-            blocker_version: Some(dependent.version.clone()),
-            blocker_source: dependent.source.clone(),
+            blocker_kind: BlockerKind::Package {
+                version: dependent.version.clone(),
+                package_spec: package_spec_of(dependent, name_version_index),
+            },
             req,
         })
         .collect();
@@ -454,21 +479,25 @@ fn manifest_label(path: &Path, working_dir: &Path) -> String {
 }
 
 /// Uses a source-qualified pkgid when a shared name and version is ambiguous.
+/// A lockfile source can already end in a `#fragment` (a git source's precise
+/// commit); it is dropped so the result stays a single `{source}#{name}`.
 fn build_package_spec(name: &str, target_source: Option<&str>, is_ambiguous: bool) -> String {
     match (is_ambiguous, target_source) {
-        (true, Some(source)) => format!("{source}#{name}"),
+        (true, Some(source)) => {
+            let source = source.rsplit_once('#').map_or(source, |(base, _)| base);
+            format!("{source}#{name}")
+        }
         _ => name.to_string(),
     }
 }
 
-/// The source-qualified pkgid of a lockfile blocker whose name and version
-/// are shared with a package from another source; otherwise `None`.
-fn blocker_package_spec(blocker: &Constraint, index: &NameVersionIndex) -> Option<String> {
-    let version = blocker.blocker_version.as_deref()?;
-    let source = blocker.blocker_source.as_deref()?;
-    let same_name_version = index.get(&(blocker.blocker_name.as_str(), version))?;
-    (same_name_version.len() > 1)
-        .then(|| build_package_spec(&blocker.blocker_name, Some(source), true))
+/// Cargo's pkgid for a lockfile package: its bare name unless another package
+/// shares its name and version, then `{source}#{name}`.
+fn package_spec_of(package: &Package, index: &NameVersionIndex) -> String {
+    let is_ambiguous = index
+        .get(&(package.name.as_str(), package.version.as_str()))
+        .is_some_and(|packages| packages.len() > 1);
+    build_package_spec(&package.name, package.source.as_deref(), is_ambiguous)
 }
 
 /// Generates outcomes for "too new" violations; empty when there are none.
@@ -543,6 +572,7 @@ pub fn generate_suggestions<T: Transport>(
         let gathered = gather_constraints(
             client,
             &dependents_index,
+            &name_version_index,
             direct_requirements,
             working_dir,
             &violation.package,
@@ -573,9 +603,8 @@ pub fn generate_suggestions<T: Transport>(
                     // suggestion is only known once every violation has been
                     // walked, so this starts false and is patched below.
                     also_suggested: false,
-                    package_spec: blocker_package_spec(&blocker, &name_version_index),
                     name: blocker.blocker_name,
-                    version: blocker.blocker_version,
+                    kind: blocker.blocker_kind,
                     req: blocker.req.to_string(),
                 },
             },
@@ -604,7 +633,7 @@ pub fn generate_suggestions<T: Transport>(
         .collect();
     for outcome in &mut outcomes {
         if let Outcome::Blocked { blocker, .. } = outcome
-            && let Some(version) = &blocker.version
+            && let BlockerKind::Package { version, .. } = &blocker.kind
         {
             blocker.also_suggested = suggested.contains(&(blocker.name.clone(), version.clone()));
         }
