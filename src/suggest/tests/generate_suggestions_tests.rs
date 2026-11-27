@@ -368,6 +368,25 @@ fn unavailable_outcome_for_a_duplicated_package_carries_the_qualified_spec() {
 }
 
 #[test]
+fn unavailable_outcome_for_a_failed_versions_fetch_carries_the_qualified_spec() {
+    // The fetch-error arm must also report the ambiguous spec.
+    let transport = FakeTransport::default();
+    transport.versions_error("anyhow");
+    let packages = [
+        pkg("anyhow", "1.0.102", &[]),
+        external_pkg("anyhow", "1.0.102", ALT_REGISTRY_SOURCE, &[]),
+    ];
+    let violations = [too_new("anyhow", "1.0.102")];
+    let outcomes = suggestions(transport, &violations, &packages, &[], Path::new("/work"));
+    assert_eq!(
+        summaries(&outcomes),
+        [format!(
+            "anyhow: unavailable (Network error fetching versions for anyhow: connection timed out) spec={CRATES_IO_SOURCE}#anyhow"
+        )]
+    );
+}
+
+#[test]
 fn unmatched_registry_requirements_are_unverified() {
     let transport = FakeTransport::default();
     transport.index_ok(
