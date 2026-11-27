@@ -320,18 +320,16 @@ fn update_argv(package_spec: &str, locked_version: &str, suggested_version: &str
     ]
 }
 
-/// Renders an argv as a paste-ready shell command. An argument is quoted only
-/// when it has a character outside `[A-Za-z0-9_@%+=:,./-]`: in double quotes,
-/// which sh, cmd.exe and PowerShell all accept, unless it has a character
-/// those treat specially inside them, then in POSIX single quotes.
+/// Renders an argv as a shell command. An argument with a character outside
+/// `[A-Za-z0-9_@%+=:,./-]` is put in double quotes, which sh, cmd.exe and
+/// PowerShell accept. The only such argument here is a source-qualified spec,
+/// which has nothing those shells expand inside double quotes.
 fn shell_command(argv: &[String]) -> String {
     argv.iter()
         .map(|arg| {
             let plain = |c: char| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c);
             if arg.chars().all(plain) {
                 arg.clone()
-            } else if arg.contains(['"', '$', '`', '\\', '!']) {
-                format!("'{}'", arg.replace('\'', "'\\''"))
             } else {
                 format!("\"{arg}\"")
             }
@@ -428,10 +426,6 @@ mod tests {
         assert_eq!(
             shell(spec),
             format!("cargo update -p \"{spec}@1.0.28\" --precise 1.0.27")
-        );
-        assert_eq!(
-            shell("it's$"),
-            "cargo update -p 'it'\\''s$@1.0.28' --precise 1.0.27"
         );
     }
 
