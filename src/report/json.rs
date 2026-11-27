@@ -387,7 +387,7 @@ mod tests {
         report.suggestions = Some(vec![
             Outcome::Suggest {
                 package: "widget".into(),
-                package_spec: "registry+https://example.test#index#widget".into(),
+                package_spec: "registry+https://example.test/index#widget".into(),
                 locked_version: "2.0.0".into(),
                 suggested_version: "1.9.0".into(),
                 suggested_age_days: 30,
@@ -408,7 +408,7 @@ mod tests {
             },
             Outcome::NoCompliantVersion {
                 package: "none".into(),
-                package_spec: "registry+https://example.test/index#none".into(),
+                package_spec: "none".into(),
                 locked_version: "2.0.0".into(),
             },
             Outcome::Unavailable {
@@ -426,8 +426,8 @@ mod tests {
                     "kind": "suggested",
                     "package": "widget",
                     "locked_version": "2.0.0",
-                    "package_spec": "registry+https://example.test#index#widget",
-                    "command": "cargo update -p registry+https://example.test#index#widget@2.0.0 --precise 1.9.0",
+                    "package_spec": "registry+https://example.test/index#widget",
+                    "command": "cargo update -p registry+https://example.test/index#widget@2.0.0 --precise 1.9.0",
                     "suggested_version": "1.9.0",
                     "suggested_age_days": 30,
                     "unverified_dependents": ["consumer"],
@@ -449,7 +449,7 @@ mod tests {
                     "kind": "no_eligible_downgrade",
                     "package": "none",
                     "locked_version": "2.0.0",
-                    "package_spec": "registry+https://example.test/index#none",
+                    "package_spec": "none",
                 },
                 {
                     "kind": "unavailable",
