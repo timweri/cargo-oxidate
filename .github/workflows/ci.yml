@@ -28,3 +28,12 @@ jobs:
         uses: ./
         with:
           min-age-days: '14'
+
+  # Dependency-age check with the released action, independent of this branch's code
+  dependency-age:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: timweri/cargo-oxidate@7c8f72bd9bc80da065fcf1bf69274eb22d27ca50 # v0.3.0
+        with:
+          min-age-days: '14'
