@@ -65,9 +65,6 @@ pub struct Summary {
     pub unsupported_packages: usize,
     pub excluded_missing_packages: usize,
     pub failed_packages: usize,
-    /// Kept for JSON schema v1 compatibility; currently always 0 because no
-    /// code path skips eligible packages.
-    pub not_checked_packages: usize,
 }
 
 pub struct Diagnostic {
@@ -175,14 +172,13 @@ fn print_policy(policy: &Policy, lockfile: &Path) {
 fn print_summary(summary: &Summary, violations: usize, duration: Duration) {
     println!("Coverage");
     println!(
-        "  packages: total={}, checked={}, exempt={}, unsupported={}, excluded missing={}, failed={}, not checked={}",
+        "  packages: total={}, checked={}, exempt={}, unsupported={}, excluded missing={}, failed={}",
         summary.total_packages,
         summary.checked_packages,
         summary.exempt_packages,
         summary.unsupported_packages,
         summary.excluded_missing_packages,
         summary.failed_packages,
-        summary.not_checked_packages,
     );
     println!("  violations: {violations}");
     println!("  elapsed: {} ms", duration.as_millis());

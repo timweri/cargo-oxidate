@@ -172,6 +172,7 @@ version = "1.0.0"
         let stderr = String::from_utf8(output.stderr).unwrap();
         assert!(stdout.contains("No eligible dependencies checked."));
         assert!(stdout.contains("packages: total=1, checked=0"));
+        assert!(!stdout.contains("not checked"), "stdout was:\n{stdout}");
         assert!(!stdout.contains("warning:"), "stdout was:\n{stdout}");
         assert_eq!(
             stderr.matches("warning:").count(),
@@ -290,7 +291,8 @@ fn json_is_one_document_with_the_same_violation_in_direct_and_cargo_forms() {
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(stdout.ends_with('\n'));
         let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-        assert_eq!(report["schema_version"], 1);
+        assert_eq!(report["schema_version"], 2);
+        assert!(report["summary"].get("not_checked_packages").is_none());
         assert_eq!(report["status"], "violations");
         assert_eq!(report["summary"]["total_packages"], 1);
         assert_eq!(report["summary"]["violations"], 1);

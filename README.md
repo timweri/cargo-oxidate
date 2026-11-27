@@ -54,6 +54,12 @@ Suggestions are best effort. The tool does not run Cargo's resolver or build you
 can still reject a suggested command. Apply suggestions in order, then run the command again and
 run your tests.
 
+## JSON output
+
+`--format json` prints one JSON document. Its `schema_version` is `2`. Schema version 2 removed
+`summary.not_checked_packages`, and the matching `not checked=N` text from the coverage line,
+because it was always 0.
+
 ## Exit Codes
 
 | Code | Meaning |

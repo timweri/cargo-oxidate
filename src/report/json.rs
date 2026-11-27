@@ -32,7 +32,6 @@ struct JsonSummary {
     unsupported_packages: Option<usize>,
     excluded_missing_packages: Option<usize>,
     failed_packages: Option<usize>,
-    not_checked_packages: Option<usize>,
     violations: usize,
     duration_ms: u128,
 }
@@ -111,7 +110,6 @@ impl JsonSummary {
             unsupported_packages: summary.map(|summary| summary.unsupported_packages),
             excluded_missing_packages: summary.map(|summary| summary.excluded_missing_packages),
             failed_packages: summary.map(|summary| summary.failed_packages),
-            not_checked_packages: summary.map(|summary| summary.not_checked_packages),
             violations,
             duration_ms,
         }
@@ -232,10 +230,10 @@ fn suggestion_json(outcome: &Outcome) -> JsonSuggestion {
     }
 }
 
-/// Serializes a CLI report as schema version 1.
+/// Serializes a CLI report as schema version 2.
 pub fn render_json(report: &RunReport) -> serde_json::Result<String> {
     serde_json::to_string(&JsonReport {
-        schema_version: 1,
+        schema_version: 2,
         status: match report.exit_code() {
             0 => "passed",
             1 => "violations",
@@ -331,7 +329,8 @@ mod tests {
         });
 
         let json = render(&report);
-        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["schema_version"], 2);
+        assert!(json["summary"].get("not_checked_packages").is_none());
         assert_eq!(json["status"], "error");
         assert_eq!(json["summary"]["violations"], 3);
         assert_eq!(json["errors"][0]["category"], "lookup");
