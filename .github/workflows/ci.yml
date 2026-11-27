@@ -28,14 +28,3 @@ jobs:
         uses: ./
         with:
           min-age-days: '14'
-
-  tmp-cache-save-on-violations:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - run: echo "# cache-save probe ${{ github.run_id }}" >> Cargo.lock
-      - name: Run cargo-oxidate on self, expecting violations
-        continue-on-error: true
-        uses: ./
-        with:
-          min-age-days: '100000'
