@@ -1,4 +1,4 @@
-use super::{Diagnostic, RunReport, Summary, Violation, ViolationKind};
+use super::{Diagnostic, RunReport, Summary, Violation, ViolationKind, shell_command, update_argv};
 use crate::suggest::{BlockerKind, Outcome};
 use chrono::SecondsFormat;
 use serde::Serialize;
@@ -76,6 +76,9 @@ struct JsonSuggestion {
     package_spec: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     command: Option<String>,
+    /// `command` as an argument array, unquoted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command_argv: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     suggested_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -173,19 +176,21 @@ fn suggestion_json(outcome: &Outcome) -> JsonSuggestion {
             suggested_version,
             suggested_age_days,
             unverified_dependents,
-        } => JsonSuggestion {
-            kind: "suggested",
-            package: package.clone(),
-            locked_version: locked_version.clone(),
-            package_spec: Some(package_spec.clone()),
-            command: Some(format!(
-                "cargo update -p {package_spec}@{locked_version} --precise {suggested_version}"
-            )),
-            suggested_version: Some(suggested_version.clone()),
-            suggested_age_days: Some(*suggested_age_days),
-            unverified_dependents: Some(unverified_dependents.clone()),
-            ..Default::default()
-        },
+        } => {
+            let argv = update_argv(package_spec, locked_version, suggested_version);
+            JsonSuggestion {
+                kind: "suggested",
+                package: package.clone(),
+                locked_version: locked_version.clone(),
+                package_spec: Some(package_spec.clone()),
+                command: Some(shell_command(&argv)),
+                command_argv: Some(argv),
+                suggested_version: Some(suggested_version.clone()),
+                suggested_age_days: Some(*suggested_age_days),
+                unverified_dependents: Some(unverified_dependents.clone()),
+                ..Default::default()
+            }
+        }
         Outcome::Blocked {
             package,
             package_spec,
@@ -447,7 +452,15 @@ mod tests {
                     "package": "widget",
                     "locked_version": "2.0.0",
                     "package_spec": "registry+https://example.test/index#widget",
-                    "command": "cargo update -p registry+https://example.test/index#widget@2.0.0 --precise 1.9.0",
+                    "command": "cargo update -p 'registry+https://example.test/index#widget@2.0.0' --precise 1.9.0",
+                    "command_argv": [
+                        "cargo",
+                        "update",
+                        "-p",
+                        "registry+https://example.test/index#widget@2.0.0",
+                        "--precise",
+                        "1.9.0"
+                    ],
                     "suggested_version": "1.9.0",
                     "suggested_age_days": 30,
                     "unverified_dependents": ["consumer"],

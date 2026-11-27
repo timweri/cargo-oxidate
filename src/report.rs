@@ -298,9 +298,43 @@ fn suggestion_line(outcome: &Outcome) -> Option<String> {
             unverified_dependents.join(", ")
         )
     };
+    let command = shell_command(&update_argv(
+        package_spec,
+        locked_version,
+        suggested_version,
+    ));
     Some(format!(
-        "  cargo update -p {package_spec}@{locked_version} --precise {suggested_version} # {suggested_age_days} days old{annotation}"
+        "  {command} # {suggested_age_days} days old{annotation}"
     ))
+}
+
+/// The `cargo update` argv that applies a suggested downgrade, unquoted.
+fn update_argv(package_spec: &str, locked_version: &str, suggested_version: &str) -> Vec<String> {
+    vec![
+        "cargo".to_string(),
+        "update".to_string(),
+        "-p".to_string(),
+        format!("{package_spec}@{locked_version}"),
+        "--precise".to_string(),
+        suggested_version.to_string(),
+    ]
+}
+
+/// Renders an argv as a paste-ready shell command. An argument is single-quoted
+/// only when it has a character outside `[A-Za-z0-9_@%+=:,./-]`; an embedded
+/// `'` is written `'\''`.
+fn shell_command(argv: &[String]) -> String {
+    argv.iter()
+        .map(|arg| {
+            let plain = |c: char| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c);
+            if arg.chars().all(plain) {
+                arg.clone()
+            } else {
+                format!("'{}'", arg.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn other_outcome_line(outcome: &Outcome) -> Option<String> {
@@ -363,6 +397,40 @@ fn other_outcome_line(outcome: &Outcome) -> Option<String> {
 mod tests {
     use super::*;
     use crate::suggest::Blocker;
+
+    #[test]
+    fn update_argv_is_unquoted_and_shell_command_quotes_only_what_needs_it() {
+        let shell = |spec: &str| shell_command(&update_argv(spec, "1.0.28", "1.0.27"));
+
+        assert_eq!(
+            update_argv("semver", "1.0.28", "1.0.27"),
+            [
+                "cargo",
+                "update",
+                "-p",
+                "semver@1.0.28",
+                "--precise",
+                "1.0.27"
+            ]
+        );
+        assert_eq!(
+            shell("semver"),
+            "cargo update -p semver@1.0.28 --precise 1.0.27"
+        );
+        let spec = "registry+https://example.com/index#semver";
+        assert_eq!(
+            update_argv(spec, "1.0.28", "1.0.27")[3],
+            format!("{spec}@1.0.28")
+        );
+        assert_eq!(
+            shell(spec),
+            format!("cargo update -p '{spec}@1.0.28' --precise 1.0.27")
+        );
+        assert_eq!(
+            shell("it's"),
+            "cargo update -p 'it'\\''s@1.0.28' --precise 1.0.27"
+        );
+    }
 
     #[test]
     fn non_suggest_outcome_lines_name_the_package_by_its_spec() {
