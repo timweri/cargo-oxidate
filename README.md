@@ -22,22 +22,20 @@ cargo-oxidate Cargo.lock --min-age-days 14 --max-age-days 730
 
 | Flag | Description |
 |------|-------------|
-| `--min-age-days N` | Reject packages newer than N days (supply chain security) |
-| `--max-age-days N` | Reject packages older than N days (staleness) |
+| `--min-age-days N` | Reject packages newer than N days (supply chain security). At most 100000, and not above `--max-age-days` |
+| `--max-age-days N` | Reject packages older than N days (staleness). At most 100000 |
 | `--exempt pkg1,pkg2` | Packages to skip |
 | `--exclude-missing` | Accept packages with unknown publish dates |
-| `--timeout N` | HTTP timeout in seconds (default: 10) |
+| `--timeout N` | HTTP timeout in seconds, 1–86400 (default: 10) |
 | `--suggest-fix` | For "too new" violations, suggest `cargo update` commands to downgrade |
 | `--include-prerelease` | Modifier for `--suggest-fix`. Consider prerelease versions as suggestion candidates. |
 | `--cache-path PATH` | Enable response caching at PATH (or set `CARGO_OXIDATE_CACHE_PATH`) |
-| `--cache-max-age-hours N` | Max age for cached version listings (default: 24) |
+| `--cache-max-age-hours N` | Max age for cached version listings, at most 10000000 (default: 24) |
 | `--quiet` | Suppress start and per-package progress messages |
 | `--verbose` | Show each package as it is checked |
 | `--format text\|json` | Render the final result as text (default) or JSON |
 
-At least one of `--min-age-days` or `--max-age-days` must be specified. `--min-age-days` must not
-exceed `--max-age-days`. Age thresholds are capped at 100000 days, `--cache-max-age-hours` at
-10000000, and `--timeout` must be 1–86400 seconds.
+At least one of `--min-age-days` or `--max-age-days` must be specified.
 
 ## `--suggest-fix`
 
