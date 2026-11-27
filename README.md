@@ -84,7 +84,7 @@ To respect the crates.io API rate limit, requests are spaced one second apart, s
 This tool is also available as a GitHub Action. See [examples/usage.yml](examples/usage.yml) or use it in your workflow:
 
 ```yaml
-- uses: timweri/cargo-oxidate@v0.2.1
+- uses: timweri/cargo-oxidate@v0.3.0
   with:
     min-age-days: 14
     max-age-days: 730
