@@ -373,6 +373,52 @@ fn a_blocker_duplicated_at_the_same_name_version_is_source_qualified() {
 }
 
 #[test]
+fn blockers_carry_their_kind_and_an_unambiguous_package_has_a_bare_spec() {
+    let blocked = |transport, packages: &[Package], requirements: &[DirectRequirement]| {
+        let violations = [too_new("serde", "1.5.0")];
+        let outcomes = suggestions(
+            transport,
+            &violations,
+            packages,
+            requirements,
+            Path::new("/work"),
+        );
+        let Some(Outcome::Blocked { blocker, .. }) = outcomes.into_iter().next() else {
+            panic!("expected a blocked outcome");
+        };
+        blocker
+    };
+
+    let transport = FakeTransport::default();
+    transport.versions("serde", &[("1.5.0", 5), ("1.4.0", 50)]);
+    transport.index_ok(
+        "app",
+        r#"{"vers":"1.0.0","deps":[{"name":"serde","req":"^1.5"}]}"#,
+    );
+    let packages = [
+        pkg("serde", "1.5.0", &[]),
+        pkg("app", "1.0.0", &[("serde", "1.5.0")]),
+    ];
+    let blocker = blocked(transport, &packages, &[]);
+    assert_eq!(blocker.name, "app");
+    assert!(matches!(
+        &blocker.kind,
+        BlockerKind::Package { version, package_spec } if version == "1.0.0" && package_spec == "app"
+    ));
+
+    let transport = FakeTransport::default();
+    transport.versions("serde", &[("1.5.0", 5), ("1.4.0", 50)]);
+    let packages = [
+        pkg("serde", "1.5.0", &[]),
+        non_registry_pkg("app", "0.1.0", &[("serde", "1.5.0")]),
+    ];
+    let requirements = [local_requirement("app", "0.1.0", "serde", "^1.5")];
+    let blocker = blocked(transport, &packages, &requirements);
+    assert_eq!(blocker.name, "Cargo.toml");
+    assert!(matches!(blocker.kind, BlockerKind::Manifest));
+}
+
+#[test]
 fn also_suggested_stays_keyed_by_name_and_version_when_the_blocker_is_duplicated() {
     // The crates.io `app 1.1.0` blocks serde and has its own suggestion; a
     // git `app 1.1.0` shares its name and version. The block still points at
@@ -515,22 +561,13 @@ fn unverified_dependents_are_deduplicated_by_label() {
 }
 
 #[test]
-fn a_git_blockers_spec_has_a_single_fragment() {
-    let blocker = Constraint {
-        blocker_name: "app".to_string(),
-        blocker_version: Some("1.0.0".to_string()),
-        blocker_source: Some(GIT_SOURCE.to_string()),
-        req: VersionReq::parse("^1.5").unwrap(),
-    };
-    let packages = [
-        pkg("app", "1.0.0", &[]),
-        external_pkg("app", "1.0.0", GIT_SOURCE, &[]),
-    ];
-    let spec = blocker_package_spec(&blocker, &build_indexes(&packages).1);
-    assert_eq!(
-        spec.as_deref(),
-        Some("git+https://github.com/example/app#app")
-    );
+fn a_git_packages_spec_has_a_single_fragment() {
+    // A git source already ends in `#<commit>`; the spec must replace it, not
+    // append to it. Applies to any package named by spec, blockers included.
+    let git_app = external_pkg("app", "1.0.0", GIT_SOURCE, &[]);
+    let packages = [pkg("app", "1.0.0", &[]), git_app];
+    let spec = package_spec_of(&packages[1], &build_indexes(&packages).1);
+    assert_eq!(spec, "git+https://github.com/example/app#app");
 }
 
 #[test]

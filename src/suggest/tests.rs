@@ -123,19 +123,26 @@ fn summary(outcome: &Outcome) -> String {
             blocker,
             ..
         } => {
-            let version = blocker
-                .version
-                .as_deref()
-                .map_or_else(String::new, |v| format!("@{v}"));
+            let (version, blocker_spec) = match &blocker.kind {
+                BlockerKind::Package {
+                    version,
+                    package_spec,
+                } => (
+                    format!("@{version}"),
+                    // Shown only when it differs from the bare name.
+                    if *package_spec == blocker.name {
+                        String::new()
+                    } else {
+                        format!(" blocker_spec={package_spec}")
+                    },
+                ),
+                BlockerKind::Manifest => (String::new(), String::new()),
+            };
             let also = if blocker.also_suggested {
                 " (also suggested)"
             } else {
                 ""
             };
-            let blocker_spec = blocker
-                .package_spec
-                .as_deref()
-                .map_or_else(String::new, |spec| format!(" blocker_spec={spec}"));
             format!(
                 "{package}: blocked at {newest_compliant} by {}{version} {}{also}{blocker_spec}{}",
                 blocker.name,
@@ -192,8 +199,10 @@ fn make_version(version: &str, days_ago: i64, yanked: bool) -> CrateVersionInfo 
 fn constraint(req: &str) -> Constraint {
     Constraint {
         blocker_name: "dep".to_string(),
-        blocker_version: Some("1.0.0".to_string()),
-        blocker_source: None,
+        blocker_kind: BlockerKind::Package {
+            version: "1.0.0".to_string(),
+            package_spec: "dep".to_string(),
+        },
         req: VersionReq::parse(req).unwrap(),
     }
 }

@@ -624,10 +624,10 @@ fn suggest_fix_cli_qualifies_an_ambiguous_blocker_in_text_and_json() {
     );
     assert_eq!(output.status.code(), Some(1));
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(
-        json["suggestions"][0]["blocker"]["package_spec"], spec,
-        "json was:\n{json:#}"
-    );
+    let blocker = &json["suggestions"][0]["blocker"];
+    assert_eq!(blocker["kind"], "package", "json was:\n{json:#}");
+    assert_eq!(blocker["version"], "2.0.0", "json was:\n{json:#}");
+    assert_eq!(blocker["package_spec"], spec, "json was:\n{json:#}");
 }
 
 #[test]
