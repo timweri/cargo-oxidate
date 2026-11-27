@@ -181,8 +181,9 @@ impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
             retry_count: NonZeroU32::new(3).unwrap(),
-            retry_delay: Duration::from_millis(500),
-            pacing_delay: Duration::from_millis(100),
+            // crates.io asks for at most one API request per second.
+            retry_delay: Duration::from_secs(1),
+            pacing_delay: Duration::from_secs(1),
         }
     }
 }
