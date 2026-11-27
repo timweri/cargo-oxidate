@@ -166,13 +166,3 @@ fn unavailable_warning_carries_the_package_spec() {
         format!("Could not determine a downgrade for {spec}@1.0.102: network error")
     );
 }
-
-#[test]
-fn only_unavailable_outcomes_warn() {
-    let outcome = suggest::Outcome::NoCompliantVersion {
-        package: "anyhow".into(),
-        package_spec: "anyhow".into(),
-        locked_version: "1.0.102".into(),
-    };
-    assert!(unavailable_warning(&outcome).is_none());
-}

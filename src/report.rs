@@ -399,58 +399,40 @@ mod tests {
 
     #[test]
     fn blocker_line_qualifies_the_blocker_only_when_it_has_a_spec() {
-        let blocked = |version: Option<&str>, package_spec: Option<&str>| Outcome::Blocked {
-            package: "clap_derive".into(),
-            package_spec: "clap_derive".into(),
-            locked_version: "4.6.9".into(),
-            newest_compliant: "4.6.7".into(),
-            blocker: Blocker {
-                name: "clap".into(),
-                version: version.map(Into::into),
-                package_spec: package_spec.map(Into::into),
-                req: "=4.6.9".into(),
-                also_suggested: false,
-            },
-        };
-        let tail = |outcome| {
-            let line = other_outcome_line(&outcome).unwrap();
+        let spec = "registry+https://example.com/index#clap";
+        let tail = |version: Option<&str>, package_spec: Option<&str>, also_suggested| {
+            let line = other_outcome_line(&Outcome::Blocked {
+                package: "clap_derive".into(),
+                package_spec: "clap_derive".into(),
+                locked_version: "4.6.9".into(),
+                newest_compliant: "4.6.7".into(),
+                blocker: Blocker {
+                    name: "clap".into(),
+                    version: version.map(Into::into),
+                    package_spec: package_spec.map(Into::into),
+                    req: "=4.6.9".into(),
+                    also_suggested,
+                },
+            })
+            .unwrap();
             line.split_once(", but ").unwrap().1.to_string()
         };
 
+        assert_eq!(tail(None, None, false), "clap requires =4.6.9");
         assert_eq!(
-            tail(blocked(
-                Some("4.6.9"),
-                Some("registry+https://example.com/index#clap")
-            )),
-            "registry+https://example.com/index#clap@4.6.9 requires =4.6.9"
-        );
-        assert_eq!(
-            tail(blocked(Some("4.6.9"), None)),
+            tail(Some("4.6.9"), None, false),
             "clap 4.6.9 requires =4.6.9"
         );
-        assert_eq!(tail(blocked(None, None)), "clap requires =4.6.9");
-    }
-
-    #[test]
-    fn also_suggested_note_uses_the_short_form_even_when_the_blocker_is_qualified() {
-        let outcome = Outcome::Blocked {
-            package: "clap_derive".into(),
-            package_spec: "clap_derive".into(),
-            locked_version: "4.6.9".into(),
-            newest_compliant: "4.6.7".into(),
-            blocker: Blocker {
-                name: "clap".into(),
-                version: Some("4.6.9".into()),
-                package_spec: Some("registry+https://example.com/index#clap".into()),
-                req: "=4.6.9".into(),
-                also_suggested: true,
-            },
-        };
-        let line = other_outcome_line(&outcome).unwrap();
-
         assert_eq!(
-            line.split_once(", but ").unwrap().1,
-            "registry+https://example.com/index#clap@4.6.9 requires =4.6.9 (clap 4.6.9 also has a suggested downgrade above; applying it may unblock this, so re-run to check)"
+            tail(Some("4.6.9"), Some(spec), false),
+            format!("{spec}@4.6.9 requires =4.6.9")
+        );
+        // The note keeps the short form rather than repeating the spec.
+        assert_eq!(
+            tail(Some("4.6.9"), Some(spec), true),
+            format!(
+                "{spec}@4.6.9 requires =4.6.9 (clap 4.6.9 also has a suggested downgrade above; applying it may unblock this, so re-run to check)"
+            )
         );
     }
 }

@@ -464,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn blocker_package_spec_is_emitted_only_when_present() {
+    fn qualified_blocker_emits_its_package_spec() {
         let mut report = completed_report(Summary::default());
         report.suggestions = Some(vec![Outcome::Blocked {
             package: "clap_derive".into(),
