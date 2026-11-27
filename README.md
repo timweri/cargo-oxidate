@@ -56,21 +56,8 @@ run your tests.
 
 ## JSON output
 
-`--format json` prints one JSON document. Its `schema_version` is `2`. Fields may be added within
-a schema version; removing a field or changing its meaning bumps the version.
-
-Each `suggested` entry carries the downgrade twice: `command` is a string to paste into a shell,
-and `command_argv` is the same command as an argument array to run without a shell. When two
-locked packages share a name and version, the package is named by a source-qualified spec such as
-`registry+https://github.com/rust-lang/crates.io-index#serde`. `command`, and the command printed
-in text output, single-quote that argument; `command_argv` does not.
-
-A `blocked` entry's `blocker` has a `kind`. A `package` blocker has a `version` and a
-`package_spec`; a `manifest` blocker has neither, and its `name` is the path of a `Cargo.toml`.
-Entries in `unverified_dependents` are crate names, or source-qualified specs where a name and
-version are ambiguous.
-
-[ADR 1](docs/adr/0001-json-schema-v2.md) lists every difference from schema version 1.
+`--format json` prints one JSON document with `schema_version` 2. Each suggestion carries
+`command`, quoted for a shell, and `command_argv`, the same command as an argument array.
 
 ## Exit Codes
 

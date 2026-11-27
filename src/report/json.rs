@@ -203,26 +203,22 @@ fn suggestion_json(outcome: &Outcome) -> JsonSuggestion {
             locked_version: locked_version.clone(),
             package_spec: Some(package_spec.clone()),
             newest_compliant: Some(newest_compliant.clone()),
-            blocker: Some(match &blocker.kind {
-                BlockerKind::Package {
-                    version,
-                    package_spec,
-                } => JsonBlocker {
-                    kind: "package",
+            blocker: Some({
+                let (kind, version, package_spec) = match &blocker.kind {
+                    BlockerKind::Package {
+                        version,
+                        package_spec,
+                    } => ("package", Some(version), Some(package_spec)),
+                    BlockerKind::Manifest => ("manifest", None, None),
+                };
+                JsonBlocker {
+                    kind,
                     name: blocker.name.clone(),
-                    version: Some(version.clone()),
-                    package_spec: Some(package_spec.clone()),
+                    version: version.cloned(),
+                    package_spec: package_spec.cloned(),
                     requirement: blocker.req.clone(),
                     also_suggested: blocker.also_suggested,
-                },
-                BlockerKind::Manifest => JsonBlocker {
-                    kind: "manifest",
-                    name: blocker.name.clone(),
-                    version: None,
-                    package_spec: None,
-                    requirement: blocker.req.clone(),
-                    also_suggested: blocker.also_suggested,
-                },
+                }
             }),
             ..Default::default()
         },

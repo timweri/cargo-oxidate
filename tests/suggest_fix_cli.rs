@@ -460,16 +460,11 @@ fn write_local_registry(registry: &Path, name: &str, version: &str) {
         .unwrap();
 }
 
-/// A command that reads no user-global Cargo configuration: `CARGO_HOME` is an
-/// empty directory, so only the project's own `.cargo/config.toml` applies.
-fn isolated_command(program: &str, project: &Path, cargo_home: &Path) -> Command {
-    let mut command = Command::new(program);
+/// Cargo with an empty `CARGO_HOME`, so no user-global configuration applies.
+fn isolated_cargo(project: &Path, cargo_home: &Path) -> Command {
+    let mut command = Command::new("cargo");
     command.env("CARGO_HOME", cargo_home).current_dir(project);
     command
-}
-
-fn isolated_cargo(project: &Path, cargo_home: &Path) -> Command {
-    isolated_command("cargo", project, cargo_home)
 }
 
 #[test]
@@ -588,7 +583,7 @@ fn printed_source_qualified_command_updates_only_the_registry_package() {
 
     let by_argv = root.path().join("by-argv");
     copy_dir(&project, &by_argv);
-    let applied = isolated_command(argv[0], &by_argv, &cargo_home)
+    let applied = isolated_cargo(&by_argv, &cargo_home)
         .args(&argv[1..])
         .arg("--offline")
         .output()

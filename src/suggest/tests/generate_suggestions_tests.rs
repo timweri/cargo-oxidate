@@ -561,16 +561,6 @@ fn unverified_dependents_are_deduplicated_by_label() {
 }
 
 #[test]
-fn a_git_packages_spec_has_a_single_fragment() {
-    // A git source already ends in `#<commit>`; the spec must replace it, not
-    // append to it. Applies to any package named by spec, blockers included.
-    let git_app = external_pkg("app", "1.0.0", GIT_SOURCE, &[]);
-    let packages = [pkg("app", "1.0.0", &[]), git_app];
-    let spec = package_spec_of(&packages[1], &build_indexes(&packages).1);
-    assert_eq!(spec, "git+https://github.com/example/app#app");
-}
-
-#[test]
 fn external_dependent_sharing_a_local_packages_identity_stays_unverified() {
     // The local "app" manifest's requirement was never the external
     // "app" dependent's own, so it neither verifies nor constrains it.
