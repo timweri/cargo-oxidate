@@ -77,6 +77,8 @@ cargo oxidate --cache-path .cache/oxidate.json --min-age-days 14
 
 Per-version publish dates are cached indefinitely (they're immutable on crates.io). Per-crate version listings expire after `--cache-max-age-hours` (default 24h) so newly published versions are picked up.
 
+To respect the crates.io API rate limit, requests are spaced one second apart, so a cold-cache run takes about one second per crate.
+
 ## GitHub Action
 
 This tool is also available as a GitHub Action. See [examples/usage.yml](examples/usage.yml) or use it in your workflow:
