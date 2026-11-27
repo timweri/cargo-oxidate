@@ -448,7 +448,7 @@ mod tests {
                     "package": "widget",
                     "locked_version": "2.0.0",
                     "package_spec": "registry+https://example.test/index#widget",
-                    "command": "cargo update -p 'registry+https://example.test/index#widget@2.0.0' --precise 1.9.0",
+                    "command": "cargo update -p \"registry+https://example.test/index#widget@2.0.0\" --precise 1.9.0",
                     "command_argv": [
                         "cargo",
                         "update",

@@ -320,17 +320,20 @@ fn update_argv(package_spec: &str, locked_version: &str, suggested_version: &str
     ]
 }
 
-/// Renders an argv as a paste-ready shell command. An argument is single-quoted
-/// only when it has a character outside `[A-Za-z0-9_@%+=:,./-]`; an embedded
-/// `'` is written `'\''`.
+/// Renders an argv as a paste-ready shell command. An argument is quoted only
+/// when it has a character outside `[A-Za-z0-9_@%+=:,./-]`: in double quotes,
+/// which sh, cmd.exe and PowerShell all accept, unless it has a character
+/// those treat specially inside them, then in POSIX single quotes.
 fn shell_command(argv: &[String]) -> String {
     argv.iter()
         .map(|arg| {
             let plain = |c: char| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c);
             if arg.chars().all(plain) {
                 arg.clone()
-            } else {
+            } else if arg.contains(['"', '$', '`', '\\', '!']) {
                 format!("'{}'", arg.replace('\'', "'\\''"))
+            } else {
+                format!("\"{arg}\"")
             }
         })
         .collect::<Vec<_>>()
@@ -424,11 +427,11 @@ mod tests {
         );
         assert_eq!(
             shell(spec),
-            format!("cargo update -p '{spec}@1.0.28' --precise 1.0.27")
+            format!("cargo update -p \"{spec}@1.0.28\" --precise 1.0.27")
         );
         assert_eq!(
-            shell("it's"),
-            "cargo update -p 'it'\\''s@1.0.28' --precise 1.0.27"
+            shell("it's$"),
+            "cargo update -p 'it'\\''s$@1.0.28' --precise 1.0.27"
         );
     }
 

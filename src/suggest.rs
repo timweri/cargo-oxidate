@@ -48,7 +48,7 @@ pub enum Outcome {
         suggested_version: String,
         suggested_age_days: i64,
         /// Dependent labels: the bare name when its name and version are
-        /// unique in the lockfile, else its source-qualified spec.
+        /// unique in the lockfile or it has no source, else its spec.
         unverified_dependents: Vec<String>,
     },
     Blocked {
@@ -484,7 +484,7 @@ fn manifest_label(path: &Path, working_dir: &Path) -> String {
 fn build_package_spec(name: &str, target_source: Option<&str>, is_ambiguous: bool) -> String {
     match (is_ambiguous, target_source) {
         (true, Some(source)) => {
-            let source = source.split_once('#').map_or(source, |(base, _)| base);
+            let source = source.rsplit_once('#').map_or(source, |(base, _)| base);
             format!("{source}#{name}")
         }
         _ => name.to_string(),

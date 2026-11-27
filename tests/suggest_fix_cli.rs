@@ -147,9 +147,9 @@ fn suggest_fix_cli_reports_mixed_outcomes_and_preserves_project_files() {
     assert!(stdout.contains("They do not run Cargo's resolver"));
     for package in ["beta", "gamma", "delta"] {
         assert!(
-            !stdout.lines().any(|line| line
-                .trim_start()
-                .starts_with(&format!("cargo update -p {package}@"))),
+            !stdout
+                .lines()
+                .any(|line| line.contains("cargo update") && line.contains(&format!("{package}@"))),
             "no command expected for {package}; stdout was:\n{stdout}"
         );
     }
@@ -467,7 +467,6 @@ fn isolated_cargo(project: &Path, cargo_home: &Path) -> Command {
     command
 }
 
-#[cfg(unix)]
 #[test]
 fn printed_source_qualified_command_updates_only_the_registry_package() {
     let root = tempdir().unwrap();
@@ -567,20 +566,22 @@ fn printed_source_qualified_command_updates_only_the_registry_package() {
     );
 
     // The shell string and the argv must each work from a fresh project.
-    let by_shell = root.path().join("by-shell");
-    copy_dir(&project, &by_shell);
-    let applied = Command::new("sh")
-        .args(["-c", &format!("{command} --offline")])
-        .env("CARGO_HOME", &cargo_home)
-        .current_dir(&by_shell)
-        .output()
-        .unwrap();
-    assert!(
-        applied.status.success(),
-        "{}",
-        String::from_utf8_lossy(&applied.stderr)
-    );
-    assert_only_the_registry_package_was_downgraded(&by_shell);
+    if cfg!(unix) {
+        let by_shell = root.path().join("by-shell");
+        copy_dir(&project, &by_shell);
+        let applied = Command::new("sh")
+            .args(["-c", &format!("{command} --offline")])
+            .env("CARGO_HOME", &cargo_home)
+            .current_dir(&by_shell)
+            .output()
+            .unwrap();
+        assert!(
+            applied.status.success(),
+            "{}",
+            String::from_utf8_lossy(&applied.stderr)
+        );
+        assert_only_the_registry_package_was_downgraded(&by_shell);
+    }
 
     let by_argv = root.path().join("by-argv");
     copy_dir(&project, &by_argv);
