@@ -258,6 +258,27 @@ fn check_packages<T: api::Transport>(
     report
 }
 
+/// The warning for a downgrade that could not be determined, if `outcome` is one.
+fn unavailable_warning(outcome: &suggest::Outcome) -> Option<report::Diagnostic> {
+    let suggest::Outcome::Unavailable {
+        package,
+        package_spec,
+        locked_version,
+        reason,
+    } = outcome
+    else {
+        return None;
+    };
+    let message =
+        format!("Could not determine a downgrade for {package_spec}@{locked_version}: {reason}");
+    Some(report::Diagnostic {
+        package: Some(package.clone()),
+        version: Some(locked_version.clone()),
+        package_spec: Some(package_spec.clone()),
+        ..report::Diagnostic::new("suggestion", message)
+    })
+}
+
 fn run(cli: Cli, verbosity: Verbosity) -> report::RunReport {
     let started = Instant::now();
     let supplied_lockfile = cli.cargo_lock.clone();
@@ -375,25 +396,9 @@ fn run(cli: Cli, verbosity: Verbosity) -> report::RunReport {
             now,
             &mut print_suggestion_progress,
         );
-        for outcome in &outcomes {
-            if let suggest::Outcome::Unavailable {
-                package,
-                package_spec,
-                locked_version,
-                reason,
-            } = outcome
-            {
-                let message = format!(
-                    "Could not determine a downgrade for {package_spec}@{locked_version}: {reason}"
-                );
-                eprintln!("warning: {message}");
-                report.warnings.push(report::Diagnostic {
-                    package: Some(package.clone()),
-                    version: Some(locked_version.clone()),
-                    package_spec: Some(package_spec.clone()),
-                    ..report::Diagnostic::new("suggestion", message)
-                });
-            }
+        for warning in outcomes.iter().filter_map(unavailable_warning) {
+            eprintln!("warning: {}", warning.message);
+            report.warnings.push(warning);
         }
         report.suggestions = Some(outcomes);
     }

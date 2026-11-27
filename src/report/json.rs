@@ -95,6 +95,7 @@ struct JsonSuggestion {
 struct JsonBlocker {
     name: String,
     version: Option<String>,
+    /// Omitted unless `name` and `version` are ambiguous in the lockfile.
     #[serde(skip_serializing_if = "Option::is_none")]
     package_spec: Option<String>,
     requirement: String,
