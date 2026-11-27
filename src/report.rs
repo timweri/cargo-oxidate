@@ -77,6 +77,7 @@ pub struct Diagnostic {
     pub path: Option<PathBuf>,
     pub message: String,
     pub retryable: bool,
+    pub package_spec: Option<String>,
 }
 
 impl Diagnostic {
@@ -89,6 +90,7 @@ impl Diagnostic {
             path: None,
             message,
             retryable: false,
+            package_spec: None,
         }
     }
 }

@@ -390,6 +390,7 @@ fn run(cli: Cli, verbosity: Verbosity) -> report::RunReport {
                 report.warnings.push(report::Diagnostic {
                     package: Some(package.clone()),
                     version: Some(locked_version.clone()),
+                    package_spec: Some(package_spec.clone()),
                     ..report::Diagnostic::new("suggestion", message)
                 });
             }

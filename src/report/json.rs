@@ -64,6 +64,8 @@ struct JsonDiagnostic {
     path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     retryable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    package_spec: Option<String>,
 }
 
 #[derive(Serialize, Default)]
@@ -153,6 +155,7 @@ fn diagnostic_json(diagnostic: &Diagnostic) -> JsonDiagnostic {
             .as_ref()
             .map(|path| path.display().to_string()),
         retryable: (diagnostic.category == "lookup").then_some(diagnostic.retryable),
+        package_spec: diagnostic.package_spec.clone(),
     }
 }
 
@@ -180,14 +183,15 @@ fn suggestion_json(outcome: &Outcome) -> JsonSuggestion {
         },
         Outcome::Blocked {
             package,
+            package_spec,
             locked_version,
             newest_compliant,
             blocker,
-            ..
         } => JsonSuggestion {
             kind: "blocked",
             package: package.clone(),
             locked_version: locked_version.clone(),
+            package_spec: Some(package_spec.clone()),
             newest_compliant: Some(newest_compliant.clone()),
             blocker: Some(JsonBlocker {
                 name: blocker.name.clone(),
@@ -199,23 +203,25 @@ fn suggestion_json(outcome: &Outcome) -> JsonSuggestion {
         },
         Outcome::NoCompliantVersion {
             package,
+            package_spec,
             locked_version,
-            ..
         } => JsonSuggestion {
             kind: "no_eligible_downgrade",
             package: package.clone(),
             locked_version: locked_version.clone(),
+            package_spec: Some(package_spec.clone()),
             ..Default::default()
         },
         Outcome::Unavailable {
             package,
+            package_spec,
             locked_version,
             reason,
-            ..
         } => JsonSuggestion {
             kind: "unavailable",
             package: package.clone(),
             locked_version: locked_version.clone(),
+            package_spec: Some(package_spec.clone()),
             reason: Some(reason.clone()),
             ..Default::default()
         },
@@ -317,6 +323,7 @@ mod tests {
             path: None,
             message: "Client error 400".into(),
             retryable: false,
+            package_spec: None,
         });
 
         let json = render(&report);
@@ -385,7 +392,7 @@ mod tests {
             },
             Outcome::Blocked {
                 package: "blocked".into(),
-                package_spec: "blocked".into(),
+                package_spec: "registry+https://example.test/index#blocked".into(),
                 locked_version: "2.0.0".into(),
                 newest_compliant: "1.9.0".into(),
                 blocker: crate::suggest::Blocker {
@@ -397,12 +404,12 @@ mod tests {
             },
             Outcome::NoCompliantVersion {
                 package: "none".into(),
-                package_spec: "none".into(),
+                package_spec: "registry+https://example.test/index#none".into(),
                 locked_version: "2.0.0".into(),
             },
             Outcome::Unavailable {
                 package: "unavailable".into(),
-                package_spec: "unavailable".into(),
+                package_spec: "registry+https://example.test/index#unavailable".into(),
                 locked_version: "2.0.0".into(),
                 reason: "registry request failed".into(),
             },
@@ -425,6 +432,7 @@ mod tests {
                     "kind": "blocked",
                     "package": "blocked",
                     "locked_version": "2.0.0",
+                    "package_spec": "registry+https://example.test/index#blocked",
                     "newest_compliant": "1.9.0",
                     "blocker": {
                         "name": "consumer",
@@ -437,11 +445,13 @@ mod tests {
                     "kind": "no_eligible_downgrade",
                     "package": "none",
                     "locked_version": "2.0.0",
+                    "package_spec": "registry+https://example.test/index#none",
                 },
                 {
                     "kind": "unavailable",
                     "package": "unavailable",
                     "locked_version": "2.0.0",
+                    "package_spec": "registry+https://example.test/index#unavailable",
                     "reason": "registry request failed",
                 },
             ])
@@ -458,6 +468,13 @@ mod tests {
             path: Some("responses.json".into()),
             message: "Could not save cache".into(),
             retryable: false,
+            package_spec: None,
+        });
+        report.warnings.push(Diagnostic {
+            package: Some("widget".into()),
+            version: Some("2.0.0".into()),
+            package_spec: Some("registry+https://example.test/index#widget".into()),
+            ..Diagnostic::new("suggestion", "Could not determine a downgrade".into())
         });
         report.suggestions = Some(vec![]);
 
@@ -467,6 +484,11 @@ mod tests {
         assert_eq!(json["warnings"][0]["category"], "cache");
         assert_eq!(json["warnings"][0]["path"], "responses.json");
         assert!(json["warnings"][0].get("retryable").is_none());
+        assert!(json["warnings"][0].get("package_spec").is_none());
+        assert_eq!(
+            json["warnings"][1]["package_spec"],
+            "registry+https://example.test/index#widget"
+        );
         assert_eq!(json["suggestions"], json!([]));
     }
 }
